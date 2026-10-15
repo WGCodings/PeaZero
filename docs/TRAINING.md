@@ -30,6 +30,14 @@ python train.py --run ..\runs\first --resume
 
 Defaults: 1024 concurrent games, 16 considered moves per position, 100,000 new positions per generation, batch 512, K = 5, each position trained on ~4× on average, 1M-position replay buffer. See `python train.py --help`.
 
+## Dashboard
+
+`train.py` opens a live dashboard in your browser at <http://localhost:8765>: generation progress and ETA, the current phase (self-play positions / training steps with running loss), totals (positions trained and generated, games, replay buffer), and charts over all generations (total / policy / value loss incl. unrolled, agreement, W/D/B, how games end, game length, time per generation, self-play speed, learning rate), plus a table of the last 15 generations. Hover a chart to read exact values.
+
+* `--no-browser` starts the server without opening a tab; `--dashboard-port N` picks another port (0 = off).
+* Look at any run, also when it isn't training: `python -m peazero.dashboard --run ..\runs\first` (from `trainer/`).
+* The ETA counts towards `--generations` (the *total* target, also on `--resume`) and uses the average of the last 5 generations.
+
 ## Run folder
 
 ```
@@ -37,6 +45,7 @@ runs/first/
   config.json          arguments of the first start
   checkpoint.pt        latest model + optimizer (used by --resume)
   metrics.jsonl        one line per generation
+  status.json          live progress, read by the dashboard
   latest.pzn           copy of the newest network
   nets/gen_0001.pzn    every generation's network (kept, ~4 MB each)
   data/gen_0012/       self-play games of generation 12 (part_000.bin, ...)

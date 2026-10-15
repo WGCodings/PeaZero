@@ -175,7 +175,7 @@ impl Engine for PolicyEngine {
         }
 
         let [w, d, l] = eval.wdl;
-        let ms = start.elapsed().as_millis();
+        let ns = start.elapsed().as_nanos();
         let wdl = if self.show_wdl {
             let permille = |x: f32| (x * 1000.0).round() as i32;
             format!(
@@ -187,10 +187,11 @@ impl Engine for PolicyEngine {
         } else {
             String::new()
         };
+        let ms = ns / 1000000;
         println!(
             "info depth 1 seldepth 1 multipv 1 score cp {}{wdl} nodes 1 nps {} time {ms} pv {best}",
             q_to_cp(w - l),
-            1000 / ms.max(1)
+            1000000000 / ns.max(1)
         );
         SearchResult { best, ponder: None }
     }

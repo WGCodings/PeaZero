@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PeaZero Training</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec;
+  --accent: #2f7d4f; --bar: #dfe9e3;
+  --c1: #2f7d4f; --c2: #d9822b; --c3: #3a6fd8; --c4: #c2416b; --c5: #8a5cc7; --c6: #7f8796;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151b; --card: #1b1f27; --text: #e6e9ef; --muted: #8d95a6; --line: #2b313c;
+    --accent: #5cc285; --bar: #26372d;
+    --c1: #5cc285; --c2: #f0a04b; --c3: #6e9bf5; --c4: #ec6d96; --c5: #b48cf0; --c6: #9aa2b1;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12151b; --card: #1b1f27; --text: #e6e9ef; --muted: #8d95a6; --line: #2b313c;
+  --accent: #5cc285; --bar: #26372d;
+  --c1: #5cc285; --c2: #f0a04b; --c3: #6e9bf5; --c4: #ec6d96; --c5: #b48cf0; --c6: #9aa2b1;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 16px; padding: 16px 20px 4px; }
+header h1 { margin: 0; font-size: 20px; }
+header .sub { color: var(--muted); }
+main { padding: 8px 20px 32px; max-width: 1500px; margin: 0 auto; }
+.state { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+.dot.live { background: var(--accent); animation: pulse 1.6s infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.progress-card { margin-bottom: 14px; }
+.prow { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 16px; margin-bottom: 6px; }
+.prow .big { font-size: 18px; font-weight: 600; }
+.bar { height: 10px; background: var(--bar); border-radius: 5px; overflow: hidden; margin: 4px 0 10px; }
+.bar > div { height: 100%; background: var(--accent); width: 0; transition: width .6s; }
+.bar.thin { height: 6px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(165px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.tile .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.tile .value { font-size: 20px; font-weight: 600; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.tile .note { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.charts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 440px), 1fr)); gap: 12px; }
+.chart h3 { margin: 0 0 4px; font-size: 14px; }
+.chart .hint { color: var(--muted); font-size: 12px; margin: 0 0 6px; min-height: 16px; }
+.chart canvas { width: 100%; height: 220px; display: block; }
+.legend { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 12px; color: var(--muted); margin-top: 4px; }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 3px; border-radius: 2px;
+  background: var(--sw); margin-right: 5px; vertical-align: middle; }
+h2 { font-size: 15px; margin: 22px 0 8px; }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 13px; }
+th, td { padding: 5px 8px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; }
+th:first-child, td:first-child { text-align: left; }
+.empty { color: var(--muted); padding: 30px; text-align: center; }
+.controls { margin-left: auto; display: flex; gap: 10px; align-items: center; color: var(--muted); font-size: 13px; }
+.controls label { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
+@media (max-width: 600px) { header, main { padding-left: 16px; padding-right: 16px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>PeaZero Training</h1>
+  <span class="sub" id="runinfo">loading…</span>
+  <span class="state"><span class="dot" id="dot"></span><span id="statetext">–</span></span>
+  <div class="controls">
+    <label title="Only show the last 50 generations"><input type="checkbox" id="recent"> last 50 gens</label>
+  </div>
+</header>
+<main>
+  <div class="card progress-card">
+    <div class="prow">
+      <span class="big" id="genline">Generation –</span>
+      <span id="etaline">ETA –</span>
+    </div>
+    <div class="bar"><div id="runbar"></div></div>
+    <div class="prow"><span id="phaseline">–</span><span id="phasenote"></span></div>
+    <div class="bar thin"><div id="phasebar"></div></div>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+  <div class="charts" id="charts"></div>
+
+  <h2>Recent generations</h2>
+  <div class="card tablewrap"><table id="table"></table></div>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let metrics = [], status = null, config = {}, metricsText = "";
+
+// ------------------------------------------------------------------ formatting
+const fmtInt = (x) => x == null || isNaN(x) ? "–" : Math.round(x).toLocaleString("en-US");
+const fmtNum = (x, d = 3) => x == null || isNaN(x) ? "–" : Number(x).toFixed(d);
+const fmtPct = (x, d = 1) => x == null || isNaN(x) ? "–" : (100 * x).toFixed(d) + "%";
+function fmtBig(x) {
+  if (x == null || isNaN(x)) return "–";
+  if (x >= 1e9) return (x / 1e9).toFixed(2) + "B";
+  if (x >= 1e6) return (x / 1e6).toFixed(2) + "M";
+  if (x >= 1e4) return (x / 1e3).toFixed(1) + "k";
+  return fmtInt(x);
+}
+function fmtDur(s) {
+  if (s == null || !isFinite(s) || s < 0) return "–";
+  s = Math.round(s);
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+function fmtClock(t) {
+  const d = new Date(t * 1000), now = new Date();
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === now.toDateString() ? time
+    : d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }) + " " + time;
+}
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+// ------------------------------------------------------------------ charts
+const CHARTS = [
+  { id: "loss", title: "Total loss", hint: "policy + value, root and unrolled steps",
+    series: [{ name: "loss", key: "loss", color: "--c1" }] },
+  { id: "policy", title: "Policy loss", hint: "cross-entropy vs. Gumbel target; falls as the net learns",
+    series: [{ name: "root", key: "policy_loss", color: "--c1" },
+             { name: "unrolled (dynamics)", key: "policy_loss_unrolled", color: "--c2" }] },
+  { id: "value", title: "Value loss", hint: "W/D/L cross-entropy; may rise when decisive games appear",
+    series: [{ name: "root", key: "value_loss", color: "--c3" },
+             { name: "unrolled (dynamics)", key: "value_loss_unrolled", color: "--c2" }] },
+  { id: "agree", title: "Policy agreement", hint: "net's top move = target's top move",
+    pct: true, series: [{ name: "agreement", key: "policy_agreement", color: "--c1" }] },
+  { id: "results", title: "Self-play results", hint: "share of finished games", pct: true, min0: true,
+    series: [{ name: "white wins", get: (r) => frac(r, "white_wins"), color: "--c3" },
+             { name: "draws", get: (r) => frac(r, "draws"), color: "--c6" },
+             { name: "black wins", get: (r) => frac(r, "black_wins"), color: "--c4" }] },
+  { id: "terms", title: "How games end", hint: "share of finished games", pct: true, min0: true,
+    series: [{ name: "checkmate", get: (r) => term(r, "checkmate"), color: "--c1" },
+             { name: "50 moves", get: (r) => term(r, "fifty_moves"), color: "--c2" },
+             { name: "repetition", get: (r) => term(r, "repetition"), color: "--c3" },
+             { name: "insufficient", get: (r) => term(r, "insufficient_material"), color: "--c5" },
+             { name: "stalemate", get: (r) => term(r, "stalemate"), color: "--c4" },
+             { name: "ply limit", get: (r) => term(r, "max_plies"), color: "--c6" }] },
+  { id: "length", title: "Average game length", hint: "plies per finished game", min0: true,
+    series: [{ name: "plies", key: "avg_game_length", color: "--c5" }] },
+  { id: "time", title: "Time per generation", hint: "seconds", min0: true,
+    series: [{ name: "self-play", key: "selfplay_seconds", color: "--c3" },
+             { name: "training", key: "train_seconds", color: "--c2" }] },
+  { id: "speed", title: "Self-play speed", hint: "moves per second", min0: true,
+    series: [{ name: "moves/s", key: "moves_per_second", color: "--c3" }] },
+  { id: "lr", title: "Learning rate", hint: "at the end of each generation", min0: true,
+    series: [{ name: "lr", key: "lr", color: "--c6" }] },
+];
+function frac(r, k) { const g = r.results && r.results.games; return g ? r.results[k] / g : null; }
+function term(r, k) {
+  if (!r.terminations) return null;
+  const tot = Object.values(r.terminations).reduce((a, b) => a + b, 0);
+  return tot ? r.terminations[k] / tot : null;
+}
+
+function buildCharts() {
+  const root = $("charts");
+  for (const c of CHARTS) {
+    const el = document.createElement("div");
+    el.className = "card chart";
+    el.innerHTML = `<h3>${c.title}</h3><p class="hint" id="hint-${c.id}">${c.hint}</p>
+      <canvas id="cv-${c.id}"></canvas>
+      <div class="legend">${c.series.length > 1 ? c.series.map((s) =>
+        `<span style="--sw: var(${s.color})">${s.name}</span>`).join("") : ""}</div>`;
+    root.appendChild(el);
+    const cv = el.querySelector("canvas");
+    cv.addEventListener("mousemove", (e) => { c.hover = e.offsetX; drawChart(c); });
+    cv.addEventListener("mouseleave", () => { c.hover = null; drawChart(c); });
+  }
+}
+
+function niceTicks(lo, hi, n = 5) {
+  if (hi - lo < 1e-12) { hi = lo + (Math.abs(lo) || 1) * 0.1; lo -= (hi - lo); }
+  const raw = (hi - lo) / n, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => s >= raw) || raw;
+  const t0 = Math.floor(lo / step) * step, ticks = [];
+  for (let t = t0; t <= hi + step * 0.5; t += step) ticks.push(+t.toPrecision(12));
+  return { ticks, lo: ticks[0], hi: ticks[ticks.length - 1], step };
+}
+
+function chartData(c) {
+  let rows = metrics;
+  if ($("recent").checked) rows = rows.slice(-50);
+  return c.series.map((s) => ({ ...s,
+    pts: rows.map((r) => [r.generation, s.get ? s.get(r) : r[s.key]]).filter((p) => p[1] != null && isFinite(p[1])) }));
+}
+
+function drawChart(c) {
+  const cv = $("cv-" + c.id), dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== Math.round(W * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const data = chartData(c), all = data.flatMap((s) => s.pts);
+  const muted = css("--muted"), line = css("--line"), text = css("--text");
+  ctx.font = "11px system-ui, sans-serif";
+  if (!all.length) {
+    ctx.fillStyle = muted; ctx.textAlign = "center";
+    ctx.fillText("waiting for the first generation…", W / 2, H / 2);
+    return;
+  }
+  let xs = all.map((p) => p[0]), ys = all.map((p) => p[1]);
+  let x0 = Math.min(...xs), x1 = Math.max(...xs);
+  if (x1 === x0) { x0 -= 1; x1 += 1; }
+  let y0 = Math.min(...ys), y1 = Math.max(...ys);
+  if (c.min0) y0 = Math.min(0, y0);
+  const pad = (y1 - y0) * 0.06 || Math.abs(y1) * 0.05 || 0.05;
+  const yt = niceTicks(c.min0 && y0 === 0 ? 0 : y0 - pad, y1 + pad);
+  const yFmt = (v) => c.pct ? (100 * v).toFixed(yt.step * 100 < 1 ? 1 : 0) + "%"
+    : Math.abs(yt.step) < 1e-3 ? v.toExponential(0) : +v.toFixed(6) + "";
+  const labelW = Math.max(...yt.ticks.map((t) => ctx.measureText(yFmt(t)).width));
+  const L = labelW + 10, R = 8, T = 6, B = 20, pw = W - L - R, ph = H - T - B;
+  const X = (x) => L + (x - x0) / (x1 - x0) * pw, Y = (y) => T + (1 - (y - yt.lo) / (yt.hi - yt.lo)) * ph;
+
+  ctx.strokeStyle = line; ctx.lineWidth = 1; ctx.fillStyle = muted; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (const t of yt.ticks) {
+    const y = Math.round(Y(t)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W - R, y); ctx.stroke();
+    ctx.fillText(yFmt(t), L - 6, y);
+  }
+  const xt = niceTicks(x0, x1, Math.max(2, Math.floor(pw / 70)));
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  for (const t of xt.ticks) {
+    if (t < x0 || t > x1 || t % 1) continue;
+    ctx.fillText(t, X(t), H - B + 5);
+  }
+
+  for (const s of data) {
+    if (!s.pts.length) continue;
+    ctx.strokeStyle = css(s.color); ctx.lineWidth = 2; ctx.lineJoin = "round";
+    ctx.beginPath();
+    s.pts.forEach((p, i) => i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1])));
+    ctx.stroke();
+    if (s.pts.length < 40) {
+      ctx.fillStyle = css(s.color);
+      for (const p of s.pts) { ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 2.5, 0, 7); ctx.fill(); }
+    }
+  }
+
+  const hint = $("hint-" + c.id);
+  if (c.hover != null && c.hover >= L - 5) {
+    const gx = x0 + (c.hover - L) / pw * (x1 - x0);
+    const g = xs.reduce((a, b) => Math.abs(b - gx) < Math.abs(a - gx) ? b : a);
+    const px = Math.round(X(g)) + 0.5;
+    ctx.strokeStyle = muted; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(px, T); ctx.lineTo(px, T + ph); ctx.stroke(); ctx.setLineDash([]);
+    const parts = [];
+    for (const s of data) {
+      const p = s.pts.find((q) => q[0] === g);
+      if (!p) continue;
+      ctx.fillStyle = css(s.color); ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 4, 0, 7); ctx.fill();
+      const v = c.pct ? fmtPct(p[1]) : Math.abs(p[1]) < 0.01 && p[1] !== 0 ? p[1].toExponential(2)
+        : Math.abs(p[1]) >= 100 ? fmtInt(p[1]) : fmtNum(p[1], 3);
+      parts.push((data.length > 1 ? s.name + " " : "") + v);
+    }
+    hint.textContent = `gen ${g}: ` + parts.join(" · ");
+    hint.style.color = text;
+  } else {
+    hint.textContent = c.hint; hint.style.color = "";
+  }
+}
+const drawAll = () => CHARTS.forEach(drawChart);
+
+// ------------------------------------------------------------------ derived numbers
+function batchSize() { return (status && status.batch) || config.batch || 512; }
+function targetGens() { return (status && status.target_generations) || config.generations || null; }
+
+function avgGenSeconds() {
+  const recent = metrics.slice(-5);
+  if (!recent.length) return null;
+  const sp = recent.reduce((a, r) => a + r.selfplay_seconds, 0) / recent.length;
+  const tr = recent.reduce((a, r) => a + r.train_seconds, 0) / recent.length;
+  // wall time per generation incl. export/saving, when timestamps are available
+  const timed = recent.filter((r) => r.time);
+  let wall = null;
+  if (timed.length >= 2) {
+    const diffs = [];
+    for (let i = 1; i < recent.length; i++)
+      if (recent[i].time && recent[i - 1].time && recent[i].generation === recent[i - 1].generation + 1)
+        diffs.push(recent[i].time - recent[i - 1].time);
+    if (diffs.length) wall = diffs.reduce((a, b) => a + b, 0) / diffs.length;
+  }
+  return { sp, tr, total: wall && wall > sp + tr ? wall : sp + tr + 2 };
+}
+
+function isLive() { return status && status.phase !== "stopped" && status.updated && Date.now() / 1000 - status.updated < 90; }
+
+function etaSeconds() {
+  const tg = targetGens(), avg = avgGenSeconds();
+  if (!tg || !avg || !isLive()) return null;
+  const cur = status.generation;
+  let curLeft = avg.total;
+  if (status.phase === "selfplay") {
+    const f = Math.min(1, status.positions / status.positions_target || 0);
+    curLeft = (1 - f) * avg.sp + avg.tr + (avg.total - avg.sp - avg.tr);
+  } else if (status.phase === "training") {
+    const f = status.steps_done / status.steps_total || 0;
+    const el = Date.now() / 1000 - status.phase_start;
+    const trEst = f > 0.05 ? el / f : avg.tr;
+    curLeft = Math.max(0, trEst - el) + (avg.total - avg.sp - avg.tr);
+  } else if (status.phase === "saving") {
+    curLeft = 2;
+  }
+  return curLeft + Math.max(0, tg - cur) * avg.total;
+}
+
+// ------------------------------------------------------------------ rendering
+function tile(label, value, note = "") {
+  return `<div class="card tile"><div class="label">${label}</div><div class="value">${value}</div>
+    <div class="note">${note}</div></div>`;
+}
+
+function render() {
+  const last = metrics[metrics.length - 1], tg = targetGens(), live = isLive();
+  const s = status || {};
+  const runName = s.run || config.run || "";
+  $("runinfo").textContent = [runName.replace(/\\/g, "/").split("/").filter(Boolean).pop(),
+    s.net || config.net, s.params ? s.params.toFixed(2) + "M params" : "",
+    s.device ? s.device + (s.amp ? " fp16" : "") : ""].filter(Boolean).join(" · ");
+  $("dot").className = "dot" + (live ? " live" : "");
+  $("statetext").textContent = live ? "training" : status && status.updated
+    ? "not running · last update " + fmtClock(status.updated) : "not running";
+
+  // progress
+  const doneGen = last ? last.generation : 0;
+  const curGen = live ? s.generation : doneGen;
+  $("genline").textContent = `Generation ${live ? curGen : doneGen}` + (tg ? ` of ${tg}` : "");
+  let runFrac = 0;
+  if (tg) {
+    let within = 0;
+    const avg = avgGenSeconds(), spShare = avg ? avg.sp / (avg.sp + avg.tr) : 0.15;
+    if (live && s.phase === "selfplay") within = spShare * Math.min(1, s.positions / s.positions_target || 0);
+    else if (live && s.phase === "training") within = spShare + (1 - spShare) * (s.steps_done / s.steps_total || 0);
+    else if (live && s.phase === "saving") within = 1;
+    runFrac = Math.min(1, ((live ? curGen - 1 : doneGen) + within) / tg);
+  }
+  $("runbar").style.width = (100 * runFrac).toFixed(2) + "%";
+  const eta = etaSeconds();
+  $("etaline").textContent = eta != null
+    ? `ETA ${fmtDur(eta)} · done ~${fmtClock(Date.now() / 1000 + eta)}`
+    : live ? "ETA after the first generation" : "";
+
+  let phase = "Idle", note = "", pf = 0;
+  if (live && s.phase === "selfplay") {
+    pf = Math.min(1, s.positions / s.positions_target || 0);
+    phase = `Self-play · ${fmtInt(s.positions)} / ${fmtInt(s.positions_target)} positions`;
+    note = `${fmtInt(s.games_finished)} games finished · ${fmtInt(s.moves_per_second)} mv/s · ${fmtDur(Date.now() / 1000 - s.phase_start)}`;
+  } else if (live && s.phase === "training") {
+    pf = s.steps_done / s.steps_total || 0;
+    phase = `Training · step ${fmtInt(s.steps_done)} / ${fmtInt(s.steps_total)}`;
+    note = s.running ? `loss ${fmtNum(s.running.loss)} · p ${fmtNum(s.running.policy_loss)} · v ${fmtNum(s.running.value_loss)} · agree ${fmtPct(s.running.policy_agreement)}` : "";
+    note += ` · ${fmtInt(s.steps_per_second ? s.steps_per_second * batchSize() : null)} pos/s`;
+  } else if (live && s.phase === "saving") {
+    phase = "Saving network and checkpoint"; pf = 1;
+  } else if (live && s.phase === "loading") {
+    phase = "Loading replay buffer";
+  } else if (!live && last) {
+    phase = "Stopped"; note = `last generation finished ${last.time ? fmtClock(last.time) : ""}`;
+  }
+  $("phaseline").textContent = phase;
+  $("phasenote").textContent = note;
+  $("phasebar").style.width = (100 * pf).toFixed(1) + "%";
+
+  // tiles
+  const totPos = metrics.reduce((a, r) => a + (r.new_positions || 0), 0);
+  const totGames = metrics.reduce((a, r) => a + (r.new_games || 0), 0);
+  const step = live && s.step != null ? s.step : last ? last.step : 0;
+  const trained = step * batchSize();
+  const sessionStart = s.session_start;
+  const totalTime = metrics.reduce((a, r) => a + r.selfplay_seconds + r.train_seconds, 0);
+  const best = metrics.reduce((a, r) => r.policy_agreement > (a ? a.policy_agreement : -1) ? r : a, null);
+  const first = metrics[0];
+  const html = [
+    tile("Positions trained", fmtBig(trained), `${fmtInt(step)} steps × ${batchSize()}`),
+    tile("Positions generated", fmtBig(totPos), totPos ? `trained on ${(trained / totPos).toFixed(1)}× each` : ""),
+    tile("Games played", fmtBig(totGames), last ? `last gen ${fmtInt(last.new_games)}` : ""),
+    tile("Replay buffer", fmtBig(live && s.replay_positions != null ? s.replay_positions : last && last.replay_positions),
+      (s.replay_capacity || config.replay) ? `of ${fmtBig(s.replay_capacity || config.replay)}` : ""),
+    tile("Policy loss", last ? fmtNum(last.policy_loss) : "–",
+      first && last && first !== last ? `gen ${first.generation}: ${fmtNum(first.policy_loss)}` : ""),
+    tile("Value loss", last ? fmtNum(last.value_loss) : "–",
+      last ? `unrolled ${fmtNum(last.value_loss_unrolled)}` : ""),
+    tile("Agreement", last ? fmtPct(last.policy_agreement) : "–",
+      best ? `best ${fmtPct(best.policy_agreement)} (gen ${best.generation})` : ""),
+    tile("Results (W/D/B)", last ? ["white_wins", "draws", "black_wins"].map((k) => Math.round(100 * frac(last, k))).join(" / ") + "%" : "–",
+      last ? `${fmtPct(term(last, "checkmate"), 1)} checkmates` : ""),
+    tile("Game length", last ? fmtNum(last.avg_game_length, 1) : "–", "plies, last gen"),
+    tile("Self-play speed", last ? fmtInt(last.moves_per_second) : "–", "moves / s"),
+    tile("Gen time", last ? fmtDur(last.selfplay_seconds + last.train_seconds) : "–",
+      last ? `self-play ${fmtDur(last.selfplay_seconds)} · train ${fmtDur(last.train_seconds)}` : ""),
+    tile("Training time", fmtDur(totalTime),
+      live && sessionStart ? `this session ${fmtDur(Date.now() / 1000 - sessionStart)}` : "all generations"),
+  ];
+  $("tiles").innerHTML = html.join("");
+
+  // table
+  const rows = metrics.slice(-15).reverse();
+  $("table").innerHTML = rows.length ? `<tr><th>gen</th><th>games</th><th>W / D / B</th><th>len</th><th>mates</th>
+    <th>mv/s</th><th>self-play</th><th>train</th><th>loss</th><th>policy</th><th>value</th><th>p unrolled</th>
+    <th>v unrolled</th><th>agree</th><th>lr</th></tr>` + rows.map((r) => `<tr><td>${r.generation}</td>
+    <td>${fmtInt(r.new_games)}</td><td>${r.results ? `${r.results.white_wins} / ${r.results.draws} / ${r.results.black_wins}` : "–"}</td>
+    <td>${fmtNum(r.avg_game_length, 1)}</td><td>${r.terminations ? fmtInt(r.terminations.checkmate) : "–"}</td>
+    <td>${fmtInt(r.moves_per_second)}</td><td>${fmtNum(r.selfplay_seconds, 1)}s</td><td>${fmtNum(r.train_seconds, 1)}s</td>
+    <td>${fmtNum(r.loss)}</td><td>${fmtNum(r.policy_loss)}</td><td>${fmtNum(r.value_loss)}</td>
+    <td>${fmtNum(r.policy_loss_unrolled)}</td><td>${fmtNum(r.value_loss_unrolled)}</td>
+    <td>${fmtPct(r.policy_agreement)}</td><td>${r.lr != null ? r.lr.toExponential(1) : "–"}</td></tr>`).join("")
+    : `<tr><td class="empty">No finished generations yet.</td></tr>`;
+}
+
+// ------------------------------------------------------------------ polling
+async function fetchText(path) {
+  try { const r = await fetch(path + "?t=" + Date.now()); return r.ok ? await r.text() : null; }
+  catch { return null; }
+}
+async function poll() {
+  const [st, mt] = await Promise.all([fetchText("status.json"), fetchText("metrics.jsonl")]);
+  if (st) { try { status = JSON.parse(st); } catch { /* partial write, keep old */ } }
+  if (mt != null && mt !== metricsText) {
+    metricsText = mt;
+    const byGen = new Map();
+    for (const line of mt.split("\n")) {
+      if (!line.trim()) continue;
+      try { const r = JSON.parse(line); byGen.set(r.generation, r); } catch { /* skip */ }
+    }
+    metrics = [...byGen.values()].sort((a, b) => a.generation - b.generation);
+    drawAll();
+  }
+  render();
+}
+async function init() {
+  buildCharts();
+  const cfg = await fetchText("config.json");
+  if (cfg) { try { config = JSON.parse(cfg); } catch { } }
+  try { $("recent").checked = localStorage.getItem("pz-recent") === "1"; } catch { }
+  $("recent").addEventListener("change", () => {
+    try { localStorage.setItem("pz-recent", $("recent").checked ? "1" : "0"); } catch { }
+    drawAll();
+  });
+  window.addEventListener("resize", drawAll);
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);
+  await poll();
+  drawAll();
+  setInterval(poll, 2000);
+  setInterval(render, 1000);
+}
+init();
+</script>
+</body>
+</html>

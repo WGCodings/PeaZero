@@ -13,12 +13,16 @@ Run directory layout:
   <run>/config.json            arguments of the first start (for reference)
   <run>/checkpoint.pt          latest model + optimizer (used by --resume)
   <run>/metrics.jsonl          one line per generation
+  <run>/status.json            live progress (read by the dashboard)
   <run>/latest.pzn             copy of the newest network
   <run>/nets/gen_XXXX.pzn      network after every generation
   <run>/data/gen_XXXX/*.bin    self-play games (data format v0)
 
 Old data is deleted automatically once the replay buffer can no longer use
 it (see --keep-data-gens); networks are always kept.
+
+A live dashboard (statistics, charts, ETA) opens at http://localhost:8765
+while training; see --dashboard-port / --no-browser.
 """
 import argparse
 import glob
@@ -34,6 +38,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import peazero_rs as pz  # noqa: E402  (pip install ./crates/py)
+from peazero import dashboard  # noqa: E402
 from peazero import encoding as enc  # noqa: E402
 from peazero.model import MuZeroNet, NetConfig, export_pzn  # noqa: E402
 from peazero.train_lib import muzero_loss, selfplay_step  # noqa: E402
@@ -66,6 +71,8 @@ def parse_args():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-amp", action="store_true", help="disable fp16 autocast on CUDA")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--dashboard-port", type=int, default=8765, help="live dashboard port; 0 = no dashboard")
+    ap.add_argument("--no-browser", action="store_true", help="don't open the dashboard in a browser")
     return ap.parse_args()
 
 
@@ -121,13 +128,31 @@ def prune_data(run, keep):
 
 def main():
     args = parse_args()
+    for d in ("data", "nets"):
+        os.makedirs(os.path.join(args.run, d), exist_ok=True)
+    status = dashboard.StatusWriter(
+        args.run, run=os.path.abspath(args.run), target_generations=args.generations, batch=args.batch,
+        unroll=args.unroll, reuse=args.reuse, games=args.games, considered=args.considered,
+        positions_target=args.positions_per_gen, replay_capacity=args.replay)
+    status.update(force=True, phase="loading", generation=0)
+    if args.dashboard_port:
+        url = dashboard.start(args.run, args.dashboard_port, not args.no_browser)
+        if url:
+            print(f"dashboard: {url}")
+    try:
+        train(args, status)
+    except KeyboardInterrupt:
+        print("\nstopped (Ctrl+C); continue with --resume")
+    finally:
+        status.update(force=True, phase="stopped")
+
+
+def train(args, status):
     dev = torch.device(args.device)
     amp = not args.no_amp and dev.type == "cuda"
     torch.manual_seed(args.seed)
     if dev.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    for d in ("data", "nets"):
-        os.makedirs(os.path.join(args.run, d), exist_ok=True)
     migrate_flat_data(args.run)
     config_path = os.path.join(args.run, "config.json")
     if not os.path.exists(config_path):
@@ -166,6 +191,9 @@ def main():
     params = sum(p.numel() for p in net.parameters()) / 1e6
     print(f"net {args.net} ({params:.2f}M params) on {dev}{' fp16' if amp else ''}; "
           f"{args.games} games × {args.considered} considered")
+    status.update(force=True, net=args.net if not args.resume else f"{cfg.channels}x{cfg.repr_blocks}",
+                  params=params, device=dev.type, amp=amp, step=step, generation=gen,
+                  session_start_generation=gen, replay_positions=replay.positions)
 
     while gen < args.generations:
         gen += 1
@@ -177,9 +205,13 @@ def main():
         os.makedirs(gen_dir, exist_ok=True)
         stats_before = sp.stats()
         moves = 0
+        status.update(force=True, phase="selfplay", generation=gen, phase_start=t0, positions=0,
+                      games_finished=0, moves_per_second=None)
         while new_positions < args.positions_per_gen:
             selfplay_step(net, sp, dev, amp)
             moves += sp.num_games
+            status.update(positions=new_positions, games_finished=new_games,
+                          moves_per_second=moves / max(time.time() - t0, 1e-6), replay_positions=replay.positions)
             if moves % (sp.num_games * 32) == 0:
                 chunk, games, positions = sp.take_chunk()
                 if games:
@@ -200,7 +232,9 @@ def main():
         t1 = time.time()
         n_steps = max(1, int(new_positions * args.reuse / args.batch))
         sums = {}
-        for _ in range(n_steps):
+        status.update(force=True, phase="training", phase_start=t1, steps_done=0, steps_total=n_steps,
+                      running=None, positions=new_positions, games_finished=new_games, replay_positions=replay.positions)
+        for i in range(n_steps):
             step += 1
             lr = args.lr * min(1.0, step / args.warmup)
             for g in opt.param_groups:
@@ -215,10 +249,14 @@ def main():
             scaler.update()
             for k, v in m.items():
                 sums[k] = sums.get(k, 0.0) + v
+            if time.time() - status.last_write >= 1.0:
+                status.update(steps_done=i + 1, step=step, running={k: v / (i + 1) for k, v in sums.items()},
+                              steps_per_second=(i + 1) / max(time.time() - t1, 1e-6))
         train_time = time.time() - t1
         avg = {k: v / n_steps for k, v in sums.items()}
 
         # ---------------------------------------------------------------- save
+        status.update(force=True, phase="saving", steps_done=n_steps, step=step)
         net.eval()
         net_path = os.path.join(args.run, "nets", f"gen_{gen:04d}.pzn")
         export_pzn(net, net_path)
@@ -228,7 +266,7 @@ def main():
                     "generation": gen, "step": step}, ckpt_path)
 
         record = {
-            "generation": gen, "step": step, "lr": lr,
+            "generation": gen, "step": step, "lr": lr, "batch": args.batch, "time": round(time.time(), 1),
             "selfplay_seconds": round(sp_time, 1), "train_seconds": round(train_time, 1),
             "moves_per_second": round(moves / sp_time), "new_games": new_games, "new_positions": new_positions,
             "avg_game_length": round(new_positions / max(new_games, 1), 1),
