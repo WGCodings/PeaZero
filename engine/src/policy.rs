@@ -63,10 +63,24 @@ pub fn q_to_cp(q: f32) -> i32 {
     (111.714_640_912 * (1.562_068_842_1 * q).tan()).round() as i32
 }
 
+/// Legal moves with their policy probability (softmax over the legal
+/// moves' logits), most likely first: (move, probability, raw logit).
+pub fn move_probabilities(moves: &[(Move, f32)]) -> Vec<(Move, f32, f32)> {
+    let max = moves.iter().map(|m| m.1).fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = moves.iter().map(|m| (m.1 - max).exp()).sum();
+    let mut out: Vec<(Move, f32, f32)> = moves
+        .iter()
+        .map(|&(m, logit)| (m, (logit - max).exp() / sum, logit))
+        .collect();
+    out.sort_by(|a, b| b.1.total_cmp(&a.1));
+    out
+}
+
 pub struct PolicyEngine {
     net: PolicyNet,
     net_name: String,
     show_wdl: bool,
+    verbose_move_stats: bool,
 }
 
 impl PolicyEngine {
@@ -75,6 +89,7 @@ impl PolicyEngine {
             net: PolicyNet::embedded(),
             net_name: "<embedded>".to_string(),
             show_wdl: true,
+            verbose_move_stats: false,
         }
     }
 }
@@ -86,6 +101,7 @@ impl Engine for PolicyEngine {
         vec![
             format!("option name EvalFile type string default {}", self.net_name),
             "option name UCI_ShowWDL type check default true".to_string(),
+            "option name VerboseMoveStats type check default false".to_string(),
         ]
     }
 
@@ -112,6 +128,10 @@ impl Engine for PolicyEngine {
             }
             "uci_showwdl" => {
                 self.show_wdl = value.eq_ignore_ascii_case("true");
+                true
+            }
+            "verbosemovestats" => {
+                self.verbose_move_stats = value.eq_ignore_ascii_case("true");
                 true
             }
             _ => false,
@@ -144,6 +164,15 @@ impl Engine for PolicyEngine {
                 ponder: None,
             };
         };
+
+        if self.verbose_move_stats {
+            for (m, p, logit) in move_probabilities(&eval.moves) {
+                println!(
+                    "info string {m:<6} P: {:6.2}%  logit: {logit:7.3}",
+                    p * 100.0
+                );
+            }
+        }
 
         let [w, d, l] = eval.wdl;
         let ms = start.elapsed().as_millis();
@@ -190,6 +219,18 @@ mod tests {
             assert!(game.position().legal_moves().contains(&r.best));
             game.push(r.best);
         }
+    }
+
+    #[test]
+    fn move_probabilities_sum_to_one() {
+        peazero_core::init();
+        let mut net = PolicyNet::embedded();
+        let eval = net.evaluate(&Game::default());
+        let probs = move_probabilities(&eval.moves);
+        assert_eq!(probs.len(), 20);
+        let sum: f32 = probs.iter().map(|p| p.1).sum();
+        assert!((sum - 1.0).abs() < 1e-4);
+        assert!(probs.windows(2).all(|w| w[0].1 >= w[1].1));
     }
 
     #[test]
