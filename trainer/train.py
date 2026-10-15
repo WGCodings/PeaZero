@@ -6,16 +6,27 @@
 
 Each generation:
   1. self-play until --positions-per-gen new positions are recorded
-     (data saved to <run>/data/*.bin, data format v0)
   2. train ~positions × --reuse / --batch steps on the replay buffer
-  3. save <run>/checkpoint.pt and export <run>/nets/gen_XXXX.pzn
-     (upload that to OpenBench, or `setoption name EvalFile value ...`)
-Metrics go to <run>/metrics.jsonl and the console.
+  3. save the checkpoint and export the network
+
+Run directory layout:
+  <run>/config.json            arguments of the first start (for reference)
+  <run>/checkpoint.pt          latest model + optimizer (used by --resume)
+  <run>/metrics.jsonl          one line per generation
+  <run>/latest.pzn             copy of the newest network
+  <run>/nets/gen_XXXX.pzn      network after every generation
+  <run>/data/gen_XXXX/*.bin    self-play games (data format v0)
+
+Old data is deleted automatically once the replay buffer can no longer use
+it (see --keep-data-gens); networks are always kept.
 """
 import argparse
 import glob
 import json
+import math
 import os
+import re
+import shutil
 import sys
 import time
 
@@ -49,6 +60,9 @@ def parse_args():
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--warmup", type=int, default=500)
     ap.add_argument("--replay", type=int, default=1_000_000, help="replay buffer size in positions")
+    ap.add_argument("--keep-data-gens", type=int, default=-1,
+                    help="generations of self-play data kept on disk; -1 = just enough to refill the "
+                         "replay buffer on --resume (default), 0 = keep everything")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-amp", action="store_true", help="disable fp16 autocast on CUDA")
     ap.add_argument("--seed", type=int, default=0)
@@ -60,6 +74,51 @@ def log(run, record):
         f.write(json.dumps(record) + "\n")
 
 
+def data_gen_dirs(run):
+    """(generation, path) of every data/gen_XXXX folder, oldest first."""
+    out = []
+    for path in glob.glob(os.path.join(run, "data", "gen_*")):
+        m = re.fullmatch(r"gen_(\d+)", os.path.basename(path))
+        if m and os.path.isdir(path):
+            out.append((int(m.group(1)), path))
+    return sorted(out)
+
+
+def migrate_flat_data(run):
+    """Move files from the old flat layout (data/gen0001_000.bin) into
+    data/gen_0001/part_000.bin."""
+    moved = 0
+    for path in glob.glob(os.path.join(run, "data", "gen*_*.bin")):
+        m = re.fullmatch(r"gen(\d+)_(\d+)\.bin", os.path.basename(path))
+        if not m:
+            continue
+        target_dir = os.path.join(run, "data", f"gen_{int(m.group(1)):04d}")
+        os.makedirs(target_dir, exist_ok=True)
+        shutil.move(path, os.path.join(target_dir, f"part_{int(m.group(2)):03d}.bin"))
+        moved += 1
+    if moved:
+        print(f"moved {moved} data files into per-generation folders")
+
+
+def replay_gens(args):
+    """Generations of data needed to fill the replay buffer, plus one spare."""
+    return math.ceil(args.replay / args.positions_per_gen) + 1
+
+
+def data_gens_to_keep(args):
+    if args.keep_data_gens >= 0:
+        return args.keep_data_gens  # 0 = keep everything
+    return replay_gens(args)
+
+
+def prune_data(run, keep):
+    if keep <= 0:
+        return
+    dirs = data_gen_dirs(run)
+    for _, path in dirs[:-keep]:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def main():
     args = parse_args()
     dev = torch.device(args.device)
@@ -69,6 +128,12 @@ def main():
         torch.backends.cudnn.benchmark = True
     for d in ("data", "nets"):
         os.makedirs(os.path.join(args.run, d), exist_ok=True)
+    migrate_flat_data(args.run)
+    config_path = os.path.join(args.run, "config.json")
+    if not os.path.exists(config_path):
+        with open(config_path, "w") as f:
+            json.dump(vars(args), f, indent=2)
+    keep_gens = data_gens_to_keep(args)
     assert pz.ENCODING_VERSION == enc.ENCODING_VERSION, "rebuild peazero_rs: encoding version mismatch"
 
     ckpt_path = os.path.join(args.run, "checkpoint.pt")
@@ -88,11 +153,14 @@ def main():
         print(f"resumed {args.run} at generation {gen}, step {step}")
 
     replay = pz.Replay(capacity=args.replay, seed=args.seed + gen)
-    if args.resume:  # refill the replay buffer from the newest data files
-        for path in sorted(glob.glob(os.path.join(args.run, "data", "*.bin")))[-400:]:
-            with open(path, "rb") as f:
-                replay.add_chunk(f.read())
-        print(f"replay buffer: {replay.positions:,} positions from disk")
+    if args.resume:  # refill the replay buffer, oldest data first (newest must survive eviction)
+        dirs = data_gen_dirs(args.run)
+        refill = dirs[-replay_gens(args):]
+        for _, d in refill:
+            for path in sorted(glob.glob(os.path.join(d, "*.bin"))):
+                with open(path, "rb") as f:
+                    replay.add_chunk(f.read())
+        print(f"replay buffer: {replay.positions:,} positions from {len(refill)} generations on disk")
 
     sp = pz.SelfPlay(games=args.games, considered=args.considered, max_plies=args.max_plies, seed=args.seed + gen)
     params = sum(p.numel() for p in net.parameters()) / 1e6
@@ -105,6 +173,8 @@ def main():
         net.eval()
         t0 = time.time()
         new_positions, new_games, part = 0, 0, 0
+        gen_dir = os.path.join(args.run, "data", f"gen_{gen:04d}")
+        os.makedirs(gen_dir, exist_ok=True)
         stats_before = sp.stats()
         moves = 0
         while new_positions < args.positions_per_gen:
@@ -113,7 +183,7 @@ def main():
             if moves % (sp.num_games * 32) == 0:
                 chunk, games, positions = sp.take_chunk()
                 if games:
-                    path = os.path.join(args.run, "data", f"gen{gen:04d}_{part:03d}.bin")
+                    path = os.path.join(gen_dir, f"part_{part:03d}.bin")
                     with open(path, "wb") as f:
                         f.write(chunk)
                     replay.add_chunk(chunk)
@@ -152,6 +222,8 @@ def main():
         net.eval()
         net_path = os.path.join(args.run, "nets", f"gen_{gen:04d}.pzn")
         export_pzn(net, net_path)
+        shutil.copyfile(net_path, os.path.join(args.run, "latest.pzn"))
+        prune_data(args.run, keep_gens)
         torch.save({"model": net.state_dict(), "optimizer": opt.state_dict(), "config": cfg.__dict__,
                     "generation": gen, "step": step}, ckpt_path)
 

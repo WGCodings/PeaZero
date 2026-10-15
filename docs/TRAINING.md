@@ -30,6 +30,20 @@ python train.py --run ..\runs\first --resume
 
 Defaults: 1024 concurrent games, 16 considered moves per position, 100,000 new positions per generation, batch 512, K = 5, each position trained on ~4× on average, 1M-position replay buffer. See `python train.py --help`.
 
+## Run folder
+
+```
+runs/first/
+  config.json          arguments of the first start
+  checkpoint.pt        latest model + optimizer (used by --resume)
+  metrics.jsonl        one line per generation
+  latest.pzn           copy of the newest network
+  nets/gen_0001.pzn    every generation's network (kept, ~4 MB each)
+  data/gen_0012/       self-play games of generation 12 (part_000.bin, ...)
+```
+
+Self-play data is only needed to refill the replay buffer on `--resume`, so older generations are deleted automatically. By default the newest `replay / positions-per-gen + 1` generations are kept (11 with defaults, roughly 250 MB). Use `--keep-data-gens 0` to keep everything, for example to re-analyse old games later, or `--keep-data-gens N` for a fixed number. Runs using the old flat `data/genXXXX_YYY.bin` layout are reorganised automatically on the next start.
+
 ## What a generation does
 
 1. **Self-play.** All 1024 games make one move per step. The root is evaluated once (`initial`), Gumbel-Top-k picks 16 candidate moves, each candidate is evaluated once with the dynamics network (`recurrent`), and the move and policy target come from the Gumbel rules (docs/MUZERO.md §2, §6.2). Finished games are written to `runs/<name>/data/*.bin`.
