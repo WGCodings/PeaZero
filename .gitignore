@@ -1,0 +1,7 @@
+/target
+*.exe
+*.pdb
+/peazero
+/peazero-*
+*.pgn
+__pycache__/

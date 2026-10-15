@@ -1,0 +1,12 @@
+[package]
+name = "peazero-core"
+description = "Board representation, move generation and perft for PeaZero"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "peazero_core"
+
+[dependencies]
