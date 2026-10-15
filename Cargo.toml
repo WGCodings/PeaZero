@@ -1,5 +1,8 @@
 [workspace]
-members = ["crates/core", "crates/nn", "engine"]
+members = ["crates/core", "crates/nn", "crates/selfplay", "crates/py", "engine"]
+# crates/py is a Python extension (built with maturin / pip), not part of
+# plain `cargo build` / `cargo test`.
+default-members = ["crates/core", "crates/nn", "crates/selfplay", "engine"]
 resolver = "2"
 
 [workspace.package]

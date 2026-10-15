@@ -283,6 +283,43 @@ impl Position {
         self.hash ^= KEYS.side;
     }
 
+    /// The 12 piece bitboards in the order white P N B R Q K, black P N B R Q K
+    /// (the self-play data format's compact board).
+    pub fn piece_bitboards(&self) -> [u64; 12] {
+        let mut out = [0u64; 12];
+        for (ci, c) in Color::BOTH.iter().enumerate() {
+            for pt in PieceType::ALL {
+                out[ci * 6 + pt.idx()] = self.pieces_of(*c, pt).0;
+            }
+        }
+        out
+    }
+
+    /// Rebuild a position from the compact form stored in self-play data.
+    /// No legality validation: the data was produced by this engine.
+    pub fn from_compact(
+        pieces: &[u64; 12],
+        stm: Color,
+        castling: u8,
+        ep: Option<Square>,
+        halfmove: u16,
+    ) -> Position {
+        let mut pos = Position::empty();
+        for (i, &bb) in pieces.iter().enumerate() {
+            let color = if i < 6 { Color::White } else { Color::Black };
+            let p = Piece::new(color, PieceType::from_index(i % 6));
+            for sq in Bitboard(bb) {
+                pos.add_piece(p, sq);
+            }
+        }
+        pos.stm = stm;
+        pos.castling = castling & 0xF;
+        pos.ep = ep;
+        pos.halfmove = halfmove;
+        pos.hash = pos.compute_hash();
+        pos
+    }
+
     /// Hash recomputed from scratch (used to verify incremental updates).
     pub fn compute_hash(&self) -> u64 {
         let mut h = 0u64;
@@ -526,6 +563,21 @@ mod tests {
         ] {
             assert_eq!(Position::from_fen(fen).unwrap().to_fen(), fen);
         }
+    }
+
+    #[test]
+    fn compact_roundtrip() {
+        let p = Position::from_fen("rnbqkbnr/ppp1p1pp/8/3pPp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3")
+            .unwrap();
+        let q = Position::from_compact(
+            &p.piece_bitboards(),
+            p.side_to_move(),
+            p.castling_rights(),
+            p.ep_square(),
+            p.halfmove_clock(),
+        );
+        assert_eq!(p.to_fen(), q.to_fen().replace(" 1", " 3"));
+        assert_eq!(p.hash(), q.hash());
     }
 
     #[test]

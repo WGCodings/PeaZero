@@ -74,7 +74,7 @@ impl PolicyEngine {
         PolicyEngine {
             net: PolicyNet::embedded(),
             net_name: "<embedded>".to_string(),
-            show_wdl: false,
+            show_wdl: true,
         }
     }
 }
@@ -85,7 +85,7 @@ impl Engine for PolicyEngine {
     fn uci_options(&self) -> Vec<String> {
         vec![
             format!("option name EvalFile type string default {}", self.net_name),
-            "option name UCI_ShowWDL type check default false".to_string(),
+            "option name UCI_ShowWDL type check default true".to_string(),
         ]
     }
 

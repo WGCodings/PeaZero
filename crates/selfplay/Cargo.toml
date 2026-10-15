@@ -1,0 +1,10 @@
+[package]
+name = "peazero-selfplay"
+description = "Root-only Gumbel self-play, training data format and replay sampling for PeaZero"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+peazero-core = { path = "../core" }

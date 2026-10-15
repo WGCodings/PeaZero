@@ -160,12 +160,14 @@ def write_pzn(initial_onnx: str, recurrent_onnx: str, out_path: str) -> None:
 
 
 def export_pzn(net: MuZeroNet, out_path: str) -> None:
-    """Export straight to a single .pzn file."""
+    """Export straight to a single .pzn file (works for a net on any device)."""
+    import copy
     import os
     import tempfile
 
+    cpu_net = copy.deepcopy(net).float().cpu()
     with tempfile.TemporaryDirectory() as tmp:
-        export_onnx(net, tmp)
+        export_onnx(cpu_net, tmp)
         write_pzn(os.path.join(tmp, "initial.onnx"), os.path.join(tmp, "recurrent.onnx"), out_path)
 
 

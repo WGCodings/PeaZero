@@ -2,6 +2,7 @@
 torch>=2.4          # install the CUDA build: https://pytorch.org/get-started/locally/
 numpy
 onnx
+maturin             # builds ../crates/py (pip install ./crates/py)
 # optional
 onnxruntime-gpu     # bench_gpu.py ort-cuda numbers
 chess               # tests / analysis only

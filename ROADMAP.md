@@ -25,7 +25,7 @@ Roughly 5 days/week. Each sprint ends with: test what we have → review → pla
 | 1 ✅ | Phases 1–4: board, legal movegen, perft suite, UCI, random mover, OpenBench hooks (`bench`, Makefile) | done: 4.8B perft nodes correct, 1000-game stress clean, OB progtest ran |
 | 2 ✅ | Phase 5 research + decisions, action/observation encodings (Rust + Python mirror), PyTorch→ONNX→tract inference spike | done: docs/MUZERO.md, 486 Rust↔Python encoding checks, tract matches PyTorch to 1e-7. Open: run `bench_gpu.py` on the 3070 |
 | 3 ✅ | **Searchless** engine: one network eval per move, play the best legal policy move. `.pzn` network file, embedded via `EVALFILE`, `EvalFile` UCI option, network-independent bench, thin LTO for faster OB builds | done: untrained 64×6 net plays 300/300 legal games vs random (−120 Elo: the baseline training must beat) |
-| **4** | Self-play data generation + trainer (data format v0, K=5 unroll loss, export loop); training-target approach to be decided at sprint start | trained net beats random on OB |
+| **4** | Root-only Gumbel self-play (Rust pool, PyO3 bindings) + PyTorch trainer (K=5 unroll loss, data format v0, export every generation). Engine stays searchless | pipeline done and verified on CPU; **open: first real run on the 3070, then SPRT vs the random-init net on OB** |
 | 5+ | Gumbel MCTS in the engine (mctx port), then the network/search improvement loop | — |
 | 5+ | Network/search improvement loop, every change SPRT-tested on OB | — |
 

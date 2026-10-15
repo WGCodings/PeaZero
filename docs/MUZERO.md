@@ -142,10 +142,18 @@ per game    : u16 ply count | i8 result (+1 white win, 0 draw, −1 black win) |
 per ply     : 12 × u64 piece bitboards (absolute, P N B R Q K white then black)
               u8 side to move | u8 castling | u8 ep square (64 = none) | u8 halfmove clock
               u8 repetitions | u16 action played
-              u8 legal count L | L × (u16 action, f16 target probability)
+              u8 legal count L | L × (u16 action, u16 target probability × 65535)
 ```
 
-≈ 250 bytes per position; the trainer turns the compact board into observation planes itself (vectorised numpy), checked against the same Rust test vectors.
+≈ 215 bytes per position (measured). Implemented in `crates/selfplay/src/record.rs`. The trainer never decodes it in Python: the Rust replay buffer (`peazero_rs.Replay`) samples batches and encodes observations with the engine's own encoder.
+
+## 6.2 Sprint 4: root-only Gumbel self-play (engine stays searchless)
+
+Per self-play move: one `initial` call on the root, Gumbel-Top-k picks `m = 16` legal moves, each is evaluated **once** with `recurrent` (dynamics + prediction), then §2.1 steps 5–6 pick the move and produce the policy target. With one visit per considered action, Sequential Halving is a single round (mctx with `n == m`). That's 17 network calls per move, so a 1024-game pool means batches of 1024 and 16,384.
+
+Deviation from mctx: the min-max rescale of completed Q uses an epsilon of 1e-4 instead of 1e-8, and the mixed value is summed in f64. Otherwise f32 rounding noise between equal Q-values (~1e-8) gets blown up into a full-scale preference.
+
+Architecture: Rust (`crates/selfplay`, exposed to Python as `peazero_rs`) owns the games, Gumbel selection, data files and batch sampling; Python only runs the network in PyTorch (fp16 on CUDA was ~2.5× faster than onnxruntime-CUDA in the spike).
 
 ## 7. Reference implementations reviewed
 

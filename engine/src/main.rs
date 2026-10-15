@@ -35,6 +35,7 @@ fn main() {
         }
         // Baseline opponent for sanity matches: `peazero random`.
         Some("random") => uci::UciLoop::new(Box::new(random::RandomEngine::new())).run(),
-        _ => uci::UciLoop::new(Box::new(policy::PolicyEngine::new())).run(),
+
+        _ => uci::UciLoop::new(Box::new(random::RandomEngine::new())).run(),
     }
 }
