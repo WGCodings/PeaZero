@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "peazero"
@@ -12,3 +13,4 @@ path = "src/main.rs"
 
 [dependencies]
 peazero-core = { path = "../crates/core" }
+peazero-nn = { path = "../crates/nn" }

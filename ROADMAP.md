@@ -8,7 +8,11 @@ Goal: a UCI chess engine whose move choice comes from **pure MuZero**. That mean
 - Algorithm: pure MuZero, using **Gumbel MuZero** search (Danihelka et al. 2022). It guarantees policy improvement even with very few simulations (16–32), which cuts self-play compute by an order of magnitude compared to 800-sim pUCT.
 - Data: **pure self-play** only, with no supervised bootstrap.
 - Testing: every change, whether to search or network, is validated by **SPRT on PeaOB** (OpenBench).
-- Trainer stack: decided at the end of Phase 5.
+- Self-play + training: locally on the RTX 3070. OpenBench workers only *play* (CPU inference).
+- Trainer: our own small PyTorch trainer; losses/tricks ported from LightZero (`gumbel_muzero`) and the MuZero paper. Search ported from DeepMind `mctx` to Rust.
+- Inference: `tract` (pure Rust) on CPU for the engine/OpenBench; hand-written SIMD later. ONNX Runtime CUDA (`ort` crate, Cargo feature) for self-play only.
+- Repo: public at github.com/WGCodings/PeaZero, registered on PeaOB (`Engines/PeaZero.json`).
+- Details and rationale: [docs/MUZERO.md](docs/MUZERO.md).
 - Language: Rust for everything that ships. Python or an external project is allowed for training.
 - First network milestone: **a small model that reliably plays legal chess** (and beats random), not strength.
 - The project is open-ended: after the first net, it's a continuous loop of search and network improvements.
@@ -18,10 +22,11 @@ Roughly 5 days/week. Each sprint ends with: test what we have → review → pla
 
 | Sprint | Scope | Done when |
 |---|---|---|
-| **1** | Phases 1–4: board, legal movegen, perft suite, UCI, random mover, OpenBench hooks (`bench`, Makefile) | all perft passes, random mover playable in a GUI, OB can build it and run a test |
-| 2 | Phase 5 research + trainer/inference decision, action encoding spec, observation planes in Rust | written decision, encoding round-trip tests |
-| 3 | Gumbel MuZero search + batched self-play generator with an untrained net | self-play produces valid training data at a measured games/hour |
-| 4 | Trainer + first training loop, tiny net | net plays legal chess, beats random on OB |
+| 1 ✅ | Phases 1–4: board, legal movegen, perft suite, UCI, random mover, OpenBench hooks (`bench`, Makefile) | done: 4.8B perft nodes correct, 1000-game stress clean, OB progtest ran |
+| 2 ✅ | Phase 5 research + decisions, action/observation encodings (Rust + Python mirror), PyTorch→ONNX→tract inference spike | done: docs/MUZERO.md, 486 Rust↔Python encoding checks, tract matches PyTorch to 1e-7. Open: run `bench_gpu.py` on the 3070 |
+| 3 ✅ | **Searchless** engine: one network eval per move, play the best legal policy move. `.pzn` network file, embedded via `EVALFILE`, `EvalFile` UCI option, network-independent bench, thin LTO for faster OB builds | done: untrained 64×6 net plays 300/300 legal games vs random (−120 Elo: the baseline training must beat) |
+| **4** | Self-play data generation + trainer (data format v0, K=5 unroll loss, export loop); training-target approach to be decided at sprint start | trained net beats random on OB |
+| 5+ | Gumbel MCTS in the engine (mctx port), then the network/search improvement loop | — |
 | 5+ | Network/search improvement loop, every change SPRT-tested on OB | — |
 
 ### OpenBench requirements (apply from Sprint 1)
@@ -190,7 +195,9 @@ The random mover (Phase 4) and the MuZero engine (Phase 7) are both implementati
 - [x] Supervised bootstrapping: **no**, pure self-play
 - [x] Testing: PeaOB SPRT for everything
 - [ ] Chess960 support: in scope or not?
-- [ ] Where does self-play run: on the 3070 locally, or distributed via OB workers (OB doesn't do self-play data generation natively)?
+- [x] Self-play location: locally on the 3070 (OB datagen workloads with a tiny net = possible later)
+- [x] Trainer: own PyTorch trainer using LightZero/mctx as references
+- [x] CPU inference: tract now, SIMD later
 
 ## Risks
 - **Compute.** Pure MuZero for chess from zero is very expensive. Mitigations: tiny nets, Gumbel search, reanalyze, optional supervised bootstrap.

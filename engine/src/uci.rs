@@ -16,7 +16,7 @@ use peazero_core::{Game, Position, START_FEN};
 use crate::engine::{CommonOptions, Engine, SearchLimits};
 
 const NAME: &str = "PeaZero";
-const AUTHOR: &str = "WGCodings";
+const AUTHOR: &str = "WG";
 
 pub struct UciLoop {
     game: Game,
@@ -101,7 +101,7 @@ impl UciLoop {
             ),
             "bench" => {
                 self.stop_search();
-                crate::bench::run(tokens.get(1).and_then(|d| d.parse().ok()));
+                crate::bench::run(&mut crate::policy::PolicyNet::embedded());
             }
             "perft" => {
                 self.stop_search();

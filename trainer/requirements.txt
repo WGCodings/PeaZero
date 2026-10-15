@@ -1,0 +1,8 @@
+# Trainer (runs on the RTX 3070 machine)
+torch>=2.4          # install the CUDA build: https://pytorch.org/get-started/locally/
+numpy
+onnx
+# optional
+onnxruntime-gpu     # bench_gpu.py ort-cuda numbers
+chess               # tests / analysis only
+pytest

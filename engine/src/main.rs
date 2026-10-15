@@ -1,5 +1,6 @@
 mod bench;
 mod engine;
+mod policy;
 mod random;
 mod timeman;
 mod uci;
@@ -11,8 +12,14 @@ fn main() {
     match args.first().map(String::as_str) {
         // OpenBench runs `<engine> bench` and parses "<nodes> nodes <nps> nps".
         Some("bench") => {
-            let depth = args.get(1).and_then(|d| d.parse().ok());
-            bench::run(depth);
+            let mut net = match args.get(1) {
+                Some(path) => {
+                    policy::PolicyNet::from_pzn(&std::fs::read(path).expect("read network"))
+                        .expect("load network")
+                }
+                None => policy::PolicyNet::embedded(),
+            };
+            bench::run(&mut net);
         }
         Some("perft") => {
             let depth = args.get(1).and_then(|d| d.parse().ok()).unwrap_or(5);
@@ -26,6 +33,8 @@ fn main() {
                 Err(e) => eprintln!("{e}"),
             }
         }
-        _ => uci::UciLoop::new(Box::new(random::RandomEngine::new())).run(),
+        // Baseline opponent for sanity matches: `peazero random`.
+        Some("random") => uci::UciLoop::new(Box::new(random::RandomEngine::new())).run(),
+        _ => uci::UciLoop::new(Box::new(policy::PolicyEngine::new())).run(),
     }
 }

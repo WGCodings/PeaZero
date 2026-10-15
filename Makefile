@@ -1,7 +1,9 @@
-# OpenBench builds with:  make EXE=<name>
+# OpenBench builds with:  make EXE=<name> [EVALFILE=<path to .pzn>]
 # The first target is the default.
 
-EXE := peazero
+EXE      := peazero
+EVALFILE ?= networks/default.pzn
+export EVALFILE
 
 ifeq ($(OS),Windows_NT)
 	NAME := $(EXE).exe

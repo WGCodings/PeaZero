@@ -5,6 +5,7 @@
 
 pub mod attacks;
 pub mod bitboard;
+pub mod encoding;
 pub mod game;
 pub mod movegen;
 pub mod moves;

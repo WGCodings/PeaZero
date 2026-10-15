@@ -1,0 +1,15 @@
+[package]
+name = "peazero-nn"
+description = "MuZero network inference for PeaZero (CPU via tract)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+peazero-core = { path = "../core" }
+tract-onnx = "0.23"
+
+[[bin]]
+name = "nnbench"
+path = "src/bin/nnbench.rs"

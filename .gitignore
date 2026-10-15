@@ -5,3 +5,5 @@
 /peazero-*
 *.pgn
 __pycache__/
+/models
+.pytest_cache/

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "engine"]
+members = ["crates/core", "crates/nn", "engine"]
 resolver = "2"
 
 [workspace.package]
@@ -10,10 +10,17 @@ license = "GPL-3.0-or-later"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
-codegen-units = 1
+lto = "thin"
 panic = "abort"
 debug = false
+
+# Our own hot code gets a single codegen unit; dependencies (tract) keep
+# the default parallel codegen so OpenBench builds stay fast.
+[profile.release.package.peazero-core]
+codegen-units = 1
+
+[profile.release.package.peazero]
+codegen-units = 1
 
 # Tests run with `cargo test --release`; keep them fast but unwinding.
 [profile.test]
