@@ -25,9 +25,9 @@ Roughly 5 days/week. Each sprint ends with: test what we have → review → pla
 | 1 ✅ | Phases 1–4: board, legal movegen, perft suite, UCI, random mover, OpenBench hooks (`bench`, Makefile) | done: 4.8B perft nodes correct, 1000-game stress clean, OB progtest ran |
 | 2 ✅ | Phase 5 research + decisions, action/observation encodings (Rust + Python mirror), PyTorch→ONNX→tract inference spike | done: docs/MUZERO.md, 486 Rust↔Python encoding checks, tract matches PyTorch to 1e-7. Open: run `bench_gpu.py` on the 3070 |
 | 3 ✅ | **Searchless** engine: one network eval per move, play the best legal policy move. `.pzn` network file, embedded via `EVALFILE`, `EvalFile` UCI option, network-independent bench, thin LTO for faster OB builds | done: untrained 64×6 net plays 300/300 legal games vs random (−120 Elo: the baseline training must beat) |
-| **4** | Root-only Gumbel self-play (Rust pool, PyO3 bindings) + PyTorch trainer (K=5 unroll loss, data format v0, export every generation). Engine stays searchless | pipeline done and verified on CPU; **open: first real run on the 3070, then SPRT vs the random-init net on OB** |
-| 5+ | Gumbel MCTS in the engine (mctx port), then the network/search improvement loop | — |
-| 5+ | Network/search improvement loop, every change SPRT-tested on OB | — |
+| 4 ✅ | Root-only Gumbel self-play (Rust pool, PyO3 bindings) + PyTorch trainer (K=5 unroll loss, data format v0, export every generation), live dashboard. Engine stays searchless | done: runs on the 3070 (~11k moves/s). Fixed: BatchNorm statistics mixed root and dynamics latents → exported net broken in eval mode (run `first` peaked at gen 200); per-graph recalibration since run `second` (+100 Elo at gen 100). Learning still slow: one-ply targets through the dynamics net |
+| **5** | Self-play with Gumbel **tree search** (64 simulations) on the real board, leaves evaluated with `initial` (docs/MUZERO.md §6.3). Engine stays searchless | implemented + tested (finds mate in 1, avoids defended-pawn capture a one-ply search plays); **open: run `third` on the 3070, SPRT vs `second`** |
+| 6+ | Policy net in an alpha-beta engine (own framework); value-target improvements (search value mixing, lower sampling noise after the opening); network/search improvement loop, every change SPRT-tested on OB | — |
 
 ### OpenBench requirements (apply from Sprint 1)
 - `Makefile` at repo root that honours `EXE=` (OB builds with `make EXE=<name>`).

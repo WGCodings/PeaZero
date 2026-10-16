@@ -15,6 +15,7 @@ pub mod gumbel;
 pub mod pool;
 pub mod record;
 pub mod replay;
+pub mod search;
 
 /// Scalar value `W - L` from W/D/L logits (side-to-move perspective).
 pub fn wdl_logits_to_q(logits: &[f32]) -> f32 {

@@ -41,7 +41,8 @@ import peazero_rs as pz  # noqa: E402  (pip install ./crates/py)
 from peazero import dashboard  # noqa: E402
 from peazero import encoding as enc  # noqa: E402
 from peazero.model import MuZeroNet, NetConfig, export_pzn  # noqa: E402
-from peazero.train_lib import batch_to_device, calibrate_bn, eval_metrics, muzero_loss, selfplay_step  # noqa: E402
+from peazero.train_lib import (  # noqa: E402
+    batch_to_device, calibrate_bn, eval_metrics, muzero_loss, search_step, selfplay_step)
 
 SIZES = {"32x4": (32, 4), "64x6": (64, 6), "128x10": (128, 10)}
 
@@ -54,7 +55,11 @@ def parse_args():
     ap.add_argument("--generations", type=int, default=1000)
     # self-play
     ap.add_argument("--games", type=int, default=1024, help="concurrent self-play games")
-    ap.add_argument("--considered", type=int, default=16, help="Gumbel m: actions evaluated per move")
+    ap.add_argument("--simulations", type=int, default=64,
+                    help="tree-search simulations per move on the real board (Gumbel MuZero search, "
+                         "AlphaZero-style evaluation); 0 = old root-only mode through the dynamics network")
+    ap.add_argument("--considered", type=int, default=16,
+                    help="Gumbel m: root candidates (Sequential Halving width; root-only mode: evaluations per move)")
     ap.add_argument("--max-plies", type=int, default=512)
     ap.add_argument("--threads", type=int, default=0,
                     help="CPU threads for the Rust self-play work (0 = all logical CPUs); "
@@ -199,18 +204,21 @@ def train(args, status):
                     replay.add_chunk(f.read())
         print(f"replay buffer: {replay.positions:,} positions from {len(refill)} generations on disk")
 
-    try:
+    if args.simulations > 0:
+        if not hasattr(pz, "SearchSelfPlay"):
+            sys.exit("peazero_rs is out of date (no tree search); run `pip install ./crates/py`")
+        sp = pz.SearchSelfPlay(games=args.games, simulations=args.simulations, considered=args.considered,
+                               max_plies=args.max_plies, seed=args.seed + gen, threads=args.threads)
+        mode = f"{args.simulations} simulations, {args.considered} considered"
+    else:
         sp = pz.SelfPlay(games=args.games, considered=args.considered, max_plies=args.max_plies,
                          seed=args.seed + gen, threads=args.threads)
-        sp_threads = sp.num_threads
-    except TypeError:  # peazero_rs built before --threads existed
-        print("note: peazero_rs is out of date (no --threads support); run `pip install ./crates/py`")
-        sp = pz.SelfPlay(games=args.games, considered=args.considered, max_plies=args.max_plies, seed=args.seed + gen)
-        sp_threads = 1
+        mode = f"root-only, {args.considered} considered"
+    sp_threads = sp.num_threads
     params = sum(p.numel() for p in net.parameters()) / 1e6
     net_name = f"{cfg.channels}x{cfg.repr_blocks}"
     print(f"net {net_name} ({params:.2f}M params) on {dev}{' fp16' if amp else ''}; "
-          f"{args.games} games × {args.considered} considered, {sp_threads} self-play threads, batch {args.batch}")
+          f"{args.games} games, {mode}, {sp_threads} self-play threads, batch {args.batch}")
     status.update(force=True, net=net_name,
                   params=params, device=dev.type, amp=amp, step=step, generation=gen,
                   session_start_generation=gen, replay_positions=replay.positions)
@@ -226,15 +234,24 @@ def train(args, status):
         gen_dir = os.path.join(args.run, "data", f"gen_{gen:04d}")
         os.makedirs(gen_dir, exist_ok=True)
         stats_before = sp.stats()
-        moves = 0
         status.update(force=True, phase="selfplay", generation=gen, phase_start=t0, positions=0,
                       games_finished=0, moves_per_second=None)
+        # root-only: one step = one move per game; search: one step = one
+        # simulation per game (~simulations + 1 steps per move)
+        chunk_every = 32 if args.simulations == 0 else 8 * (args.simulations + 1)
+        steps = 0
         while new_positions < args.positions_per_gen:
-            selfplay_step(init_net, sp, dev, amp, rec_net)
-            moves += sp.num_games
-            status.update(positions=new_positions, games_finished=new_games,
-                          moves_per_second=moves / max(time.time() - t0, 1e-6), replay_positions=replay.positions)
-            if moves % (sp.num_games * 32) == 0:
+            if args.simulations > 0:
+                search_step(init_net, sp, dev, amp)
+            else:
+                selfplay_step(init_net, sp, dev, amp, rec_net)
+            steps += 1
+            if time.time() - status.last_write >= 1.0:
+                moves = sp.stats()["plies"] - stats_before["plies"]
+                status.update(positions=new_positions, games_finished=new_games,
+                              moves_per_second=moves / max(time.time() - t0, 1e-6),
+                              replay_positions=replay.positions)
+            if steps % chunk_every == 0:
                 chunk, games, positions = sp.take_chunk()
                 if games:
                     path = os.path.join(gen_dir, f"part_{part:03d}.bin")
@@ -246,6 +263,7 @@ def train(args, status):
                     new_games += games
         sp_time = time.time() - t0
         st = sp.stats()
+        moves = st["plies"] - stats_before["plies"]
         d = {k: st[k] - stats_before[k] for k in ("games", "white_wins", "black_wins", "draws")}
         terms = {k: st["terminations"][k] - stats_before["terminations"][k] for k in st["terminations"]}
 

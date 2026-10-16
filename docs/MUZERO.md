@@ -155,6 +155,23 @@ Deviation from mctx: the min-max rescale of completed Q uses an epsilon of 1e-4 
 
 Architecture: Rust (`crates/selfplay`, exposed to Python as `peazero_rs`) owns the games, Gumbel selection, data files and batch sampling; Python only runs the network in PyTorch (fp16 on CUDA was ~2.5× faster than onnxruntime-CUDA in the spike).
 
+## 6.3 Sprint 5: Gumbel tree search on the real board (self-play only)
+
+Root-only Gumbel (§6.2) looks one ply deep and takes its child values from the dynamics network, whose values correlated only ~0.3 with the network's own evaluation of the real child positions. That made the policy targets barely better than the prior, so learning was slow (after ~50M positions a queen was worth only +0.13 W−L to the value head).
+
+`crates/selfplay/src/search.rs` now runs the full mctx `gumbel_muzero_policy` per move, with `n` simulations (default 64):
+
+* every node is a real position (moves made with our movegen); leaves are evaluated with `initial` (representation + prediction), AlphaZero-style; the dynamics network is not used in self-play;
+* root: Gumbel noise + Sequential Halving schedule over `m = 16` candidates (`get_table_of_considered_visits`; 64 simulations → 16 candidates × 1 visit, 8 × 2 more, 4 × 4 more, the final 2 the rest);
+* interior: deterministic `argmax π'(a) − N(a)/(1+ΣN)`, `π' = softmax(logits + σ(q̂))`;
+* completed Q with the mixed value, min-max rescaled, `σ = (50 + max N) · 0.1 · q̂` (epsilon 1e-4, see §6.2);
+* checkmate / draw leaves (incl. repetition and 50-move rule from the game history) get their exact value and cost no network call;
+* move: Sequential Halving winner; policy target: `softmax(logits + σ(q̂))` at the root.
+
+Tests (`search::tests`): the schedule matches mctx's Python implementation; with a material-only value and a uniform policy the search finds a back-rank mate in one, takes a hanging rook, and refuses a pawn defended by a pawn (Qxd5?? exd5), which a one-ply search with the same networks plays.
+
+Training is unchanged (K-step unroll still trains the dynamics network; with `--unroll 0` training becomes AlphaZero-style and much cheaper). The engine stays searchless.
+
 ## 7. Reference implementations reviewed
 
 | project | what we take | what we don't |

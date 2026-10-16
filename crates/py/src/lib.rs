@@ -22,9 +22,11 @@ use peazero_core::encoding::{
 };
 use peazero_core::Game;
 use peazero_selfplay::gumbel::GumbelConfig;
+use peazero_selfplay::pool::PoolStats;
 use peazero_selfplay::pool::{GamePool, PoolConfig};
 use peazero_selfplay::record::{write_chunk, Termination};
 use peazero_selfplay::replay::{Replay as RustReplay, MAX_LEGAL};
+use peazero_selfplay::search::{SearchConfig, SearchPool};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -172,19 +174,138 @@ impl SelfPlay {
     }
 
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let s = self.pool.stats();
-        let d = PyDict::new(py);
-        d.set_item("games", s.games_finished)?;
-        d.set_item("plies", s.plies)?;
-        d.set_item("white_wins", s.white_wins)?;
-        d.set_item("black_wins", s.black_wins)?;
-        d.set_item("draws", s.draws)?;
-        let t = PyDict::new(py);
-        for (i, &count) in s.terminations.iter().enumerate() {
-            t.set_item(Termination::from_u8(i as u8).unwrap().name(), count)?;
+        stats_dict(py, self.pool.stats())
+    }
+}
+
+fn stats_dict<'py>(py: Python<'py>, s: &PoolStats) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("games", s.games_finished)?;
+    d.set_item("plies", s.plies)?;
+    d.set_item("white_wins", s.white_wins)?;
+    d.set_item("black_wins", s.black_wins)?;
+    d.set_item("draws", s.draws)?;
+    let t = PyDict::new(py);
+    for (i, &count) in s.terminations.iter().enumerate() {
+        t.set_item(Termination::from_u8(i as u8).unwrap().name(), count)?;
+    }
+    d.set_item("terminations", t)?;
+    Ok(d)
+}
+
+/// Self-play with Gumbel MuZero tree search on the real board (only the
+/// `initial` network is needed). Lock-step rounds:
+///
+/// ```python
+/// sp = pz.SearchSelfPlay(games=1024, simulations=64)
+/// obs, legal = sp.requests()          # (N,21,8,8) float32, (N,218) int32
+/// # policy (N,4672) → gather legal → (N,218); value (N,3)
+/// sp.respond(legal_logits, value)     # one simulation for every game
+/// ```
+#[pyclass]
+struct SearchSelfPlay {
+    pool: SearchPool,
+}
+
+#[pymethods]
+impl SearchSelfPlay {
+    #[new]
+    #[pyo3(signature = (games=1024, simulations=64, considered=16, gumbel_scale=1.0, c_visit=50.0, c_scale=0.1, max_plies=512, seed=0, threads=0))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        games: usize,
+        simulations: usize,
+        considered: usize,
+        gumbel_scale: f32,
+        c_visit: f32,
+        c_scale: f32,
+        max_plies: usize,
+        seed: u64,
+        threads: usize,
+    ) -> PyResult<Self> {
+        if games == 0 || considered == 0 || simulations == 0 {
+            return Err(PyValueError::new_err(
+                "games, simulations and considered must be > 0",
+            ));
         }
-        d.set_item("terminations", t)?;
-        Ok(d)
+        peazero_core::init();
+        Ok(SearchSelfPlay {
+            pool: SearchPool::new(SearchConfig {
+                games,
+                simulations,
+                max_plies,
+                gumbel: GumbelConfig {
+                    considered,
+                    gumbel_scale,
+                    c_visit,
+                    c_scale,
+                },
+                seed,
+                threads,
+            }),
+        })
+    }
+
+    #[getter]
+    fn num_games(&self) -> usize {
+        self.pool.num_games()
+    }
+
+    #[getter]
+    fn num_threads(&self) -> usize {
+        self.pool.num_threads()
+    }
+
+    /// Positions to evaluate: (obs (N,21,8,8) float32, legal (N,218) int32
+    /// policy indices of their legal moves, padded with 0).
+    #[allow(clippy::type_complexity)]
+    fn requests<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyArrayDyn<f32>>, Bound<'py, PyArrayDyn<i32>>)> {
+        let n = self.pool.num_games();
+        let pool = &self.pool;
+        let (obs, legal) = py.detach(|| {
+            let mut obs = vec![0.0f32; n * OBS_SIZE];
+            let mut legal = vec![0i32; n * MAX_LEGAL];
+            pool.requests(&mut obs, &mut legal);
+            (obs, legal)
+        });
+        Ok((
+            shaped(py, obs, &[n, OBS_PLANES, 8, 8])?,
+            shaped(py, legal, &[n, MAX_LEGAL])?,
+        ))
+    }
+
+    /// Legal-move logits (N,218) gathered at `legal`, value logits (N,3).
+    /// Runs one simulation step for every game; returns games finished.
+    fn respond(
+        &mut self,
+        py: Python<'_>,
+        legal_logits: PyReadonlyArrayDyn<'_, f32>,
+        value: PyReadonlyArrayDyn<'_, f32>,
+    ) -> PyResult<usize> {
+        let n = self.pool.num_games();
+        let l = slice_of(&legal_logits, n * MAX_LEGAL, "legal_logits")?;
+        let v = slice_of(&value, n * 3, "value")?;
+        let pool = &mut self.pool;
+        Ok(py.detach(|| pool.respond(l, v)))
+    }
+
+    /// Finished games as one data-format-v0 chunk: (bytes, games, positions).
+    fn take_chunk<'py>(&mut self, py: Python<'py>) -> (Bound<'py, PyBytes>, usize, usize) {
+        let games = self.pool.take_finished();
+        let positions = games.iter().map(|g| g.plies.len()).sum();
+        let bytes = py.detach(|| write_chunk(&games));
+        (PyBytes::new(py, &bytes), games.len(), positions)
+    }
+
+    fn plies_in_progress(&self) -> usize {
+        self.pool.plies_in_progress()
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        stats_dict(py, self.pool.stats())
     }
 }
 
@@ -280,6 +401,7 @@ fn encode_fen<'py>(
 #[pymodule]
 fn peazero_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SelfPlay>()?;
+    m.add_class::<SearchSelfPlay>()?;
     m.add_class::<Replay>()?;
     m.add_function(wrap_pyfunction!(encode_fen, m)?)?;
     m.add("ENCODING_VERSION", ENCODING_VERSION)?;

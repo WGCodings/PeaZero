@@ -97,6 +97,24 @@ def muzero_loss(net: MuZeroNet, batch: dict, device: torch.device, amp: bool):
     return loss, metrics
 
 
+@torch.inference_mode()
+def search_step(net: MuZeroNet, sp, device: torch.device, amp: bool) -> int:
+    """One tree-search simulation for every game of a SearchSelfPlay pool:
+    evaluate the requested positions with `initial` and hand back the
+    legal-move logits (gathered on the GPU, so only N×218 values come back
+    instead of N×4672) and the value logits. Returns games finished."""
+    obs, legal = sp.requests()
+    obs_t = torch.from_numpy(obs).to(device, non_blocking=True)
+    idx = torch.from_numpy(legal).to(device, non_blocking=True).long()
+    with autocast(device, amp):
+        _, policy, value = net.initial_inference(obs_t)
+    legal_logits = policy.float().gather(1, idx)
+    return sp.respond(
+        np.ascontiguousarray(legal_logits.cpu().numpy()),
+        np.ascontiguousarray(value.float().cpu().numpy()),
+    )
+
+
 def _reset_bn(modules) -> None:
     for m in modules:
         if isinstance(m, torch.nn.BatchNorm2d):

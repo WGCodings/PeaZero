@@ -55,7 +55,7 @@ Self-play data is only needed to refill the replay buffer on `--resume`, so olde
 
 ## What a generation does
 
-1. **Self-play.** All 1024 games make one move per step. The root is evaluated once (`initial`), Gumbel-Top-k picks 16 candidate moves, each candidate is evaluated once with the dynamics network (`recurrent`), and the move and policy target come from the Gumbel rules (docs/MUZERO.md §2, §6.2). Finished games are written to `runs/<name>/data/*.bin`.
+1. **Self-play.** Every move runs a Gumbel MuZero tree search with `--simulations` (default 64) leaf evaluations on the *real* board: Rust makes the moves, the `initial` network evaluates each new leaf, checkmates and draws are scored exactly. The root uses Sequential Halving over the top `--considered` (16) moves, so the best candidates are searched several plies deep. The move played and the policy target come from the search (docs/MUZERO.md §6.3). All games advance in lock-step, one simulation per step, so the GPU always sees batches of `--games` positions. `--simulations 0` selects the old root-only mode (one dynamics-network evaluation per candidate, §6.2). Finished games are written to `runs/<name>/data/`.
 2. **Training.** Batches are sampled from the replay buffer and trained with the K = 5 unrolled MuZero loss.
 3. **Export.** BatchNorm statistics are recalibrated (see below), then `runs/<name>/nets/gen_XXXX.pzn` plus `checkpoint.pt` are written.
 
@@ -88,7 +88,7 @@ gen   12 | selfplay  20.1s  5100 mv/s  520 games (W80 D360 B80, len 192.3) | tra
 
 Where a generation's time goes (64×6, RTX 3070): self-play ~12 s, training ~30–38 s.
 
-* **Self-play is GPU-bound.** Every move costs 17 network evaluations (1 root + 16 children), and ~11k moves/s × 17 ≈ 187k evals/s is the 3070's measured fp16 throughput. The Rust side (encoding, Gumbel, making moves) is ~10% of a step; `--threads N` spreads it over CPU cores (0 = all, the default) without changing the games played.
+* **Self-play is GPU-bound.** With tree search every move costs `simulations + 1` network evaluations (65 by default), in batches of `--games` positions; expect roughly 2k moves/s on the 3070 instead of ~11k in root-only mode, so self-play takes ~4–5× longer per generation. The Rust side (tree, move making, encoding) is ~2 ms per round of 1024 games with 8 threads; `--threads N` spreads it over CPU cores (0 = all, the default) without changing the games played. Larger `--games` (e.g. 2048) gives the GPU bigger batches and may raise moves/s.
 * **Training** samples the next batch while the GPU is still busy, keeps metrics on the GPU and uses fused AdamW, so the GPU no longer waits for the CPU between steps.
 * **Bigger batches** are the main remaining lever for a small net: `--batch 1024` halves the number of steps (steps = new positions × reuse / batch). Check the gain first with `python scripts/bench_gpu.py --sizes 64x6 --train-batch 1024`; when switching, raise the learning rate a bit (e.g. `--lr 1.4e-3`) and SPRT the result, since it changes how the net learns. Both flags can change on `--resume`.
 
