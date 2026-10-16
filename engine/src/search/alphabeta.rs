@@ -338,6 +338,84 @@ mod tests {
         assert_eq!(w.pv_leaf_wdl(&game, &[mate]), [1.0, 0.0, 0.0]);
     }
 
+    /// Plain minimax over the same tree, same leaf score, same draw/mate
+    /// rules, no pruning. Alpha-beta must return exactly the same value.
+    fn minimax(net: &mut PolicyNet, game: &Game, depth: i32, ply: usize) -> i32 {
+        let pos = game.position();
+        if ply > 0
+            && (pos.halfmove_clock() >= 100
+                || pos.insufficient_material()
+                || game.repetitions() >= 1)
+        {
+            return 0;
+        }
+        let legal = pos.legal_moves();
+        if legal.is_empty() {
+            return if pos.in_check() {
+                -MATE + ply as i32
+            } else {
+                0
+            };
+        }
+        if depth <= 0 {
+            let [w, _, l] = net.evaluate(game).wdl;
+            return q_to_cp(w - l).clamp(-MAX_EVAL, MAX_EVAL);
+        }
+        let mut best = -INF;
+        for &m in legal.iter() {
+            let mut child = game.clone();
+            child.push(m);
+            best = best.max(-minimax(net, &child, depth - 1, ply + 1));
+        }
+        best
+    }
+
+    #[test]
+    fn alphabeta_equals_minimax() {
+        peazero_core::init();
+        let mut net = PolicyNet::embedded();
+        let limits = SearchLimits::default();
+        let common = CommonOptions::default();
+        let stop = AtomicBool::new(false);
+        let ctx = SearchContext {
+            limits: &limits,
+            common: &common,
+            stop: &stop,
+            show_wdl: false,
+            verbose_move_stats: false,
+        };
+        for (fen, depth) in [
+            (
+                "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+                2,
+            ),
+            (
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                2,
+            ),
+            ("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1", 3),
+            ("kbK5/pp6/1P6/8/8/8/8/R7 w - - 0 1", 3),
+        ] {
+            let game = Game::from_fen(fen).unwrap();
+            let mut w = Worker {
+                net: &mut net,
+                ctx: &ctx,
+                start: Instant::now(),
+                hard: None,
+                nodes: 0,
+                seldepth: 0,
+                aborted: false,
+                pv: vec![[Move::NULL; MAX_PLY]; MAX_PLY],
+                pv_len: [0; MAX_PLY],
+            };
+            let ab = w.negamax(&game, depth, -INF, INF, 0);
+            let ab_nodes = w.nodes;
+            let mm = minimax(&mut net, &game, depth, 0);
+            assert_eq!(ab, mm, "{fen} depth {depth}");
+            println!("{fen} d{depth}: score {ab} (alpha-beta {ab_nodes} nodes)");
+        }
+    }
+
     #[test]
     fn score_strings() {
         assert_eq!(score_string(MATE - 1), "mate 1");
