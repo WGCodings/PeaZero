@@ -2,6 +2,7 @@ mod bench;
 mod engine;
 mod policy;
 mod random;
+mod search;
 mod timeman;
 mod uci;
 
