@@ -1,14 +1,14 @@
 //! `peazero bench` — deterministic node count used by OpenBench as the build
 //! signature, plus an NPS figure for worker speed scaling.
 //!
-//! Runs exactly what `go depth 3` does with the AlphaBeta search on every
-//! bench position (silently) and prints the total node count and the
-//! overall speed (total nodes / total time).
+//! Runs exactly what `go depth 3` does with the MCTS search (the default
+//! mode) on every bench position, silently, and prints the total node count
+//! (playouts) and the overall speed (total nodes / total time).
 //!
-//! The node count is deterministic (single-threaded tract inference) but
-//! depends on the network, because the policy orders the moves and that
-//! changes how much alpha-beta prunes: a new embedded network gives a new
-//! bench number.
+//! The node count is deterministic (no randomness in the search,
+//! single-threaded tract inference) but depends on the network: MCTS depth
+//! is the average playout depth, and how fast that grows depends on the
+//! policy and values. A new embedded network gives a new bench number.
 
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -17,9 +17,12 @@ use peazero_core::Game;
 
 use crate::engine::{CommonOptions, SearchLimits};
 use crate::policy::PolicyNet;
-use crate::search::{alphabeta, SearchContext};
+use crate::search::{mcts, SearchContext};
 
-pub const BENCH_DEPTH: u32 = 3;
+pub const BENCH_DEPTH: u32 = 4;
+/// Per-position playout cap: a flat (e.g. untrained) policy deepens the
+/// tree very slowly, so without it the bench could run for minutes.
+pub const BENCH_MAX_NODES: u64 = 2_000;
 
 pub const BENCH_FENS: &[&str] = &[
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -36,6 +39,7 @@ pub const BENCH_FENS: &[&str] = &[
 pub fn run(net: &mut PolicyNet) -> u64 {
     let limits = SearchLimits {
         depth: Some(BENCH_DEPTH),
+        nodes: Some(BENCH_MAX_NODES),
         ..Default::default()
     };
     let common = CommonOptions::default();
@@ -53,7 +57,7 @@ pub fn run(net: &mut PolicyNet) -> u64 {
     for (i, fen) in BENCH_FENS.iter().enumerate() {
         let game = Game::from_fen(fen).expect("bench FEN");
         let t = Instant::now();
-        let (_, nodes) = alphabeta::run(net, &game, &ctx, false);
+        let (_, nodes) = mcts::run(net, &game, &ctx, false);
         let ms = t.elapsed().as_millis();
         total += nodes;
         println!(

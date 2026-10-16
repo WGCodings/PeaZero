@@ -5,8 +5,10 @@
 //! Adding a method = a new file here, a variant in [`SearchMode`] and an
 //! arm in [`SearchMode::create`].
 //!
-//! * `AlphaBeta`  (default) — iterative-deepening alpha-beta: policy for
-//!   move ordering, network value at the leaves.
+//! * `Mcts` (default) — plain PUCT MCTS: policy priors, network value at
+//!   new leaves, most visited move.
+//! * `AlphaBeta` — iterative-deepening alpha-beta: policy for move
+//!   ordering, network value at the leaves.
 //! * `Searchless` — one evaluation, play the best legal policy move.
 
 use std::sync::atomic::AtomicBool;
@@ -17,6 +19,7 @@ use crate::engine::{CommonOptions, SearchLimits, SearchResult};
 use crate::policy::PolicyNet;
 
 pub mod alphabeta;
+pub mod mcts;
 pub mod searchless;
 
 /// Everything a search needs besides the network and the position.
@@ -40,15 +43,21 @@ pub trait NetSearch: Send {
 pub enum SearchMode {
     Searchless,
     AlphaBeta,
+    Mcts,
 }
 
 impl SearchMode {
-    pub const ALL: [SearchMode; 2] = [SearchMode::Searchless, SearchMode::AlphaBeta];
+    pub const ALL: [SearchMode; 3] = [
+        SearchMode::Searchless,
+        SearchMode::AlphaBeta,
+        SearchMode::Mcts,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             SearchMode::Searchless => "Searchless",
             SearchMode::AlphaBeta => "AlphaBeta",
+            SearchMode::Mcts => "Mcts",
         }
     }
 
@@ -62,6 +71,7 @@ impl SearchMode {
         match self {
             SearchMode::Searchless => Box::new(searchless::Searchless),
             SearchMode::AlphaBeta => Box::new(alphabeta::AlphaBeta),
+            SearchMode::Mcts => Box::new(mcts::Mcts),
         }
     }
 
