@@ -53,6 +53,15 @@ Values are always from the side to move's view. Backing up a value from child to
 
 Sequential Halving needs the simulation budget `n` up front. In UCI play, `n` = measured simulations/s × soft time budget (`timeman.rs`), with `gumbel_scale = 0`. `go nodes N` sets `n = N` directly. `bench` becomes a fixed-`n` search over the bench positions (deterministic, since tract inference is deterministic single-threaded).
 
+**Search modes in the engine (implemented).** `engine/src/search/` holds one file per method behind the `NetSearch` trait; `PolicyEngine` (policy.rs) owns the network and switches with the UCI option `SearchMode` (combo):
+
+| mode | what it does |
+|---|---|
+| `AlphaBeta` (default) | plain iterative-deepening negamax with alpha-beta pruning; moves ordered by the policy, network value at the leaves (`q_to_cp(W−L)`, clamped ±3000); exact mate/stalemate/draw detection. Nothing else (no TT, no cache, no extensions, no quiescence): every node is one network evaluation, ~1k nodes/s per core with 64×6, enough for short mates (Morphy's mate in 2 at depth 3 in <1 s). `wdl` in the info line = network W/D/L at the last PV position (exact for mate/draw), from the root side's view. Plain `go` without limits searches depth 3 |
+| `Searchless` | one evaluation, best legal policy move |
+
+A future `Mcts` mode is a new file in `search/`, a variant in `SearchMode` and an arm in `SearchMode::create`. `bench` runs `go depth 3` with `AlphaBeta` on the 9 bench positions and prints total nodes and overall nps. The node count is deterministic but depends on the network (the policy orders the moves, which changes how much alpha-beta prunes), so a new embedded network means a new bench number on OpenBench (16840 with the untrained `networks/default.pzn`). `option.SearchMode=Searchless` gives the old one-evaluation engine in games.
+
 ## 3. Training
 
 ### 3.1 Targets per sampled position `t`, unroll steps `k = 0..K` (K = 5)

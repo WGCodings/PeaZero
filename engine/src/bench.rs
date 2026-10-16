@@ -1,16 +1,25 @@
 //! `peazero bench` — deterministic node count used by OpenBench as the build
 //! signature, plus an NPS figure for worker speed scaling.
 //!
-//! Searchless engine: one "node" = one network evaluation. The bench
-//! evaluates every bench position and every position one legal move later,
-//! so the node count depends only on the positions, not on the network
-//! weights (swapping networks on OpenBench doesn't change the bench).
+//! Runs exactly what `go depth 3` does with the AlphaBeta search on every
+//! bench position (silently) and prints the total node count and the
+//! overall speed (total nodes / total time).
+//!
+//! The node count is deterministic (single-threaded tract inference) but
+//! depends on the network, because the policy orders the moves and that
+//! changes how much alpha-beta prunes: a new embedded network gives a new
+//! bench number.
 
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use peazero_core::{Game, GameResult};
+use peazero_core::Game;
 
+use crate::engine::{CommonOptions, SearchLimits};
 use crate::policy::PolicyNet;
+use crate::search::{alphabeta, SearchContext};
+
+pub const BENCH_DEPTH: u32 = 3;
 
 pub const BENCH_FENS: &[&str] = &[
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -25,25 +34,36 @@ pub const BENCH_FENS: &[&str] = &[
 ];
 
 pub fn run(net: &mut PolicyNet) -> u64 {
+    let limits = SearchLimits {
+        depth: Some(BENCH_DEPTH),
+        ..Default::default()
+    };
+    let common = CommonOptions::default();
+    let stop = AtomicBool::new(false);
+    let ctx = SearchContext {
+        limits: &limits,
+        common: &common,
+        stop: &stop,
+        show_wdl: false,
+        verbose_move_stats: false,
+    };
+
     let start = Instant::now();
-    let mut nodes = 0u64;
+    let mut total = 0u64;
     for (i, fen) in BENCH_FENS.iter().enumerate() {
-        let root = Game::from_fen(fen).expect("bench FEN");
-        let before = nodes;
-        let eval = net.evaluate(&root);
-        nodes += 1;
-        for &(m, _) in &eval.moves {
-            let mut child = root.clone();
-            child.push(m);
-            if child.result() == GameResult::Ongoing {
-                net.evaluate(&child);
-                nodes += 1;
-            }
-        }
-        println!("position {:>2} nodes {:>5}  {fen}", i + 1, nodes - before);
+        let game = Game::from_fen(fen).expect("bench FEN");
+        let t = Instant::now();
+        let (_, nodes) = alphabeta::run(net, &game, &ctx, false);
+        let ms = t.elapsed().as_millis();
+        total += nodes;
+        println!(
+            "position {:>2} nodes {nodes:>6} nps {:>6} time {ms:>6} ms  {fen}",
+            i + 1,
+            nodes as u128 * 1000 / ms.max(1)
+        );
     }
     let elapsed = start.elapsed().as_secs_f64().max(1e-6);
-    let nps = (nodes as f64 / elapsed) as u64;
-    println!("{nodes} nodes {nps} nps");
-    nodes
+    let nps = (total as f64 / elapsed) as u64;
+    println!("{total} nodes {nps} nps");
+    total
 }

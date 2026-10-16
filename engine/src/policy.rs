@@ -1,15 +1,16 @@
-//! Searchless engine: one network evaluation per move, play the legal move
-//! with the highest policy logit. No MCTS yet — this validates the network
-//! pipeline end to end (encoding → inference → move choice) on OpenBench.
+//! The network engine: owns the policy/value network and hands each `go` to
+//! the search method selected with the UCI option `SearchMode`
+//! (see search/mod.rs): `AlphaBeta` (default; policy move ordering, value at
+//! the leaves) or `Searchless` (one evaluation, best legal policy move).
 
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
 
 use peazero_core::encoding::{encode_game, legal_actions, OBS_SIZE};
 use peazero_core::{Game, Move};
 use peazero_nn::{wdl_probs, MuZeroNet};
 
 use crate::engine::{CommonOptions, Engine, SearchLimits, SearchResult};
+use crate::search::{NetSearch, SearchContext, SearchMode};
 
 /// The network compiled into the binary (see build.rs / `EVALFILE`).
 pub static EMBEDDED_NET: &[u8] = include_bytes!(env!("PEAZERO_EVALFILE"));
@@ -63,6 +64,17 @@ pub fn q_to_cp(q: f32) -> i32 {
     (111.714_640_912 * (1.562_068_842_1 * q).tan()).round() as i32
 }
 
+/// ` wdl W D L` in permille, as used in `info` lines.
+pub fn wdl_string([w, d, _]: [f32; 3]) -> String {
+    let permille = |x: f32| (x * 1000.0).round() as i32;
+    format!(
+        " wdl {} {} {}",
+        permille(w),
+        permille(d),
+        1000 - permille(w) - permille(d)
+    )
+}
+
 /// Legal moves with their policy probability (softmax over the legal
 /// moves' logits), most likely first: (move, probability, raw logit).
 pub fn move_probabilities(moves: &[(Move, f32)]) -> Vec<(Move, f32, f32)> {
@@ -81,27 +93,36 @@ pub struct PolicyEngine {
     net_name: String,
     show_wdl: bool,
     verbose_move_stats: bool,
+    mode: SearchMode,
+    search: Box<dyn NetSearch>,
 }
 
 impl PolicyEngine {
+    pub const DEFAULT_MODE: SearchMode = SearchMode::AlphaBeta;
+
     pub fn new() -> PolicyEngine {
         PolicyEngine {
             net: PolicyNet::embedded(),
             net_name: "<embedded>".to_string(),
             show_wdl: true,
             verbose_move_stats: false,
+            mode: Self::DEFAULT_MODE,
+            search: Self::DEFAULT_MODE.create(),
         }
     }
 }
 
 impl Engine for PolicyEngine {
-    fn new_game(&mut self) {}
+    fn new_game(&mut self) {
+        self.search.new_game();
+    }
 
     fn uci_options(&self) -> Vec<String> {
         vec![
             format!("option name EvalFile type string default {}", self.net_name),
             "option name UCI_ShowWDL type check default true".to_string(),
             "option name VerboseMoveStats type check default false".to_string(),
+            SearchMode::uci_option(Self::DEFAULT_MODE),
         ]
     }
 
@@ -124,6 +145,8 @@ impl Engine for PolicyEngine {
                         Err(e) => println!("info string failed to load {value}: {e}"),
                     }
                 }
+                // cached evaluations belong to the old network
+                self.search.new_game();
                 true
             }
             "uci_showwdl" => {
@@ -134,6 +157,17 @@ impl Engine for PolicyEngine {
                 self.verbose_move_stats = value.eq_ignore_ascii_case("true");
                 true
             }
+            "searchmode" => {
+                match SearchMode::parse(value) {
+                    Some(mode) if mode != self.mode => {
+                        self.mode = mode;
+                        self.search = mode.create();
+                    }
+                    Some(_) => {}
+                    None => println!("info string unknown SearchMode {value}"),
+                }
+                true
+            }
             _ => false,
         }
     }
@@ -142,57 +176,17 @@ impl Engine for PolicyEngine {
         &mut self,
         game: &Game,
         limits: &SearchLimits,
-        _: &CommonOptions,
-        _stop: &AtomicBool,
+        common: &CommonOptions,
+        stop: &AtomicBool,
     ) -> SearchResult {
-        let start = Instant::now();
-        let eval = self.net.evaluate(game);
-
-        let best = eval
-            .moves
-            .iter()
-            .filter(|(m, _)| {
-                limits.searchmoves.is_empty() || limits.searchmoves.contains(&m.to_uci())
-            })
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|&(m, _)| m);
-
-        let Some(best) = best else {
-            println!("info depth 0 score cp 0");
-            return SearchResult {
-                best: Move::NULL,
-                ponder: None,
-            };
+        let ctx = SearchContext {
+            limits,
+            common,
+            stop,
+            show_wdl: self.show_wdl,
+            verbose_move_stats: self.verbose_move_stats,
         };
-
-        if self.verbose_move_stats {
-            for (m, p, logit) in move_probabilities(&eval.moves) {
-                println!(
-                    "info string {m:<6} P: {:6.2}%  logit: {logit:7.3}",
-                    p * 100.0
-                );
-            }
-        }
-
-        let [w, d, l] = eval.wdl;
-        let ms = start.elapsed().as_millis();
-        let wdl = if self.show_wdl {
-            let permille = |x: f32| (x * 1000.0).round() as i32;
-            format!(
-                " wdl {} {} {}",
-                permille(w),
-                permille(d),
-                1000 - permille(w) - permille(d)
-            )
-        } else {
-            String::new()
-        };
-        println!(
-            "info depth 1 seldepth 1 multipv 1 score cp {}{wdl} nodes 1 nps {} time {ms} pv {best}",
-            q_to_cp(w - l),
-            1000 / ms.max(1)
-        );
-        SearchResult { best, ponder: None }
+        self.search.search(&mut self.net, game, &ctx)
     }
 }
 
@@ -200,25 +194,49 @@ impl Engine for PolicyEngine {
 mod tests {
     use super::*;
 
-    #[test]
-    fn embedded_net_plays_legal_moves() {
-        peazero_core::init();
-        let mut engine = PolicyEngine::new();
+    fn play(engine: &mut PolicyEngine, plies: usize, limits: &SearchLimits) {
         let stop = AtomicBool::new(false);
         let mut game = Game::default();
-        for _ in 0..40 {
-            let r = engine.search(
-                &game,
-                &SearchLimits::default(),
-                &CommonOptions::default(),
-                &stop,
-            );
+        for _ in 0..plies {
+            let r = engine.search(&game, limits, &CommonOptions::default(), &stop);
             if r.best.is_null() {
                 break;
             }
             assert!(game.position().legal_moves().contains(&r.best));
             game.push(r.best);
         }
+    }
+
+    #[test]
+    fn alphabeta_is_default_and_plays_legal_moves() {
+        peazero_core::init();
+        let mut engine = PolicyEngine::new();
+        assert_eq!(engine.mode, SearchMode::AlphaBeta);
+        let limits = SearchLimits {
+            depth: Some(2),
+            ..Default::default()
+        };
+        play(&mut engine, 6, &limits);
+    }
+
+    #[test]
+    fn searchless_mode_plays_legal_moves() {
+        peazero_core::init();
+        let mut engine = PolicyEngine::new();
+        assert!(engine.set_option("SearchMode", "searchless"));
+        assert_eq!(engine.mode, SearchMode::Searchless);
+        play(&mut engine, 40, &SearchLimits::default());
+        assert!(engine.set_option("SearchMode", "AlphaBeta"));
+        assert_eq!(engine.mode, SearchMode::AlphaBeta);
+    }
+
+    #[test]
+    fn search_mode_option_lists_all_modes() {
+        let line = SearchMode::uci_option(PolicyEngine::DEFAULT_MODE);
+        assert_eq!(
+            line,
+            "option name SearchMode type combo default AlphaBeta var Searchless var AlphaBeta"
+        );
     }
 
     #[test]

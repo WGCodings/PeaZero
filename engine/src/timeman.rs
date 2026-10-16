@@ -1,9 +1,5 @@
-//! Time management. Unused by the random mover, but in place for MCTS:
-//! the search keeps simulating until `soft` (checked between simulations)
-//! and never exceeds `hard`.
-
-// The random mover doesn't consult the clock yet.
-#![allow(dead_code)]
+//! Time management: a search stops starting new work after `soft` and never
+//! exceeds `hard` (used by the alpha-beta search; MCTS will use the same).
 
 use std::time::Duration;
 
