@@ -41,7 +41,7 @@ import peazero_rs as pz  # noqa: E402  (pip install ./crates/py)
 from peazero import dashboard  # noqa: E402
 from peazero import encoding as enc  # noqa: E402
 from peazero.model import MuZeroNet, NetConfig, export_pzn  # noqa: E402
-from peazero.train_lib import calibrate_bn, eval_metrics, muzero_loss, selfplay_step  # noqa: E402
+from peazero.train_lib import batch_to_device, calibrate_bn, eval_metrics, muzero_loss, selfplay_step  # noqa: E402
 
 SIZES = {"32x4": (32, 4), "64x6": (64, 6), "128x10": (128, 10)}
 
@@ -56,6 +56,9 @@ def parse_args():
     ap.add_argument("--games", type=int, default=1024, help="concurrent self-play games")
     ap.add_argument("--considered", type=int, default=16, help="Gumbel m: actions evaluated per move")
     ap.add_argument("--max-plies", type=int, default=512)
+    ap.add_argument("--threads", type=int, default=0,
+                    help="CPU threads for the Rust self-play work (0 = all logical CPUs); "
+                         "does not change the games played")
     ap.add_argument("--positions-per-gen", type=int, default=100_000)
     # training
     ap.add_argument("--batch", type=int, default=512)
@@ -170,11 +173,20 @@ def train(args, status):
         cfg = NetConfig(**ckpt["config"])
         gen, step = ckpt["generation"], ckpt["step"]
     net = MuZeroNet(cfg).to(dev)
-    opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # fused: one CUDA kernel for the whole update; same optimizer state as the default
+    opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+                            fused=dev.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     if args.resume and os.path.exists(ckpt_path):
         net.load_state_dict(ckpt["model"])
-        opt.load_state_dict(ckpt["optimizer"])
+        # The saved group options (incl. fused=None from checkpoints written
+        # before fused AdamW) replace ours on load, and they also decide where
+        # each parameter's step counter goes: fused AdamW needs it on the GPU.
+        opt_state = ckpt["optimizer"]
+        for g in opt_state["param_groups"]:
+            g["fused"] = dev.type == "cuda" or None
+            g["foreach"] = None
+        opt.load_state_dict(opt_state)
         print(f"resumed {args.run} at generation {gen}, step {step}")
 
     replay = pz.Replay(capacity=args.replay, seed=args.seed + gen)
@@ -187,11 +199,18 @@ def train(args, status):
                     replay.add_chunk(f.read())
         print(f"replay buffer: {replay.positions:,} positions from {len(refill)} generations on disk")
 
-    sp = pz.SelfPlay(games=args.games, considered=args.considered, max_plies=args.max_plies, seed=args.seed + gen)
+    try:
+        sp = pz.SelfPlay(games=args.games, considered=args.considered, max_plies=args.max_plies,
+                         seed=args.seed + gen, threads=args.threads)
+        sp_threads = sp.num_threads
+    except TypeError:  # peazero_rs built before --threads existed
+        print("note: peazero_rs is out of date (no --threads support); run `pip install ./crates/py`")
+        sp = pz.SelfPlay(games=args.games, considered=args.considered, max_plies=args.max_plies, seed=args.seed + gen)
+        sp_threads = 1
     params = sum(p.numel() for p in net.parameters()) / 1e6
     net_name = f"{cfg.channels}x{cfg.repr_blocks}"
     print(f"net {net_name} ({params:.2f}M params) on {dev}{' fp16' if amp else ''}; "
-          f"{args.games} games × {args.considered} considered")
+          f"{args.games} games × {args.considered} considered, {sp_threads} self-play threads, batch {args.batch}")
     status.update(force=True, net=net_name,
                   params=params, device=dev.type, amp=amp, step=step, generation=gen,
                   session_start_generation=gen, replay_positions=replay.positions)
@@ -237,26 +256,32 @@ def train(args, status):
         sums = {}
         status.update(force=True, phase="training", phase_start=t1, steps_done=0, steps_total=n_steps,
                       running=None, positions=new_positions, games_finished=new_games, replay_positions=replay.positions)
+        # The next batch is sampled (CPU, Rust) and copied while the GPU is still
+        # busy with the current step's backward pass; metrics stay on the GPU
+        # and are only read once a second for the dashboard.
+        batch = batch_to_device(replay.sample(args.batch, args.unroll), dev)
         for i in range(n_steps):
             step += 1
             lr = args.lr * min(1.0, step / args.warmup)
             for g in opt.param_groups:
                 g["lr"] = lr
-            batch = replay.sample(args.batch, args.unroll)
             loss, m = muzero_loss(net, batch, dev, amp)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
+            if i + 1 < n_steps:
+                batch = batch_to_device(replay.sample(args.batch, args.unroll), dev)
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(net.parameters(), 5.0)
             scaler.step(opt)
             scaler.update()
             for k, v in m.items():
-                sums[k] = sums.get(k, 0.0) + v
+                sums[k] = sums[k] + v if k in sums else v
             if time.time() - status.last_write >= 1.0:
-                status.update(steps_done=i + 1, step=step, running={k: v / (i + 1) for k, v in sums.items()},
+                status.update(steps_done=i + 1, step=step,
+                              running={k: float(v) / (i + 1) for k, v in sums.items()},
                               steps_per_second=(i + 1) / max(time.time() - t1, 1e-6))
+        avg = {k: float(v) / n_steps for k, v in sums.items()}
         train_time = time.time() - t1
-        avg = {k: v / n_steps for k, v in sums.items()}
 
         # ---------------------------------------------------------------- save
         status.update(force=True, phase="saving", steps_done=n_steps, step=step)

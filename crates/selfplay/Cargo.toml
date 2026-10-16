@@ -8,3 +8,4 @@ license.workspace = true
 
 [dependencies]
 peazero-core = { path = "../core" }
+rayon = "1.10"

@@ -42,9 +42,24 @@ def selfplay_step(net: MuZeroNet, sp, device: torch.device, amp: bool, rec_net: 
     )
 
 
+def batch_to_device(batch: dict, device: torch.device) -> dict:
+    """numpy batch → tensors on `device`. On CUDA the copy goes through pinned
+    memory and is asynchronous, so it overlaps with work already queued."""
+    out = {}
+    for k, v in batch.items():
+        t = torch.from_numpy(v)
+        if device.type == "cuda":
+            t = t.pin_memory()
+        out[k] = t.to(device, non_blocking=True)
+    return out
+
+
 def muzero_loss(net: MuZeroNet, batch: dict, device: torch.device, amp: bool):
-    """K-step unrolled loss. Returns (loss tensor, metrics dict of floats)."""
-    t = {k: torch.from_numpy(v).to(device, non_blocking=True) for k, v in batch.items()}
+    """K-step unrolled loss. `batch` is a numpy batch from Replay.sample or
+    the output of batch_to_device. Returns (loss tensor, metrics dict of
+    detached 0-dim tensors; call float() on them only when needed, every
+    float() waits for the GPU)."""
+    t = batch if isinstance(next(iter(batch.values())), torch.Tensor) else batch_to_device(batch, device)
     obs, actions = t["obs"], t["actions"]
     pidx, pprob, pmask = t["policy_index"], t["policy_prob"], t["policy_mask"]
     vtgt, vmask = t["value_target"], t["value_mask"]
@@ -72,12 +87,12 @@ def muzero_loss(net: MuZeroNet, batch: dict, device: torch.device, amp: bool):
         loss = loss + pl_u + vl_u
 
     metrics = {
-        "loss": float(loss.detach()),
-        "policy_loss": float(pl0.detach()),
-        "value_loss": float(vl0.detach()),
-        "policy_loss_unrolled": float(pl_u.detach()),
-        "value_loss_unrolled": float(vl_u.detach()),
-        "policy_agreement": float(agree0.detach()),
+        "loss": loss.detach().float(),
+        "policy_loss": pl0.detach().float(),
+        "value_loss": vl0.detach().float(),
+        "policy_loss_unrolled": pl_u.detach().float(),
+        "value_loss_unrolled": vl_u.detach().float(),
+        "policy_agreement": agree0.detach().float(),
     }
     return loss, metrics
 

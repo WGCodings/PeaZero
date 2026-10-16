@@ -84,7 +84,16 @@ gen   12 | selfplay  20.1s  5100 mv/s  520 games (W80 D360 B80, len 192.3) | tra
 * Locally: `setoption name EvalFile value C:\...\runs\first\nets\gen_0010.pzn`, or embed it with `make EXE=pz EVALFILE=...`.
 * On OpenBench: upload the `.pzn` as a network for PeaZero and SPRT it against the previous one (or the random-init `networks/default.pzn`). The bench (231) doesn't depend on the network.
 
+## Speed
+
+Where a generation's time goes (64×6, RTX 3070): self-play ~12 s, training ~30–38 s.
+
+* **Self-play is GPU-bound.** Every move costs 17 network evaluations (1 root + 16 children), and ~11k moves/s × 17 ≈ 187k evals/s is the 3070's measured fp16 throughput. The Rust side (encoding, Gumbel, making moves) is ~10% of a step; `--threads N` spreads it over CPU cores (0 = all, the default) without changing the games played.
+* **Training** samples the next batch while the GPU is still busy, keeps metrics on the GPU and uses fused AdamW, so the GPU no longer waits for the CPU between steps.
+* **Bigger batches** are the main remaining lever for a small net: `--batch 1024` halves the number of steps (steps = new positions × reuse / batch). Check the gain first with `python scripts/bench_gpu.py --sizes 64x6 --train-batch 1024`; when switching, raise the learning rate a bit (e.g. `--lr 1.4e-3`) and SPRT the result, since it changes how the net learns. Both flags can change on `--resume`.
+
+All flags are read from the command line on every start (`config.json` only records the first one), so repeat them on `--resume`.
+
 ## Known limits (next sprint candidates)
 
-* The Rust side of self-play is single-threaded (~11k moves/s on one core). With a 64×6 network the GPU and Rust are roughly balanced; threading the pool is the next easy speed-up.
-* Self-play and training alternate in one process; overlapping them would make better use of the GPU.
+* Self-play and training alternate. Overlapping them gains little while both are GPU-bound; it pays off once self-play is cheaper per move or a second GPU is available.

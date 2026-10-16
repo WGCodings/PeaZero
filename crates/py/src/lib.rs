@@ -13,7 +13,8 @@
 //! batch = rb.sample(512, 5)                  # dict of numpy arrays
 //! ```
 //! Shapes are validated here and raise `ValueError` instead of panicking
-//! (the release profile aborts on panic).
+//! (the release profile aborts on panic). The heavy calls release the GIL, so
+//! self-play in a background Python thread runs alongside training.
 
 use numpy::{IntoPyArray, PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn, PyUntypedArrayMethods};
 use peazero_core::encoding::{
@@ -54,15 +55,18 @@ fn slice_of<'a>(
     Ok(s)
 }
 
-#[pyclass(unsendable)]
+#[pyclass]
 struct SelfPlay {
     pool: GamePool,
 }
 
 #[pymethods]
 impl SelfPlay {
+    /// `threads`: CPU threads for the per-game work (0 = one per logical CPU).
+    /// The games played do not depend on it.
     #[new]
-    #[pyo3(signature = (games=256, considered=16, gumbel_scale=1.0, c_visit=50.0, c_scale=0.1, max_plies=512, seed=0))]
+    #[pyo3(signature = (games=256, considered=16, gumbel_scale=1.0, c_visit=50.0, c_scale=0.1, max_plies=512, seed=0, threads=1))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         games: usize,
         considered: usize,
@@ -71,6 +75,7 @@ impl SelfPlay {
         c_scale: f32,
         max_plies: usize,
         seed: u64,
+        threads: usize,
     ) -> PyResult<Self> {
         if games == 0 || considered == 0 {
             return Err(PyValueError::new_err("games and considered must be > 0"));
@@ -87,8 +92,14 @@ impl SelfPlay {
                     c_scale,
                 },
                 seed,
+                threads,
             }),
         })
+    }
+
+    #[getter]
+    fn num_threads(&self) -> usize {
+        self.pool.num_threads()
     }
 
     #[getter]
@@ -104,8 +115,12 @@ impl SelfPlay {
     /// Root observations of all games: (N, 21, 8, 8) float32.
     fn observations<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
         let n = self.pool.num_games();
-        let mut v = vec![0.0f32; n * OBS_SIZE];
-        self.pool.observations(&mut v);
+        let pool = &self.pool;
+        let v = py.detach(|| {
+            let mut v = vec![0.0f32; n * OBS_SIZE];
+            pool.observations(&mut v);
+            v
+        });
         shaped(py, v, &[n, OBS_PLANES, 8, 8])
     }
 
@@ -119,8 +134,12 @@ impl SelfPlay {
         let n = self.pool.num_games();
         let m = self.pool.considered();
         let p = slice_of(&policy, n * NUM_ACTIONS, "policy")?;
-        let mut out = vec![0.0f32; n * m * ACTION_SIZE];
-        self.pool.expand(p, &mut out);
+        let pool = &mut self.pool;
+        let out = py.detach(|| {
+            let mut out = vec![0.0f32; n * m * ACTION_SIZE];
+            pool.expand(p, &mut out);
+            out
+        });
         shaped(py, out, &[n * m, ACTION_PLANES, 8, 8])
     }
 
@@ -128,6 +147,7 @@ impl SelfPlay {
     /// move in every game. Returns the number of games that finished.
     fn finish(
         &mut self,
+        py: Python<'_>,
         root_value: PyReadonlyArrayDyn<'_, f32>,
         child_value: PyReadonlyArrayDyn<'_, f32>,
     ) -> PyResult<usize> {
@@ -135,14 +155,15 @@ impl SelfPlay {
         let m = self.pool.considered();
         let r = slice_of(&root_value, n * 3, "root_value")?;
         let c = slice_of(&child_value, n * m * 3, "child_value")?;
-        Ok(self.pool.finish(r, c))
+        let pool = &mut self.pool;
+        Ok(py.detach(|| pool.finish(r, c)))
     }
 
     /// Finished games as one data-format-v0 chunk: (bytes, games, positions).
     fn take_chunk<'py>(&mut self, py: Python<'py>) -> (Bound<'py, PyBytes>, usize, usize) {
         let games = self.pool.take_finished();
         let positions = games.iter().map(|g| g.plies.len()).sum();
-        let bytes = write_chunk(&games);
+        let bytes = py.detach(|| write_chunk(&games));
         (PyBytes::new(py, &bytes), games.len(), positions)
     }
 
@@ -167,7 +188,7 @@ impl SelfPlay {
     }
 }
 
-#[pyclass(unsendable)]
+#[pyclass]
 struct Replay {
     inner: RustReplay,
 }
@@ -184,8 +205,10 @@ impl Replay {
     }
 
     /// Add a data-format-v0 chunk; returns the number of games added.
-    fn add_chunk(&mut self, data: &[u8]) -> PyResult<usize> {
-        self.inner.add_chunk(data).map_err(PyValueError::new_err)
+    fn add_chunk(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<usize> {
+        let inner = &mut self.inner;
+        py.detach(|| inner.add_chunk(data))
+            .map_err(PyValueError::new_err)
     }
 
     #[getter]
@@ -215,7 +238,8 @@ impl Replay {
         if self.inner.positions() == 0 {
             return Err(PyValueError::new_err("replay buffer is empty"));
         }
-        let b = self.inner.sample(batch, unroll);
+        let inner = &mut self.inner;
+        let b = py.detach(|| inner.sample(batch, unroll));
         let k1 = unroll + 1;
         let d = PyDict::new(py);
         d.set_item("obs", shaped(py, b.obs, &[batch, OBS_PLANES, 8, 8])?)?;
