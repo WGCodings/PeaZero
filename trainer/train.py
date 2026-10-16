@@ -41,7 +41,7 @@ import peazero_rs as pz  # noqa: E402  (pip install ./crates/py)
 from peazero import dashboard  # noqa: E402
 from peazero import encoding as enc  # noqa: E402
 from peazero.model import MuZeroNet, NetConfig, export_pzn  # noqa: E402
-from peazero.train_lib import muzero_loss, selfplay_step  # noqa: E402
+from peazero.train_lib import calibrate_bn, eval_metrics, muzero_loss, selfplay_step  # noqa: E402
 
 SIZES = {"32x4": (32, 4), "64x6": (64, 6), "128x10": (128, 10)}
 
@@ -189,16 +189,19 @@ def train(args, status):
 
     sp = pz.SelfPlay(games=args.games, considered=args.considered, max_plies=args.max_plies, seed=args.seed + gen)
     params = sum(p.numel() for p in net.parameters()) / 1e6
-    print(f"net {args.net} ({params:.2f}M params) on {dev}{' fp16' if amp else ''}; "
+    net_name = f"{cfg.channels}x{cfg.repr_blocks}"
+    print(f"net {net_name} ({params:.2f}M params) on {dev}{' fp16' if amp else ''}; "
           f"{args.games} games × {args.considered} considered")
-    status.update(force=True, net=args.net if not args.resume else f"{cfg.channels}x{cfg.repr_blocks}",
+    status.update(force=True, net=net_name,
                   params=params, device=dev.type, amp=amp, step=step, generation=gen,
                   session_start_generation=gen, replay_positions=replay.positions)
+    # Self-play and export use eval-mode copies with recalibrated BatchNorm
+    # statistics (train_lib.calibrate_bn), never `net` itself in eval mode.
+    init_net, rec_net = calibrate_bn(net, replay, dev, amp)
 
     while gen < args.generations:
         gen += 1
         # ---------------------------------------------------------------- self-play
-        net.eval()
         t0 = time.time()
         new_positions, new_games, part = 0, 0, 0
         gen_dir = os.path.join(args.run, "data", f"gen_{gen:04d}")
@@ -208,7 +211,7 @@ def train(args, status):
         status.update(force=True, phase="selfplay", generation=gen, phase_start=t0, positions=0,
                       games_finished=0, moves_per_second=None)
         while new_positions < args.positions_per_gen:
-            selfplay_step(net, sp, dev, amp)
+            selfplay_step(init_net, sp, dev, amp, rec_net)
             moves += sp.num_games
             status.update(positions=new_positions, games_finished=new_games,
                           moves_per_second=moves / max(time.time() - t0, 1e-6), replay_positions=replay.positions)
@@ -258,8 +261,10 @@ def train(args, status):
         # ---------------------------------------------------------------- save
         status.update(force=True, phase="saving", steps_done=n_steps, step=step)
         net.eval()
+        init_net, rec_net = calibrate_bn(net, replay, dev, amp)
+        ev = eval_metrics(init_net, rec_net, replay, dev, amp)
         net_path = os.path.join(args.run, "nets", f"gen_{gen:04d}.pzn")
-        export_pzn(net, net_path)
+        export_pzn(init_net, net_path, rec_net)
         shutil.copyfile(net_path, os.path.join(args.run, "latest.pzn"))
         prune_data(args.run, keep_gens)
         torch.save({"model": net.state_dict(), "optimizer": opt.state_dict(), "config": cfg.__dict__,
@@ -270,14 +275,15 @@ def train(args, status):
             "selfplay_seconds": round(sp_time, 1), "train_seconds": round(train_time, 1),
             "moves_per_second": round(moves / sp_time), "new_games": new_games, "new_positions": new_positions,
             "avg_game_length": round(new_positions / max(new_games, 1), 1),
-            "results": d, "terminations": terms, "replay_positions": replay.positions, **avg,
+            "results": d, "terminations": terms, "replay_positions": replay.positions, **avg, **ev,
         }
         log(args.run, record)
         print(f"gen {gen:4d} | selfplay {sp_time:6.1f}s {moves / sp_time:7.0f} mv/s "
               f"{new_games:5d} games (W{d['white_wins']} D{d['draws']} B{d['black_wins']}, "
               f"len {record['avg_game_length']}) | train {n_steps} steps {train_time:6.1f}s "
               f"loss {avg['loss']:.3f} (p {avg['policy_loss']:.3f} v {avg['value_loss']:.3f} "
-              f"agree {avg['policy_agreement']:.2f}) | {net_path}")
+              f"agree {avg['policy_agreement']:.2f}) | exported p {ev.get('eval_policy_loss', 0):.3f} "
+              f"v {ev.get('eval_value_loss', 0):.3f} | {net_path}")
 
 
 if __name__ == "__main__":

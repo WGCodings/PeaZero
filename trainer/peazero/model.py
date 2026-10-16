@@ -159,16 +159,22 @@ def write_pzn(initial_onnx: str, recurrent_onnx: str, out_path: str) -> None:
         f.write(rec)
 
 
-def export_pzn(net: MuZeroNet, out_path: str) -> None:
-    """Export straight to a single .pzn file (works for a net on any device)."""
+def export_pzn(net: MuZeroNet, out_path: str, rec_net: MuZeroNet | None = None) -> None:
+    """Export straight to a single .pzn file (works for a net on any device).
+    `initial` comes from `net`, `recurrent` from `rec_net` (default: `net`);
+    they share weights but may carry different BatchNorm statistics
+    (train_lib.calibrate_bn)."""
     import copy
     import os
     import tempfile
 
     cpu_net = copy.deepcopy(net).float().cpu()
+    cpu_rec = cpu_net if rec_net is None else copy.deepcopy(rec_net).float().cpu()
     with tempfile.TemporaryDirectory() as tmp:
-        export_onnx(cpu_net, tmp)
-        write_pzn(os.path.join(tmp, "initial.onnx"), os.path.join(tmp, "recurrent.onnx"), out_path)
+        ini_dir, rec_dir = os.path.join(tmp, "i"), os.path.join(tmp, "r")
+        export_onnx(cpu_net, ini_dir)
+        export_onnx(cpu_rec, rec_dir)
+        write_pzn(os.path.join(ini_dir, "initial.onnx"), os.path.join(rec_dir, "recurrent.onnx"), out_path)
 
 
 def export_onnx(net: MuZeroNet, out_dir: str, opset: int = 17) -> None:

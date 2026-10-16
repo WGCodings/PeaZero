@@ -30,6 +30,14 @@ python train.py --run ..\runs\first --resume
 
 Defaults: 1024 concurrent games, 16 considered moves per position, 100,000 new positions per generation, batch 512, K = 5, each position trained on ~4× on average, 1M-position replay buffer. See `python train.py --help`.
 
+## Dashboard
+
+`train.py` opens a live dashboard in your browser at <http://localhost:8765>: generation progress and ETA, the current phase (self-play positions / training steps with running loss), totals (positions trained and generated, games, replay buffer), and charts over all generations (total / policy / value loss incl. unrolled, agreement, W/D/B, how games end, game length, time per generation, self-play speed, learning rate), plus a table of the last 15 generations. Hover a chart to read exact values.
+
+* `--no-browser` starts the server without opening a tab; `--dashboard-port N` picks another port (0 = off).
+* Look at any run, also when it isn't training: `python -m peazero.dashboard --run ..\runs\first` (from `trainer/`).
+* The ETA counts towards `--generations` (the *total* target, also on `--resume`) and uses the average of the last 5 generations.
+
 ## Run folder
 
 ```
@@ -37,6 +45,7 @@ runs/first/
   config.json          arguments of the first start
   checkpoint.pt        latest model + optimizer (used by --resume)
   metrics.jsonl        one line per generation
+  status.json          live progress, read by the dashboard
   latest.pzn           copy of the newest network
   nets/gen_0001.pzn    every generation's network (kept, ~4 MB each)
   data/gen_0012/       self-play games of generation 12 (part_000.bin, ...)
@@ -48,7 +57,13 @@ Self-play data is only needed to refill the replay buffer on `--resume`, so olde
 
 1. **Self-play.** All 1024 games make one move per step. The root is evaluated once (`initial`), Gumbel-Top-k picks 16 candidate moves, each candidate is evaluated once with the dynamics network (`recurrent`), and the move and policy target come from the Gumbel rules (docs/MUZERO.md §2, §6.2). Finished games are written to `runs/<name>/data/*.bin`.
 2. **Training.** Batches are sampled from the replay buffer and trained with the K = 5 unrolled MuZero loss.
-3. **Export.** `runs/<name>/nets/gen_XXXX.pzn` plus `checkpoint.pt`.
+3. **Export.** BatchNorm statistics are recalibrated (see below), then `runs/<name>/nets/gen_XXXX.pzn` plus `checkpoint.pt` are written.
+
+### BatchNorm calibration
+
+Training normalises every network call with its own batch statistics, but BatchNorm's running averages mix root positions and dynamics (unrolled) latents, which the shared prediction head sees with very different distributions. In eval mode (self-play, engine) that mix fits neither. In run `first` this made the exported value head worse than guessing (value loss 1.6 vs. 0.7 in training) and the children's Q in self-play uncorrelated with the real positions, so the Gumbel policy targets were mostly noise and strength peaked around generation 200.
+
+Since then, after each generation `calibrate_bn` recomputes the statistics for each graph separately: `initial` from root positions, `recurrent` from first-step children. Self-play and the exported `.pzn` use these copies. `metrics.jsonl` logs the exported net's losses as `eval_policy_loss` / `eval_value_loss` (+ `_k1` for the first dynamics step); they should stay close to the training losses, and the dashboard plots them next to them.
 
 ## Reading the log
 
