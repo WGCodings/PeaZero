@@ -33,8 +33,9 @@ while training; see --dashboard-port / --no-browser.
 
 Strength: every --eval-every generations a background CPU process
 (peazero/evaluator.py) plays gen N against gen N - eval-every
-(--match-games games) and runs the puzzle set (trainer/data/puzzles.csv,
-made by scripts/make_puzzles.py). The GPU keeps training meanwhile; the
+(--match-games games with the engine binary at --match-tc 8+0.08, MCTS)
+and runs the puzzle set (trainer/data/puzzles.csv, made by
+scripts/make_puzzles.py). The GPU keeps training meanwhile; the
 Elo ladder and puzzle curves appear on the dashboard. --eval-every 0 = off.
 """
 import argparse
@@ -71,7 +72,8 @@ DEFAULTS = {
     "batch": 512, "unroll": 0, "reuse": 2.0, "lr": 1e-3, "weight_decay": 1e-4, "warmup": 500,
     "replay": 1_000_000, "keep_data_gens": -1, "q_ratio": 0.5, "seed": 0,
     # background strength evaluation (CPU)
-    "eval_every": 25, "match_games": 100, "match_simulations": 0, "eval_threads": 4,
+    "eval_every": 25, "match_games": 100, "match_tc": "8+0.08", "match_search_mode": "Mcts",
+    "match_simulations": 0, "eval_threads": 4,
 }
 # What runs started before a setting existed did (used when their
 # config.json lacks the key).
@@ -120,12 +122,20 @@ def parse_args():
                     help="every N generations: match vs the net N generations older + puzzles, in a "
                          "background CPU process (0 = off)")
     ap.add_argument("--match-games", type=int, help="games per evaluation match (0 = puzzles only)")
+    ap.add_argument("--match-tc",
+                    help="evaluation matches: time control (base+inc seconds) for the engine binary "
+                         "playing with its own search; 'none' = in-process match without clock")
+    ap.add_argument("--match-search-mode", choices=["Mcts", "AlphaBeta", "Searchless"],
+                    help="engine SearchMode in --match-tc matches")
     ap.add_argument("--match-simulations", type=int,
-                    help="search simulations per move in evaluation matches (0 = searchless)")
-    ap.add_argument("--eval-threads", type=int, help="CPU threads for the evaluation")
+                    help="--match-tc none: search simulations per move (0 = searchless)")
+    ap.add_argument("--eval-threads", type=int,
+                    help="CPU threads for the evaluation (= games at the same time in --match-tc matches)")
     # this session only (not stored)
     ap.add_argument("--puzzles", help="puzzle CSV for the evaluation (default trainer/data/puzzles.csv; "
                                       "'none' = no puzzles)")
+    ap.add_argument("--engine", help="engine binary for --match-tc matches (default: newest of "
+                                     "target/release/peazero and ./peazero)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-amp", action="store_true", help="disable fp16 autocast on CUDA")
     ap.add_argument("--dashboard-port", type=int, default=8765, help="live dashboard port; 0 = no dashboard")
@@ -221,8 +231,11 @@ def start_evaluator(args):
         return None
     cmd = [sys.executable, "-m", "peazero.evaluator", "--run", os.path.abspath(args.run),
            "--every", str(args.eval_every), "--games", str(args.match_games),
+           "--tc", str(args.match_tc), "--search-mode", args.match_search_mode,
            "--simulations", str(args.match_simulations), "--threads", str(args.eval_threads),
            "--seed", str(args.seed), "--parent-stdin"]
+    if args.engine:
+        cmd += ["--engine", os.path.abspath(args.engine)]
     if args.puzzles:
         cmd += ["--puzzles", args.puzzles if args.puzzles.lower() == "none" else os.path.abspath(args.puzzles)]
     kw = {}

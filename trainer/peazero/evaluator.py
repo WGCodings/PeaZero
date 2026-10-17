@@ -3,8 +3,10 @@
 
 Every --every generations (a "milestone"):
   * match:   gen N vs gen N - every, --games games (random openings, each
-             played twice with colours swapped), searchless by default
-             (--simulations for noise-free Gumbel tree search)
+             played twice with colours swapped). Default: the real engine
+             binary over UCI at --tc 8+0.08 with its own search (--search-mode,
+             MCTS), like OpenBench (uci_match.py). --tc none: in-process
+             match without clock, searchless or --simulations
   * puzzles: gen N on a fixed puzzle set (Lichess format, see
              scripts/make_puzzles.py), searchless by default
 
@@ -16,8 +18,10 @@ an old run:
     python -m peazero.evaluator --run runs/fourth --once        # evaluate what exists, then exit
     python -m peazero.evaluator --run runs/fourth               # keep watching for new networks
 
-train.py starts it automatically (see --eval-every there). Inference is
-tract on the CPU, exactly like the engine, so the GPU keeps training.
+train.py starts it automatically (see --eval-every there). Everything runs
+on the CPU (tract, the engine's inference), so the GPU keeps training. The
+time-control match needs the engine built: `cargo build --release` (or
+`make`); without it the evaluator falls back to the in-process match.
 """
 import argparse
 import csv
@@ -30,7 +34,9 @@ import threading
 import time
 import traceback
 
-DEFAULT_PUZZLES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "puzzles.csv")
+TRAINER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(TRAINER_DIR)
+DEFAULT_PUZZLES = os.path.join(TRAINER_DIR, "data", "puzzles.csv")
 # Rating bands for the per-band puzzle curves (upper bound exclusive).
 BANDS = [(0, 1000), (1000, 1400), (1400, 1800), (1800, 2200), (2200, 10_000)]
 
@@ -193,9 +199,23 @@ def stable(path, age=10.0):
         return False
 
 
+def record_mode(e):
+    """Match conditions of an evals.jsonl match record (older records: in-process)."""
+    return e.get("mode") or (f"{e['simulations']} sims" if e.get("simulations") else "searchless")
+
+
+def match_mode(args):
+    """Match conditions; only matches with the same mode form one ladder."""
+    if args.tc:
+        return f"{args.tc} {args.search_mode}"
+    return f"{args.simulations} sims" if args.simulations else "searchless"
+
+
 def pending_work(args, nets, evals, have_puzzles):
     """(kind, generation) tasks still to do, oldest first."""
-    matches = {(e["generation"], e["opponent"]) for e in evals if e.get("type") == "match"}
+    mode = match_mode(args)
+    matches = {(e["generation"], e["opponent"]) for e in evals
+               if e.get("type") == "match" and record_mode(e) == mode}
     puzzles = {e["generation"] for e in evals if e.get("type") == "puzzles"}
     todo = []
     for g in sorted(nets):
@@ -209,17 +229,33 @@ def pending_work(args, nets, evals, have_puzzles):
     return todo
 
 
-def run_match(pz, args, nets, g):
+def run_match(pz, args, nets, g, status):
     opp = g - args.every
     t = time.time()
-    games = pz.play_match(nets[g], nets[opp], games=args.games, opening_plies=args.opening_plies,
-                          simulations=args.simulations, considered=args.considered,
-                          max_plies=args.max_plies, seed=args.seed, threads=args.threads)
+    if args.tc:
+        from peazero.uci_match import play_tc_match
+        # The engine keeps its old network if EvalFile fails to load; make
+        # sure both load (same tract code as the engine) before playing.
+        for net in (nets[g], nets[opp]):
+            pz.solve_puzzles(net, [])
+        task = f"gen {g} vs {opp}"
+        games = play_tc_match(args.engine, nets[g], nets[opp], games=args.games, tc=args.tc,
+                              concurrency=args.concurrency, opening_plies=args.opening_plies,
+                              seed=args.seed, max_plies=args.max_plies,
+                              options={"SearchMode": args.search_mode},
+                              progress=lambda d, n: status.set("running", f"{task} ({d}/{n} games)"))
+    else:
+        games = pz.play_match(nets[g], nets[opp], games=args.games, opening_plies=args.opening_plies,
+                              simulations=args.simulations, considered=args.considered,
+                              max_plies=args.max_plies, seed=args.seed, threads=args.threads)
     st = match_stats(games)
-    rec = {"type": "match", "generation": g, "opponent": opp, "simulations": args.simulations,
+    rec = {"type": "match", "generation": g, "opponent": opp, "mode": match_mode(args),
+           "simulations": 0 if args.tc else args.simulations,
            "seconds": round(time.time() - t, 1), "time": round(time.time(), 1), **st}
-    print(f"[eval] gen {g} vs {opp}: {st['elo']:+.0f} Elo [{st['elo_lo']:+.0f}, {st['elo_hi']:+.0f}] "
-          f"(+{st['wins']} ={st['draws']} -{st['losses']}, {rec['seconds']:.0f}s)", flush=True)
+    bad = {k: v for k, v in st["terminations"].items() if k in ("time_forfeit", "engine_error", "illegal_move")}
+    print(f"[eval] gen {g} vs {opp} ({rec['mode']}): {st['elo']:+.0f} Elo [{st['elo_lo']:+.0f}, {st['elo_hi']:+.0f}] "
+          f"(+{st['wins']} ={st['draws']} -{st['losses']}, {rec['seconds']:.0f}s)"
+          + (f" WARNING {bad}" if bad else ""), flush=True)
     return rec
 
 
@@ -234,6 +270,26 @@ def run_puzzles(pz, args, nets, g, puzzles):
     print(f"[eval] gen {g} puzzles: {100 * st['solved']:.1f}% solved, {100 * st['first_move']:.1f}% first move, "
           f"rating {st['rating']} ({rec['seconds']:.0f}s)", flush=True)
     return rec
+
+
+def refresh_engine(args, first=False):
+    """Use time-control matches whenever the engine binary exists, the
+    in-process match otherwise (checked again before every milestone, so
+    building the engine later switches over)."""
+    if not args.tc_wanted:
+        return
+    from peazero.uci_match import find_engine
+    exe = args.engine_arg or find_engine(REPO_ROOT)
+    if exe and os.path.isfile(exe):
+        if args.tc is None and not first:
+            print(f"[eval] engine found: {exe}; time-control matches from now on", flush=True)
+        args.tc, args.engine = args.tc_wanted, exe
+    else:
+        if args.tc is not None or first:
+            where = args.engine_arg or f"target/release in {REPO_ROOT}"
+            print(f"[eval] no engine binary at {where} (build it with `cargo build --release`); "
+                  "in-process match until it exists", flush=True)
+        args.tc = None
 
 
 def watch_parent():
@@ -255,7 +311,14 @@ def parse_args(argv=None):
     ap.add_argument("--run", required=True)
     ap.add_argument("--every", type=int, default=25, help="milestone interval in generations")
     ap.add_argument("--games", type=int, default=100, help="match games per milestone (0 = no matches)")
-    ap.add_argument("--simulations", type=int, default=0, help="match search simulations (0 = searchless)")
+    ap.add_argument("--tc", default="8+0.08",
+                    help="match time control (base+increment seconds) with the engine binary; "
+                         "'none' = in-process match without clock (--simulations)")
+    ap.add_argument("--engine", help="engine binary (default: newest of target/release/peazero and ./peazero)")
+    ap.add_argument("--search-mode", default="Mcts", help="engine SearchMode for --tc matches")
+    ap.add_argument("--concurrency", type=int, help="--tc games at the same time (default --threads)")
+    ap.add_argument("--simulations", type=int, default=0,
+                    help="in-process match (--tc none): search simulations (0 = searchless)")
     ap.add_argument("--puzzles", default=DEFAULT_PUZZLES, help="puzzle CSV ('none' = no puzzles)")
     ap.add_argument("--puzzle-simulations", type=int, default=0, help="0 = searchless (the raw policy)")
     ap.add_argument("--threads", type=int, default=4, help="CPU threads")
@@ -276,6 +339,20 @@ def main(argv=None):
     import peazero_rs as pz
     if not hasattr(pz, "play_match"):
         sys.exit("[eval] peazero_rs is out of date (no play_match); run `pip install ./crates/py`")
+    if args.tc and args.tc.lower() == "none":
+        args.tc = None
+    if args.tc:
+        from peazero.uci_match import parse_tc
+        parse_tc(args.tc)  # fail early on a typo
+        try:
+            import chess.engine  # noqa: F401
+        except ImportError:
+            print("[eval] time-control matches need python-chess (pip install chess); "
+                  "using the in-process match", flush=True)
+            args.tc = None
+    args.tc_wanted, args.engine_arg, args.tc = args.tc, args.engine, None
+    refresh_engine(args, first=True)
+    args.concurrency = args.concurrency or args.threads
 
     puzzles = []
     if args.puzzles and args.puzzles.lower() != "none":
@@ -286,17 +363,19 @@ def main(argv=None):
             print(f"[eval] no puzzle file at {args.puzzles} (make one with trainer/scripts/make_puzzles.py); "
                   "matches only", flush=True)
     settings = {"every": args.every, "games": args.games, "simulations": args.simulations,
-                "puzzles": len(puzzles), "threads": args.threads}
+                "mode": match_mode(args), "puzzles": len(puzzles), "threads": args.threads}
     status = Status(args.run, settings)
     print(f"[eval] every {args.every} generations: "
-          + (f"{args.games}-game match vs gen N-{args.every} "
-             f"({'searchless' if args.simulations == 0 else f'{args.simulations} simulations'})"
+          + (f"{args.games}-game match vs gen N-{args.every} ({match_mode(args)}"
+             + (f", {args.concurrency} at a time, {args.engine})" if args.tc else ")")
              if args.games > 0 else "no matches")
           + (f", {len(puzzles)} puzzles" if puzzles else "")
           + f", {args.threads} CPU threads", flush=True)
 
     failures = {}
     while True:
+        refresh_engine(args)
+        status.settings["mode"] = match_mode(args)
         nets = net_files(args.run)
         todo = [t for t in pending_work(args, nets, read_evals(args.run), bool(puzzles))
                 if failures.get(t, 0) < 3]
@@ -310,7 +389,7 @@ def main(argv=None):
         try:
             if kind == "match":
                 status.set("running", f"gen {g} vs {g - args.every}")
-                rec = run_match(pz, args, nets, g)
+                rec = run_match(pz, args, nets, g, status)
             else:
                 status.set("running", f"puzzles gen {g}")
                 rec = run_puzzles(pz, args, nets, g, puzzles)

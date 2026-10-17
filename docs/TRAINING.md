@@ -42,16 +42,19 @@ Defaults for a new run (`python train.py --help`):
 | `--reuse` | 2.0 | average times each new position is trained on |
 | `--games`, `--positions-per-gen`, `--batch`, `--replay` | 1024, 100k, 512, 1M | |
 | `--eval-every` | 25 | strength evaluation every 25 generations (match + puzzles, below); 0 = off |
-| `--match-games` / `--match-simulations` | 100 / 0 | games per evaluation match (0 = puzzles only) / search simulations in those games (0 = searchless) |
-| `--eval-threads` | 4 | CPU threads for the evaluation |
+| `--match-games` | 100 | games per evaluation match (0 = puzzles only) |
+| `--match-tc` / `--match-search-mode` | 8+0.08 / Mcts | evaluation matches: the engine binary with its own search at this clock; `none` = in-process match without clock |
+| `--match-simulations` | 0 | only with `--match-tc none`: search simulations per move (0 = searchless) |
+| `--eval-threads` | 4 | CPU threads for the evaluation = games played at the same time |
+| `--engine` | newest `target/release/peazero` or `./peazero` | engine binary for the matches (this session only) |
 | `--puzzles` | `trainer/data/puzzles.csv` | puzzle set (this session only; `none` = no puzzles) |
 
 ## Strength evaluation
 
 The losses can't tell you how strong the network is: the targets get harder as the search gets better, and the value loss even rises as games become more decisive. So every `--eval-every` generations (a *milestone*: 25, 50, 75, …) a background process measures it directly, **on the CPU** (tract, the engine's own inference) at lower priority, while the GPU keeps training:
 
-* **Match:** gen N vs gen N − 25, `--match-games` games. Random 6-ply openings (the same set at every milestone), each played twice with colours swapped; searchless by default, like your OpenBench searchless tests. The result is an Elo difference with a 95 % interval from the game pairs.
-* **Elo ladder:** the matches chained (gen 25 = 0, gen 50 = Elo(50 vs 25), gen 75 = that + Elo(75 vs 50), …). As long as it keeps climbing, the network keeps getting stronger. Self-play Elo is inflated compared to Elo against other engines, so read it as a trend, not a rating. The interval widens along the ladder (the errors add up).
+* **Match:** gen N vs gen N − 25, `--match-games` games with the **real engine** over UCI, each side with its own `EvalFile`, its own search (`SearchMode`, MCTS by default) and its own time management at `--match-tc 8+0.08`, like an OpenBench test. Random 6-ply openings (the same set at every milestone), each played twice with colours swapped; `--eval-threads` games at a time, one engine thread each. The clock is kept like cutechess does (a side whose time runs out loses; time losses and engine errors are flagged in the console). The result is an Elo difference with a 95 % interval from the game pairs. Needs the engine built (`cargo build --release` or `make`; the binary is copied before each match, so rebuilding meanwhile is fine) and python-chess (`pip install chess`). Without a binary the evaluator uses the in-process match (no clock, searchless or `--match-simulations`) and switches over as soon as the binary exists; `--match-tc none` always uses the in-process match.
+* **Elo ladder:** the matches played under the same conditions (time control + search mode, or in-process settings), chained (gen 25 = 0, gen 50 = Elo(50 vs 25), gen 75 = that + Elo(75 vs 50), …). As long as it keeps climbing, the network keeps getting stronger. Self-play Elo is inflated compared to Elo against other engines, so read it as a trend, not a rating. The interval widens along the ladder (the errors add up).
 * **Puzzles:** a fixed set of Lichess puzzles solved by the raw policy (searchless): the share solved, the share whose first move is right, the share per rating band, and a **puzzle rating** (the Lichess puzzle rating at which that share would be expected). This compares against an outside reference, not the run's own targets, so it is the steadiest progress signal between matches.
 
 One-time setup for the puzzles (Lichess puzzle database, CC0; streams ~250 MB and keeps ~3,250 puzzles, 250 per 200-point band from 400 to 3000):
@@ -70,7 +73,7 @@ python -m peazero.evaluator --run ..\runs\third --once                  # every 
 python -m peazero.evaluator --run ..\runs\third --once --every 100 --games 200
 ```
 
-Cost with 4 threads (64×6, ~800 evaluations/s per core): the searchless 100-game match is ~12k evaluations, a few seconds; the puzzles about as much. `--match-simulations 64` gives more decisive games (deterministic searchless play often repeats into draws) but needs 65× the evaluations, roughly 4–5 minutes per milestone, still fine every 25 generations.
+Cost with 4 threads: the 100-game 8+0.08 match takes about 8–10 minutes (fits easily in 25 generations of ~1.5 minutes each); the puzzles a few seconds. The engines run at lower priority next to self-play, so on a busy CPU they search a bit less than on an idle machine. That hits both sides equally, so the Elo difference stays fair, but don't compare node counts with OpenBench. The in-process searchless match takes seconds, but deterministic searchless play often repeats into draws.
 
 ## Dashboard
 

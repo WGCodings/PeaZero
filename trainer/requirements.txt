@@ -6,5 +6,5 @@ maturin             # builds ../crates/py (pip install ./crates/py)
 # optional
 onnxruntime-gpu     # bench_gpu.py ort-cuda numbers
 zstandard           # scripts/make_puzzles.py (puzzle set for the strength evaluation)
-chess               # tests / analysis only
+chess               # time-control evaluation matches (peazero/uci_match.py), tests, analysis
 pytest

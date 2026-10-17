@@ -102,7 +102,7 @@ th:first-child, td:first-child { text-align: left; }
 "use strict";
 const $ = (id) => document.getElementById(id);
 let metrics = [], status = null, config = {}, metricsText = "";
-let evalsText = "", evalStatus = null, matches = [], puzzleRuns = [], ladder = [];
+let evalsText = "", evalStatus = null, allMatches = [], matches = [], matchMode = "", puzzleRuns = [], ladder = [];
 
 // ------------------------------------------------------------------ formatting
 const fmtInt = (x) => x == null || isNaN(x) ? "–" : Math.round(x).toLocaleString("en-US");
@@ -172,7 +172,7 @@ const evalEvery = () => (evalStatus && evalStatus.every) || config.eval_every ||
 const BAND_SERIES = [["<1000", "--c1"], ["1000-1400", "--c3"], ["1400-1800", "--c5"], ["1800-2200", "--c2"], ["2200+", "--c4"]];
 const STRENGTH_CHARTS = [
   { id: "ladder", title: "Elo ladder", noRecent: true, zero: true, rows: () => ladder,
-    hint: "chained matches vs. the previous milestone; first milestone = 0; band = 95%",
+    hint: "chained matches vs. the previous milestone (same conditions); first = 0; band = 95%",
     empty: () => `first match after generation ${2 * evalEvery()}`,
     fmt: (p) => `${fmtElo(p[1])} [${fmtElo(p[2])}, ${fmtElo(p[3])}]`,
     series: [{ name: "Elo", key: "elo", lo: (r) => r.lo, hi: (r) => r.hi, color: "--c1" }] },
@@ -362,9 +362,24 @@ function parseEvals(text) {
       else if (r.type === "puzzles") pz.set(r.generation, r);
     } catch { /* partial line */ }
   }
-  matches = [...m.values()].sort((a, b) => a.generation - b.generation);
+  allMatches = [...m.values()].sort((a, b) => a.generation - b.generation);
   puzzleRuns = [...pz.values()].sort((a, b) => a.generation - b.generation);
-  ladder = buildLadder(matches);
+  selectMatches();
+}
+
+// Match conditions of a record (older records: in-process match).
+const recordMode = (r) => r.mode || (r.simulations ? `${r.simulations} sims` : "searchless");
+
+// Only matches played under the evaluator's current conditions form the
+// ladder (or the latest conditions, when the evaluator isn't running).
+function selectMatches() {
+  const latest = allMatches.length ? recordMode(allMatches[allMatches.length - 1]) : "";
+  const mode = (evalStatus && evalStatus.mode && allMatches.some((r) => recordMode(r) === evalStatus.mode))
+    ? evalStatus.mode : latest;
+  const sel = allMatches.filter((r) => recordMode(r) === mode);
+  if (mode === matchMode && sel.length === matches.length) return false;
+  matchMode = mode; matches = sel; ladder = buildLadder(matches);
+  return true;
 }
 
 // Chain the matches: Elo(N) = Elo(N - interval) + match Elo; the first
@@ -390,13 +405,13 @@ function renderStrength() {
   const es = evalStatus, every = evalEvery();
   let txt = "";
   if (es && es.updated && Date.now() / 1000 - es.updated < 180) {
-    const what = es.games > 0 ? `${es.games}-game match${es.simulations ? ` (${es.simulations} sims)` : ""}` : "";
+    const what = es.games > 0 ? `${es.games}-game match (${es.mode || (es.simulations ? es.simulations + " sims" : "searchless")})` : "";
     const setup = [what, es.puzzles ? `${fmtInt(es.puzzles)} puzzles` : ""].filter(Boolean).join(" + ");
     txt = es.state === "running" ? `evaluating ${es.task}…` : es.state === "error" ? `evaluation error (${es.task}), see console`
       : es.state === "idle" ? "evaluator finished" : `next evaluation at generation ${(Math.floor(((metrics[metrics.length - 1] || {}).generation || 0) / every) + 1) * every}`;
     txt += ` · every ${every} gens: ${setup}`;
   } else if (matches.length || puzzleRuns.length) {
-    txt = "evaluator not running";
+    txt = "evaluator not running" + (matchMode ? ` · matches: ${matchMode}` : "");
   } else {
     txt = config.eval_every === 0 ? "evaluation off (--eval-every 0)" : "evaluator not running";
   }
@@ -582,6 +597,8 @@ async function poll() {
   if (ev != null && ev !== evalsText) {
     evalsText = ev;
     parseEvals(ev);
+    drawStrength();
+  } else if (selectMatches()) {
     drawStrength();
   }
   if (st) { try { status = JSON.parse(st); } catch { /* partial write, keep old */ } }
