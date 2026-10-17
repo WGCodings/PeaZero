@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""PeaZero training loop: alternate root-only-Gumbel self-play and training.
+"""PeaZero training loop: alternate tree-search self-play and training.
 
-    python train.py --run runs/first --net 64x6
-    python train.py --run runs/first --resume          # continue a run
+    python train.py --run runs/fourth                  # new run, default settings
+    python train.py --run runs/fourth --resume         # continue with the run's settings
+    python train.py --run runs/fourth --resume --generations 2000   # ... and change one
 
 Each generation:
   1. self-play until --positions-per-gen new positions are recorded
@@ -10,13 +11,18 @@ Each generation:
   3. save the checkpoint and export the network
 
 Run directory layout:
-  <run>/config.json            arguments of the first start (for reference)
+  <run>/config.json            the run's settings (reused by --resume)
   <run>/checkpoint.pt          latest model + optimizer (used by --resume)
   <run>/metrics.jsonl          one line per generation
   <run>/status.json            live progress (read by the dashboard)
   <run>/latest.pzn             copy of the newest network
   <run>/nets/gen_XXXX.pzn      network after every generation
-  <run>/data/gen_XXXX/*.bin    self-play games (data format v0)
+  <run>/data/gen_XXXX/*.bin    self-play games (data format v2)
+
+Settings: every run stores its settings in config.json. --resume reuses
+them; a flag given on the command line overrides the stored value and is
+saved. Settings that an older run never recorded keep that run's original
+behaviour (LEGACY below), so resuming an old run doesn't change it.
 
 Old data is deleted automatically once the replay buffer can no longer use
 it (see --keep-data-gens); networks are always kept.
@@ -47,41 +53,95 @@ from peazero.train_lib import (  # noqa: E402
 SIZES = {"32x4": (32, 4), "64x6": (64, 6), "128x10": (128, 10)}
 
 
+# Settings of a new run. All of these are stored in <run>/config.json.
+DEFAULTS = {
+    "net": "64x6", "generations": 1000,
+    # self-play
+    "games": 1024, "simulations": 64, "considered": 16, "max_plies": 512, "threads": 0,
+    "positions_per_gen": 100_000, "noise_plies": 30, "late_noise": 0.0,
+    # training
+    "batch": 512, "unroll": 0, "reuse": 2.0, "lr": 1e-3, "weight_decay": 1e-4, "warmup": 500,
+    "replay": 1_000_000, "keep_data_gens": -1, "q_ratio": 0.5, "seed": 0,
+}
+# What runs started before a setting existed did (used when their
+# config.json lacks the key).
+LEGACY = {"simulations": 0, "unroll": 5, "reuse": 4.0, "threads": 0,
+          "noise_plies": 0, "late_noise": 0.0, "q_ratio": 0.0}
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", required=True, help="run directory")
-    ap.add_argument("--resume", action="store_true")
-    ap.add_argument("--net", default="64x6", choices=SIZES)
-    ap.add_argument("--generations", type=int, default=1000)
+    ap.add_argument("--resume", action="store_true", help="continue the run with its stored settings")
+    ap.add_argument("--net", choices=SIZES)
+    ap.add_argument("--generations", type=int, help="total generations to reach")
     # self-play
-    ap.add_argument("--games", type=int, default=1024, help="concurrent self-play games")
-    ap.add_argument("--simulations", type=int, default=64,
+    ap.add_argument("--games", type=int, help="concurrent self-play games")
+    ap.add_argument("--simulations", type=int,
                     help="tree-search simulations per move on the real board (Gumbel MuZero search, "
                          "AlphaZero-style evaluation); 0 = old root-only mode through the dynamics network")
-    ap.add_argument("--considered", type=int, default=16,
+    ap.add_argument("--considered", type=int,
                     help="Gumbel m: root candidates (Sequential Halving width; root-only mode: evaluations per move)")
-    ap.add_argument("--max-plies", type=int, default=512)
-    ap.add_argument("--threads", type=int, default=0,
+    ap.add_argument("--max-plies", type=int)
+    ap.add_argument("--threads", type=int,
                     help="CPU threads for the Rust self-play work (0 = all logical CPUs); "
                          "does not change the games played")
-    ap.add_argument("--positions-per-gen", type=int, default=100_000)
+    ap.add_argument("--positions-per-gen", type=int)
+    ap.add_argument("--noise-plies", type=int,
+                    help="plies per game with full Gumbel noise, then --late-noise (0 = full noise all game)")
+    ap.add_argument("--late-noise", type=float, help="Gumbel noise scale after --noise-plies (0 = none)")
     # training
-    ap.add_argument("--batch", type=int, default=512)
-    ap.add_argument("--unroll", type=int, default=5)
-    ap.add_argument("--reuse", type=float, default=4.0, help="avg times each new position is sampled")
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--weight-decay", type=float, default=1e-4)
-    ap.add_argument("--warmup", type=int, default=500)
-    ap.add_argument("--replay", type=int, default=1_000_000, help="replay buffer size in positions")
-    ap.add_argument("--keep-data-gens", type=int, default=-1,
+    ap.add_argument("--batch", type=int)
+    ap.add_argument("--unroll", type=int,
+                    help="dynamics unroll steps K in the loss; 0 = AlphaZero-style (no dynamics training)")
+    ap.add_argument("--reuse", type=float, help="avg times each new position is sampled")
+    ap.add_argument("--lr", type=float)
+    ap.add_argument("--weight-decay", type=float)
+    ap.add_argument("--warmup", type=int)
+    ap.add_argument("--replay", type=int, help="replay buffer size in positions")
+    ap.add_argument("--keep-data-gens", type=int,
                     help="generations of self-play data kept on disk; -1 = just enough to refill the "
-                         "replay buffer on --resume (default), 0 = keep everything")
+                         "replay buffer on --resume, 0 = keep everything")
+    ap.add_argument("--q-ratio", type=float,
+                    help="value target = (1-q)·game result + q·search value (needs data format v2)")
+    ap.add_argument("--seed", type=int)
+    # this session only (not stored)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-amp", action="store_true", help="disable fp16 autocast on CUDA")
-    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dashboard-port", type=int, default=8765, help="live dashboard port; 0 = no dashboard")
     ap.add_argument("--no-browser", action="store_true", help="don't open the dashboard in a browser")
-    return ap.parse_args()
+    return resolve_settings(ap.parse_args())
+
+
+def resolve_settings(args):
+    """Fill unset settings from the run's config.json (--resume) or the
+    defaults, store the result in config.json and print it."""
+    config_path = os.path.join(args.run, "config.json")
+    saved = {}
+    if args.resume and os.path.exists(config_path):
+        with open(config_path) as f:
+            saved = json.load(f)
+    overridden = []
+    for key, default in DEFAULTS.items():
+        value = getattr(args, key)
+        if value is not None:
+            if args.resume and saved.get(key, value) != value:
+                overridden.append(key)
+            continue
+        if args.resume and os.path.exists(config_path):
+            value = saved.get(key, LEGACY.get(key, default))
+        else:
+            value = default
+        setattr(args, key, value)
+    if args.simulations == 0 and args.unroll == 0:
+        print("root-only self-play needs the dynamics network: using --unroll 5")
+        args.unroll = 5
+    os.makedirs(args.run, exist_ok=True)
+    with open(config_path, "w") as f:
+        json.dump({k: getattr(args, k) for k in DEFAULTS}, f, indent=2)
+    print("settings: " + ", ".join(f"{k}={getattr(args, k)}" + (" (changed)" if k in overridden else "")
+                                   for k in DEFAULTS))
+    return args
 
 
 def log(run, record):
@@ -162,10 +222,6 @@ def train(args, status):
     if dev.type == "cuda":
         torch.backends.cudnn.benchmark = True
     migrate_flat_data(args.run)
-    config_path = os.path.join(args.run, "config.json")
-    if not os.path.exists(config_path):
-        with open(config_path, "w") as f:
-            json.dump(vars(args), f, indent=2)
     keep_gens = data_gens_to_keep(args)
     assert pz.ENCODING_VERSION == enc.ENCODING_VERSION, "rebuild peazero_rs: encoding version mismatch"
 
@@ -207,8 +263,12 @@ def train(args, status):
     if args.simulations > 0:
         if not hasattr(pz, "SearchSelfPlay"):
             sys.exit("peazero_rs is out of date (no tree search); run `pip install ./crates/py`")
-        sp = pz.SearchSelfPlay(games=args.games, simulations=args.simulations, considered=args.considered,
-                               max_plies=args.max_plies, seed=args.seed + gen, threads=args.threads)
+        try:
+            sp = pz.SearchSelfPlay(games=args.games, simulations=args.simulations, considered=args.considered,
+                                   max_plies=args.max_plies, seed=args.seed + gen, threads=args.threads,
+                                   noise_plies=args.noise_plies, late_gumbel_scale=args.late_noise)
+        except TypeError:
+            sys.exit("peazero_rs is out of date (no noise schedule / data format v2); run `pip install ./crates/py`")
         mode = f"{args.simulations} simulations, {args.considered} considered"
     else:
         sp = pz.SelfPlay(games=args.games, considered=args.considered, max_plies=args.max_plies,
@@ -283,7 +343,7 @@ def train(args, status):
             lr = args.lr * min(1.0, step / args.warmup)
             for g in opt.param_groups:
                 g["lr"] = lr
-            loss, m = muzero_loss(net, batch, dev, amp)
+            loss, m = muzero_loss(net, batch, dev, amp, q_ratio=args.q_ratio)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             if i + 1 < n_steps:

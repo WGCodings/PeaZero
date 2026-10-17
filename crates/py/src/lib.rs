@@ -210,7 +210,9 @@ struct SearchSelfPlay {
 #[pymethods]
 impl SearchSelfPlay {
     #[new]
-    #[pyo3(signature = (games=1024, simulations=64, considered=16, gumbel_scale=1.0, c_visit=50.0, c_scale=0.1, max_plies=512, seed=0, threads=0))]
+    /// `noise_plies`: plies per game with the full Gumbel noise
+    /// (`gumbel_scale`), then `late_gumbel_scale`; 0 = full noise all game.
+    #[pyo3(signature = (games=1024, simulations=64, considered=16, gumbel_scale=1.0, c_visit=50.0, c_scale=0.1, max_plies=512, seed=0, threads=0, noise_plies=0, late_gumbel_scale=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         games: usize,
@@ -222,6 +224,8 @@ impl SearchSelfPlay {
         max_plies: usize,
         seed: u64,
         threads: usize,
+        noise_plies: usize,
+        late_gumbel_scale: f32,
     ) -> PyResult<Self> {
         if games == 0 || considered == 0 || simulations == 0 {
             return Err(PyValueError::new_err(
@@ -242,6 +246,8 @@ impl SearchSelfPlay {
                 },
                 seed,
                 threads,
+                noise_plies,
+                late_gumbel_scale,
             }),
         })
     }
@@ -349,7 +355,9 @@ impl Replay {
 
     /// Sample a training batch. Keys: obs (B,21,8,8), actions (B,K,5,8,8),
     /// policy_index / policy_prob (B,K+1,218), policy_mask (B,K+1),
-    /// value_target (B,K+1) int64 (0 win, 1 draw, 2 loss), value_mask (B,K+1).
+    /// value_target (B,K+1) int64 (0 win, 1 draw, 2 loss), value_mask (B,K+1),
+    /// value_search (B,K+1,3) search W/D/L where recorded (data format v2),
+    /// value_search_mask (B,K+1).
     fn sample<'py>(
         &mut self,
         py: Python<'py>,
@@ -379,6 +387,11 @@ impl Replay {
         d.set_item("policy_mask", shaped(py, b.policy_mask, &[batch, k1])?)?;
         d.set_item("value_target", shaped(py, b.value_target, &[batch, k1])?)?;
         d.set_item("value_mask", shaped(py, b.value_mask, &[batch, k1])?)?;
+        d.set_item("value_search", shaped(py, b.value_search, &[batch, k1, 3])?)?;
+        d.set_item(
+            "value_search_mask",
+            shaped(py, b.value_search_mask, &[batch, k1])?,
+        )?;
         Ok(d)
     }
 }

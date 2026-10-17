@@ -54,37 +54,53 @@ def batch_to_device(batch: dict, device: torch.device) -> dict:
     return out
 
 
-def muzero_loss(net: MuZeroNet, batch: dict, device: torch.device, amp: bool):
+def muzero_loss(net: MuZeroNet, batch: dict, device: torch.device, amp: bool, q_ratio: float = 0.0):
     """K-step unrolled loss. `batch` is a numpy batch from Replay.sample or
     the output of batch_to_device. Returns (loss tensor, metrics dict of
     detached 0-dim tensors; call float() on them only when needed, every
-    float() waits for the GPU)."""
+    float() waits for the GPU).
+
+    Value target: the game result, or with `q_ratio` > 0 the mix
+    `(1 - q_ratio)·result + q_ratio·search value` where the data has a
+    search value (format v2). The logged value losses are always against
+    the game result, so they stay comparable between runs."""
     t = batch if isinstance(next(iter(batch.values())), torch.Tensor) else batch_to_device(batch, device)
     obs, actions = t["obs"], t["actions"]
     pidx, pprob, pmask = t["policy_index"], t["policy_prob"], t["policy_mask"]
     vtgt, vmask = t["value_target"], t["value_mask"]
     b, unroll = actions.shape[0], actions.shape[1]
 
+    use_search = q_ratio > 0 and "value_search" in t
+
     def step(k: int, policy: torch.Tensor, value: torch.Tensor):
         logp = F.log_softmax(policy.float(), dim=-1)
         target = torch.zeros_like(logp).scatter_add_(1, pidx[:, k], pprob[:, k])
         pl = (-(target * logp).sum(-1) * pmask[:, k]).sum() / b
-        vl = (F.cross_entropy(value.float(), vtgt[:, k], reduction="none") * vmask[:, k]).sum() / b
+        vlogp = F.log_softmax(value.float(), dim=-1)
+        result = F.one_hot(vtgt[:, k], 3).float()
+        vl = (-(result * vlogp).sum(-1) * vmask[:, k]).sum() / b
+        if use_search:
+            w = q_ratio * t["value_search_mask"][:, k].unsqueeze(-1)
+            mixed = (1 - w) * result + w * t["value_search"][:, k]
+            vl_train = (-(mixed * vlogp).sum(-1) * vmask[:, k]).sum() / b
+        else:
+            vl_train = vl
         agree = ((policy.argmax(-1) == target.argmax(-1)).float() * pmask[:, k]).sum() / pmask[:, k].sum().clamp(min=1)
-        return pl, vl, agree
+        return pl, vl, vl_train, agree
 
     with autocast(device, amp):
         latent, policy, value = net.initial_inference(obs)
-        pl0, vl0, agree0 = step(0, policy, value)
-        loss = pl0 + vl0
-        pl_u = vl_u = torch.zeros((), device=device)
+        pl0, vl0, vt0, agree0 = step(0, policy, value)
+        loss = pl0 + vt0
+        pl_u = vl_u = vt_u = torch.zeros((), device=device)
         for k in range(1, unroll + 1):
             latent = 0.5 * latent + 0.5 * latent.detach()  # MuZero gradient scaling
             latent, policy, value = net.recurrent_inference(latent, actions[:, k - 1])
-            pl, vl, _ = step(k, policy, value)
+            pl, vl, vt, _ = step(k, policy, value)
             pl_u = pl_u + pl / unroll
             vl_u = vl_u + vl / unroll
-        loss = loss + pl_u + vl_u
+            vt_u = vt_u + vt / unroll
+        loss = loss + pl_u + vt_u
 
     metrics = {
         "loss": loss.detach().float(),

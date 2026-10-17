@@ -19,16 +19,28 @@ Re-run `pip install .\crates\py` whenever anything under `crates/` changes.
 
 ```powershell
 cd trainer
-python train.py --run ..\runs\first --net 64x6
+python train.py --run ..\runs\fourth
 ```
 
 Stop it any time with Ctrl+C. Continue with:
 
 ```powershell
-python train.py --run ..\runs\first --resume
+python train.py --run ..\runs\fourth --resume
 ```
 
-Defaults: 1024 concurrent games, 16 considered moves per position, 100,000 new positions per generation, batch 512, K = 5, each position trained on ~4× on average, 1M-position replay buffer. See `python train.py --help`.
+**Settings live with the run.** The first start stores all settings in `runs/<name>/config.json`; `--resume` reuses them, so you don't repeat flags. A flag on the command line overrides the stored value and is saved (the startup `settings:` line marks it "changed"), e.g. `--resume --generations 2000`. Settings an older run never recorded keep that run's original behaviour, so resuming `second` or `third` doesn't change how they train.
+
+Defaults for a new run (`python train.py --help`):
+
+| setting | default | meaning |
+|---|---|---|
+| `--simulations` | 64 | tree-search simulations per move (0 = old root-only mode) |
+| `--considered` | 16 | root candidates (Sequential Halving width) |
+| `--noise-plies` / `--late-noise` | 30 / 0.0 | full Gumbel noise for the first 30 plies of a game, then none: opening variety, but games are played out properly so the result reflects who was better |
+| `--q-ratio` | 0.5 | value target = 50 % game result + 50 % search value of the position (much less noisy than the result alone) |
+| `--unroll` | 0 | AlphaZero-style training: no dynamics unroll (self-play and the engine don't use the dynamics network); training ~4× cheaper than K = 5 |
+| `--reuse` | 2.0 | average times each new position is trained on |
+| `--games`, `--positions-per-gen`, `--batch`, `--replay` | 1024, 100k, 512, 1M | |
 
 ## Dashboard
 
@@ -42,7 +54,7 @@ Defaults: 1024 concurrent games, 16 considered moves per position, 100,000 new p
 
 ```
 runs/first/
-  config.json          arguments of the first start
+  config.json          the run's settings (reused by --resume)
   checkpoint.pt        latest model + optimizer (used by --resume)
   metrics.jsonl        one line per generation
   status.json          live progress, read by the dashboard
@@ -55,7 +67,7 @@ Self-play data is only needed to refill the replay buffer on `--resume`, so olde
 
 ## What a generation does
 
-1. **Self-play.** Every move runs a Gumbel MuZero tree search with `--simulations` (default 64) leaf evaluations on the *real* board: Rust makes the moves, the `initial` network evaluates each new leaf, checkmates and draws are scored exactly. The root uses Sequential Halving over the top `--considered` (16) moves, so the best candidates are searched several plies deep. The move played and the policy target come from the search (docs/MUZERO.md §6.3). All games advance in lock-step, one simulation per step, so the GPU always sees batches of `--games` positions. `--simulations 0` selects the old root-only mode (one dynamics-network evaluation per candidate, §6.2). Finished games are written to `runs/<name>/data/`.
+1. **Self-play.** Every move runs a Gumbel MuZero tree search with `--simulations` (default 64) leaf evaluations on the *real* board: Rust makes the moves, the `initial` network evaluates each new leaf, checkmates and draws are scored exactly. The root uses Sequential Halving over the top `--considered` (16) moves, so the best candidates are searched several plies deep. The move played and the policy target come from the search (docs/MUZERO.md §6.3). All games advance in lock-step, one simulation per step, so the GPU always sees batches of `--games` positions. `--simulations 0` selects the old root-only mode (one dynamics-network evaluation per candidate, §6.2). Every recorded position also stores the search's value (W/D/L for the side to move: W−L from the root search value, D from the network), used by `--q-ratio`. Finished games are written to `runs/<name>/data/` (data format v2; v1 files from older runs are still read).
 2. **Training.** Batches are sampled from the replay buffer and trained with the K = 5 unrolled MuZero loss.
 3. **Export.** BatchNorm statistics are recalibrated (see below), then `runs/<name>/nets/gen_XXXX.pzn` plus `checkpoint.pt` are written.
 

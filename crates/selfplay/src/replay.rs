@@ -41,6 +41,10 @@ pub struct Batch {
     pub value_target: Vec<i64>,
     /// `B × (K+1)`
     pub value_mask: Vec<f32>,
+    /// `B × (K+1) × 3` search value (W/D/L, side to move) where recorded
+    pub value_search: Vec<f32>,
+    /// `B × (K+1)`: 1 where `value_search` is valid
+    pub value_search_mask: Vec<f32>,
 }
 
 pub struct Replay {
@@ -134,6 +138,8 @@ impl Replay {
             policy_mask: vec![0.0; batch * k1],
             value_target: vec![1; batch * k1],
             value_mask: vec![0.0; batch * k1],
+            value_search: vec![0.0; batch * k1 * 3],
+            value_search_mask: vec![0.0; batch * k1],
         };
         for i in 0..batch {
             let (gi, t) = self.pick();
@@ -178,6 +184,10 @@ impl Replay {
                     b.policy_mask[slot] = 1.0;
                     b.value_target[slot] = value_class(game.result, p.stm);
                     b.value_mask[slot] = 1.0;
+                    if let Some(wdl) = p.value_wdl() {
+                        b.value_search[slot * 3..slot * 3 + 3].copy_from_slice(&wdl);
+                        b.value_search_mask[slot] = 1.0;
+                    }
                 } else if j == total {
                     let stm = !plies[total - 1].stm;
                     b.value_target[slot] = value_class(game.result, stm);

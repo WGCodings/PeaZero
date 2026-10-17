@@ -33,7 +33,7 @@ use crate::gumbel::GumbelConfig;
 use crate::pool::PoolStats;
 use crate::record::{GameRecord, PlyRecord, Termination};
 use crate::replay::MAX_LEGAL;
-use crate::wdl_logits_to_q;
+use crate::{wdl_logits_to_probs, wdl_logits_to_q};
 
 #[derive(Clone, Debug)]
 pub struct SearchConfig {
@@ -47,6 +47,10 @@ pub struct SearchConfig {
     pub seed: u64,
     /// Worker threads for the per-game work; 0 = one per logical CPU.
     pub threads: usize,
+    /// Plies per game with the full Gumbel noise (`gumbel.gumbel_scale`);
+    /// after that `late_gumbel_scale` is used. 0 = full noise all game.
+    pub noise_plies: usize,
+    pub late_gumbel_scale: f32,
 }
 
 impl Default for SearchConfig {
@@ -58,6 +62,8 @@ impl Default for SearchConfig {
             gumbel: GumbelConfig::default(),
             seed: 0,
             threads: 1,
+            noise_plies: 0,
+            late_gumbel_scale: 0.0,
         }
     }
 }
@@ -74,11 +80,13 @@ struct Node {
     value_sum: Vec<f32>,
     /// Network value (`W - L`, side to move), or the exact terminal value.
     raw_value: f32,
+    /// Network draw probability (exact for terminals).
+    raw_draw: f32,
     terminal: bool,
 }
 
 impl Node {
-    fn new(actions: Vec<(usize, Move)>, raw_logits: &[f32], raw_value: f32) -> Node {
+    fn new(actions: Vec<(usize, Move)>, raw_logits: &[f32], raw_value: f32, raw_draw: f32) -> Node {
         let max = raw_logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let k = actions.len();
         Node {
@@ -88,6 +96,7 @@ impl Node {
             value_sum: vec![0.0; k],
             actions,
             raw_value,
+            raw_draw,
             terminal: false,
         }
     }
@@ -100,6 +109,7 @@ impl Node {
             visits: Vec::new(),
             value_sum: Vec::new(),
             raw_value: value,
+            raw_draw: if value == 0.0 { 1.0 } else { 0.0 },
             terminal: true,
         }
     }
@@ -363,12 +373,22 @@ impl Slot {
         let target = softmax(&improved);
         let targets: Vec<(usize, f32)> = root.actions.iter().map(|&(a, _)| a).zip(target).collect();
         let (action, mv) = root.actions[chosen];
-        self.plies.push(PlyRecord::new(
-            self.game.position(),
-            self.game.repetitions(),
-            action,
-            &targets,
-        ));
+        // Search value of the root: mean of the network value and all backed-up
+        // values (mctx node value). W - L from it, D from the network.
+        let visits: u32 = root.total_visits();
+        let sum: f32 = root.value_sum.iter().sum();
+        let q = ((root.raw_value + sum) / (1.0 + visits as f32)).clamp(-1.0, 1.0);
+        let d = root.raw_draw.min(1.0 - q.abs());
+        let value = [(1.0 - d + q) / 2.0, d, (1.0 - d - q) / 2.0];
+        self.plies.push(
+            PlyRecord::new(
+                self.game.position(),
+                self.game.repetitions(),
+                action,
+                &targets,
+            )
+            .with_value(value),
+        );
         self.game.push(mv);
 
         let outcome = match Termination::from_result(self.game.result()) {
@@ -398,12 +418,18 @@ impl Slot {
     ) -> Option<Outcome> {
         let k = self.eval_actions.len();
         let v = wdl_logits_to_q(value);
+        let draw = wdl_logits_to_probs(value)[1];
         let actions = std::mem::take(&mut self.eval_actions);
-        let node = Node::new(actions, &logits[..k], v);
+        let node = Node::new(actions, &logits[..k], v, draw);
         match std::mem::replace(&mut self.request, Request::Root) {
             Request::Root => {
+                let scale = if cfg.noise_plies > 0 && self.plies.len() >= cfg.noise_plies {
+                    cfg.late_gumbel_scale
+                } else {
+                    cfg.gumbel.gumbel_scale
+                };
                 self.root_gumbel = (0..k)
-                    .map(|_| cfg.gumbel.gumbel_scale * sample_gumbel(&mut self.rng))
+                    .map(|_| scale * sample_gumbel(&mut self.rng))
                     .collect();
                 self.nodes.clear();
                 self.nodes.push(node);
@@ -584,6 +610,16 @@ mod tests {
     }
 
     fn search_with(fen: &str, simulations: usize, considered: usize) -> (Move, Vec<(usize, f32)>) {
+        let (mv, targets, _) = search_full(fen, simulations, considered);
+        (mv, targets)
+    }
+
+    /// Searches one move; returns move, policy target and recorded value.
+    fn search_full(
+        fen: &str,
+        simulations: usize,
+        considered: usize,
+    ) -> (Move, Vec<(usize, f32)>, Option<[f32; 3]>) {
         peazero_core::init();
         let cfg = SearchConfig {
             games: 1,
@@ -622,9 +658,25 @@ mod tests {
                     .iter()
                     .map(|&(a, q)| (a as usize, q as f32 / 65535.0))
                     .collect();
-                return (mv, targets);
+                return (mv, targets, p.value_wdl());
             }
         }
+    }
+
+    #[test]
+    fn records_search_value() {
+        // White mates in one: the root search value must be clearly winning,
+        // and a valid W/D/L distribution.
+        let fen = "6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1";
+        let (_, _, value) = search_full(fen, 64, 16);
+        let [w, d, l] = value.unwrap();
+        assert!((w + d + l - 1.0).abs() < 1e-3);
+        assert!(w - l > 0.5, "search value {w} {d} {l}");
+        // Black is a rook down with no tactic: the value is negative.
+        let fen = "6k1/5ppp/8/8/8/8/5PPP/R5K1 b - - 0 1";
+        let (_, _, value) = search_full(fen, 64, 16);
+        let [w, _, l] = value.unwrap();
+        assert!(w - l < 0.0, "search value {w} {l}");
     }
 
     /// Material balance for the side to move, squashed to (-1, 1).

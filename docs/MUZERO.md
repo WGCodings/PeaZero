@@ -142,7 +142,7 @@ Run `python trainer/scripts/bench_gpu.py` on the 3070 and fill in:
 | first network | 64×6 (fallback 32×4 if self-play is too slow) | spike numbers above |
 | value head | W/D/L classes | chess draws are a real outcome; also gives UCI WDL output for free |
 
-### 6.1 Self-play data format v0 (implemented in Sprint 3)
+### 6.1 Self-play data format v0/v1 (implemented in Sprint 3; header version 1, superseded by v2, §6.4)
 
 Binary chunk files, little-endian, written by Rust, read by Python with numpy:
 
@@ -181,6 +181,14 @@ Root-only Gumbel (§6.2) looks one ply deep and takes its child values from the 
 Tests (`search::tests`): the schedule matches mctx's Python implementation; with a material-only value and a uniform policy the search finds a back-rank mate in one, takes a hanging rook, and refuses a pawn defended by a pawn (Qxd5?? exd5), which a one-ply search with the same networks plays.
 
 Training is unchanged (K-step unroll still trains the dynamics network; with `--unroll 0` training becomes AlphaZero-style and much cheaper). The engine stays searchless.
+
+## 6.4 Sprint 5b: value targets and noise schedule (run `fourth`)
+
+* **Data format v2** (`record.rs`): per ply an optional search value, stored as W and D × 65535 for the side to move. W − L = root search value (mctx node value: mean of the root's network value and all backed-up values), D = the network's draw probability at the root, so L = 1 − W − D. v1 chunks (no value) are still read.
+* **Value target** (`--q-ratio`, default 0.5 for new runs): `(1 − q)·one-hot(game result) + q·search W/D/L` per position, as soft cross-entropy. The logged `value_loss` stays the loss against the game result, so it remains comparable with earlier runs.
+* **Noise schedule** (`--noise-plies 30 --late-noise 0`): full Gumbel noise for the first 30 plies, then none (AlphaZero's temperature drop). The policy target doesn't depend on the noise, only the move played does.
+* **`--unroll 0`** for new runs: AlphaZero-style loss on the root position only; the dynamics network is still in the model but no longer trained.
+* Run settings are stored in `config.json` and reused by `--resume`; settings missing from an older run's config keep that run's original behaviour.
 
 ## 7. Reference implementations reviewed
 
