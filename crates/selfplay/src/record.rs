@@ -1,13 +1,17 @@
-//! Self-play data format v0. One chunk = one file (little-endian):
+//! Self-play data format. One chunk = one file (little-endian):
 //!
 //! ```text
-//! header   : "PZSP" | u32 format version (1) | u32 ENCODING_VERSION | u32 game count
+//! header   : "PZSP" | u32 format version (2) | u32 ENCODING_VERSION | u32 game count
 //! per game : u16 ply count | i8 result (+1 white wins, 0 draw, -1 black wins) | u8 termination
 //! per ply  : 12 × u64 piece bitboards (white P N B R Q K, black P N B R Q K)
 //!            u8 side to move (0 white, 1 black) | u8 castling | u8 ep square (64 = none)
 //!            u8 halfmove clock | u8 repetitions | u16 action played
 //!            u8 legal count L | L × (u16 action, u16 target probability × 65535)
+//!   v2 only: u8 has_value | if 1: u16 W × 65535, u16 D × 65535
+//!            (search value of the position for its side to move; L = 1 - W - D)
 //! ```
+//!
+//! Version 1 (no search value) is still read.
 //!
 //! The position *after* the last ply (the terminal position) is not stored;
 //! its side to move is the opposite of the last ply's.
@@ -16,7 +20,7 @@ use peazero_core::encoding::ENCODING_VERSION;
 use peazero_core::{Color, GameResult, Position, Square};
 
 pub const MAGIC: &[u8; 4] = b"PZSP";
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -82,6 +86,8 @@ pub struct PlyRecord {
     pub action: u16,
     /// (action, probability × 65535)
     pub targets: Vec<(u16, u16)>,
+    /// Search value (W, D) × 65535 for the side to move, if recorded.
+    pub value: Option<(u16, u16)>,
 }
 
 impl PlyRecord {
@@ -103,7 +109,24 @@ impl PlyRecord {
                 .iter()
                 .map(|&(a, p)| (a as u16, (p.clamp(0.0, 1.0) * 65535.0).round() as u16))
                 .collect(),
+            value: None,
         }
+    }
+
+    /// Attach the search value as W/D/L probabilities for the side to move.
+    pub fn with_value(mut self, [w, d, _]: [f32; 3]) -> PlyRecord {
+        let q = |x: f32| (x.clamp(0.0, 1.0) * 65535.0).round() as u16;
+        let (w, d) = (q(w), q(d));
+        self.value = Some((w, d.min(65535 - w)));
+        self
+    }
+
+    /// The stored search value as W/D/L, if any.
+    pub fn value_wdl(&self) -> Option<[f32; 3]> {
+        self.value.map(|(w, d)| {
+            let (w, d) = (w as f32 / 65535.0, d as f32 / 65535.0);
+            [w, d, (1.0 - w - d).max(0.0)]
+        })
     }
 
     pub fn position(&self) -> Position {
@@ -126,9 +149,13 @@ pub struct GameRecord {
 }
 
 pub fn write_chunk(games: &[GameRecord]) -> Vec<u8> {
+    write_chunk_version(games, FORMAT_VERSION)
+}
+
+fn write_chunk_version(games: &[GameRecord], version: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(16 + games.iter().map(|g| g.plies.len() * 250).sum::<usize>());
     out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&ENCODING_VERSION.to_le_bytes());
     out.extend_from_slice(&(games.len() as u32).to_le_bytes());
     for g in games {
@@ -149,6 +176,15 @@ pub fn write_chunk(games: &[GameRecord]) -> Vec<u8> {
             for &(a, prob) in &p.targets {
                 out.extend_from_slice(&a.to_le_bytes());
                 out.extend_from_slice(&prob.to_le_bytes());
+            }
+            match p.value.filter(|_| version >= 2) {
+                Some((w, d)) => {
+                    out.push(1);
+                    out.extend_from_slice(&w.to_le_bytes());
+                    out.extend_from_slice(&d.to_le_bytes());
+                }
+                None if version >= 2 => out.push(0),
+                None => {}
             }
         }
     }
@@ -190,7 +226,7 @@ pub fn read_chunk(bytes: &[u8]) -> Result<Vec<GameRecord>, String> {
     }
     let version = r.u32()?;
     let encoding = r.u32()?;
-    if version != FORMAT_VERSION {
+    if !(1..=FORMAT_VERSION).contains(&version) {
         return Err(format!("unsupported data format v{version}"));
     }
     if encoding != ENCODING_VERSION {
@@ -229,6 +265,11 @@ pub fn read_chunk(bytes: &[u8]) -> Result<Vec<GameRecord>, String> {
             for _ in 0..l {
                 targets.push((r.u16()?, r.u16()?));
             }
+            let value = if version >= 2 && r.u8()? == 1 {
+                Some((r.u16()?, r.u16()?))
+            } else {
+                None
+            };
             plies.push(PlyRecord {
                 pieces,
                 stm,
@@ -238,6 +279,7 @@ pub fn read_chunk(bytes: &[u8]) -> Result<Vec<GameRecord>, String> {
                 repetitions,
                 action,
                 targets,
+                value,
             });
         }
         games.push(GameRecord {
@@ -253,4 +295,39 @@ pub fn read_chunk(bytes: &[u8]) -> Result<Vec<GameRecord>, String> {
         ));
     }
     Ok(games)
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    fn sample_games() -> Vec<GameRecord> {
+        let pos = Position::startpos();
+        let ply = PlyRecord::new(&pos, 0, 7, &[(7, 0.75), (9, 0.25)]);
+        vec![GameRecord {
+            plies: vec![ply.clone().with_value([0.5, 0.3, 0.2]), ply],
+            result: 1,
+            termination: Termination::Checkmate,
+        }]
+    }
+
+    #[test]
+    fn v2_round_trip_keeps_search_value() {
+        let games = sample_games();
+        let back = read_chunk(&write_chunk(&games)).unwrap();
+        assert_eq!(back, games);
+        let wdl = back[0].plies[0].value_wdl().unwrap();
+        assert!((wdl[0] - 0.5).abs() < 1e-4 && (wdl[1] - 0.3).abs() < 1e-4);
+        assert!((wdl.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+        assert!(back[0].plies[1].value_wdl().is_none());
+    }
+
+    #[test]
+    fn v1_chunks_are_still_read() {
+        let games = sample_games();
+        let back = read_chunk(&write_chunk_version(&games, 1)).unwrap();
+        assert_eq!(back.len(), 1);
+        assert!(back[0].plies.iter().all(|p| p.value.is_none()));
+        assert_eq!(back[0].plies[0].targets, games[0].plies[0].targets);
+    }
 }
