@@ -41,6 +41,36 @@ Defaults for a new run (`python train.py --help`):
 | `--unroll` | 0 | AlphaZero-style training: no dynamics unroll (self-play and the engine don't use the dynamics network); training ~4× cheaper than K = 5 |
 | `--reuse` | 2.0 | average times each new position is trained on |
 | `--games`, `--positions-per-gen`, `--batch`, `--replay` | 1024, 100k, 512, 1M | |
+| `--eval-every` | 25 | strength evaluation every 25 generations (match + puzzles, below); 0 = off |
+| `--match-games` / `--match-simulations` | 100 / 0 | games per evaluation match (0 = puzzles only) / search simulations in those games (0 = searchless) |
+| `--eval-threads` | 4 | CPU threads for the evaluation |
+| `--puzzles` | `trainer/data/puzzles.csv` | puzzle set (this session only; `none` = no puzzles) |
+
+## Strength evaluation
+
+The losses can't tell you how strong the network is: the targets get harder as the search gets better, and the value loss even rises as games become more decisive. So every `--eval-every` generations (a *milestone*: 25, 50, 75, …) a background process measures it directly, **on the CPU** (tract, the engine's own inference) at lower priority, while the GPU keeps training:
+
+* **Match:** gen N vs gen N − 25, `--match-games` games. Random 6-ply openings (the same set at every milestone), each played twice with colours swapped; searchless by default, like your OpenBench searchless tests. The result is an Elo difference with a 95 % interval from the game pairs.
+* **Elo ladder:** the matches chained (gen 25 = 0, gen 50 = Elo(50 vs 25), gen 75 = that + Elo(75 vs 50), …). As long as it keeps climbing, the network keeps getting stronger. Self-play Elo is inflated compared to Elo against other engines, so read it as a trend, not a rating. The interval widens along the ladder (the errors add up).
+* **Puzzles:** a fixed set of Lichess puzzles solved by the raw policy (searchless): the share solved, the share whose first move is right, the share per rating band, and a **puzzle rating** (the Lichess puzzle rating at which that share would be expected). This compares against an outside reference, not the run's own targets, so it is the steadiest progress signal between matches.
+
+One-time setup for the puzzles (Lichess puzzle database, CC0; streams ~250 MB and keeps ~3,250 puzzles, 250 per 200-point band from 400 to 3000):
+
+```powershell
+pip install zstandard
+python scripts\make_puzzles.py          # writes trainer\data\puzzles.csv
+```
+
+Keep that file fixed: the curves are only comparable on the same set. Without it the evaluator still runs the matches.
+
+Results go to `runs/<name>/evals.jsonl` and the dashboard's **Strength** section (Elo ladder, Elo per milestone, puzzle curves, a table of the latest evaluations); the console shows one `[eval]` line per result. The evaluator catches up on missed milestones after a restart. When training reaches `--generations` it waits for the last milestones (Ctrl+C skips). Evaluate an existing run, e.g. backfill `third` (from `trainer/`):
+
+```powershell
+python -m peazero.evaluator --run ..\runs\third --once                  # every 25 generations, then exit
+python -m peazero.evaluator --run ..\runs\third --once --every 100 --games 200
+```
+
+Cost with 4 threads (64×6, ~800 evaluations/s per core): the searchless 100-game match is ~12k evaluations, a few seconds; the puzzles about as much. `--match-simulations 64` gives more decisive games (deterministic searchless play often repeats into draws) but needs 65× the evaluations, roughly 4–5 minutes per milestone, still fine every 25 generations.
 
 ## Dashboard
 
@@ -60,6 +90,8 @@ runs/first/
   status.json          live progress, read by the dashboard
   latest.pzn           copy of the newest network
   nets/gen_0001.pzn    every generation's network (kept, ~4 MB each)
+  evals.jsonl          strength evaluation: one line per match / puzzle run
+  eval_status.json     what the evaluator is doing, read by the dashboard
   data/gen_0012/       self-play games of generation 12 (part_000.bin, ...)
 ```
 

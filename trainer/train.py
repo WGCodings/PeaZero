@@ -17,6 +17,7 @@ Run directory layout:
   <run>/status.json            live progress (read by the dashboard)
   <run>/latest.pzn             copy of the newest network
   <run>/nets/gen_XXXX.pzn      network after every generation
+  <run>/evals.jsonl            strength evaluation (matches, puzzles; see below)
   <run>/data/gen_XXXX/*.bin    self-play games (data format v2)
 
 Settings: every run stores its settings in config.json. --resume reuses
@@ -29,6 +30,12 @@ it (see --keep-data-gens); networks are always kept.
 
 A live dashboard (statistics, charts, ETA) opens at http://localhost:8765
 while training; see --dashboard-port / --no-browser.
+
+Strength: every --eval-every generations a background CPU process
+(peazero/evaluator.py) plays gen N against gen N - eval-every
+(--match-games games) and runs the puzzle set (trainer/data/puzzles.csv,
+made by scripts/make_puzzles.py). The GPU keeps training meanwhile; the
+Elo ladder and puzzle curves appear on the dashboard. --eval-every 0 = off.
 """
 import argparse
 import glob
@@ -37,6 +44,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 
@@ -62,6 +70,8 @@ DEFAULTS = {
     # training
     "batch": 512, "unroll": 0, "reuse": 2.0, "lr": 1e-3, "weight_decay": 1e-4, "warmup": 500,
     "replay": 1_000_000, "keep_data_gens": -1, "q_ratio": 0.5, "seed": 0,
+    # background strength evaluation (CPU)
+    "eval_every": 25, "match_games": 100, "match_simulations": 0, "eval_threads": 4,
 }
 # What runs started before a setting existed did (used when their
 # config.json lacks the key).
@@ -105,7 +115,17 @@ def parse_args():
     ap.add_argument("--q-ratio", type=float,
                     help="value target = (1-q)·game result + q·search value (needs data format v2)")
     ap.add_argument("--seed", type=int)
+    # strength evaluation
+    ap.add_argument("--eval-every", type=int,
+                    help="every N generations: match vs the net N generations older + puzzles, in a "
+                         "background CPU process (0 = off)")
+    ap.add_argument("--match-games", type=int, help="games per evaluation match (0 = puzzles only)")
+    ap.add_argument("--match-simulations", type=int,
+                    help="search simulations per move in evaluation matches (0 = searchless)")
+    ap.add_argument("--eval-threads", type=int, help="CPU threads for the evaluation")
     # this session only (not stored)
+    ap.add_argument("--puzzles", help="puzzle CSV for the evaluation (default trainer/data/puzzles.csv; "
+                                      "'none' = no puzzles)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-amp", action="store_true", help="disable fp16 autocast on CUDA")
     ap.add_argument("--dashboard-port", type=int, default=8765, help="live dashboard port; 0 = no dashboard")
@@ -194,6 +214,47 @@ def prune_data(run, keep):
         shutil.rmtree(path, ignore_errors=True)
 
 
+def start_evaluator(args):
+    """Background strength evaluation (peazero/evaluator.py) at lower CPU
+    priority. It exits when we do: it watches its stdin, which we hold."""
+    if args.eval_every <= 0:
+        return None
+    cmd = [sys.executable, "-m", "peazero.evaluator", "--run", os.path.abspath(args.run),
+           "--every", str(args.eval_every), "--games", str(args.match_games),
+           "--simulations", str(args.match_simulations), "--threads", str(args.eval_threads),
+           "--seed", str(args.seed), "--parent-stdin"]
+    if args.puzzles:
+        cmd += ["--puzzles", args.puzzles if args.puzzles.lower() == "none" else os.path.abspath(args.puzzles)]
+    kw = {}
+    if os.name == "nt":
+        kw["creationflags"] = subprocess.BELOW_NORMAL_PRIORITY_CLASS
+    else:
+        kw["preexec_fn"] = lambda: os.nice(10)
+    try:
+        return subprocess.Popen(cmd, cwd=os.path.dirname(os.path.abspath(__file__)), stdin=subprocess.PIPE, **kw)
+    except OSError as e:
+        print(f"could not start the evaluator: {e}")
+        return None
+
+
+def stop_evaluator(proc, finish=False):
+    """finish=True (training done): let it evaluate the last milestones
+    first; otherwise stop it now."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if finish:
+            print("waiting for the evaluator to finish the last milestones (Ctrl+C to skip)")
+            proc.stdin.write(b"finish\n")
+            proc.stdin.flush()
+            proc.wait()
+        else:
+            proc.stdin.close()  # the evaluator exits on end of file
+            proc.wait(timeout=5)
+    except (Exception, KeyboardInterrupt):
+        proc.kill()
+
+
 def main():
     args = parse_args()
     for d in ("data", "nets"):
@@ -207,12 +268,16 @@ def main():
         url = dashboard.start(args.run, args.dashboard_port, not args.no_browser)
         if url:
             print(f"dashboard: {url}")
+    evaluator = start_evaluator(args)
+    finished = False
     try:
         train(args, status)
+        finished = True
     except KeyboardInterrupt:
         print("\nstopped (Ctrl+C); continue with --resume")
     finally:
         status.update(force=True, phase="stopped")
+        stop_evaluator(evaluator, finish=finished)
 
 
 def train(args, status):

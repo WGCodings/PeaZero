@@ -12,6 +12,14 @@
 //! rb.add_chunk(chunk)
 //! batch = rb.sample(512, 5)                  # dict of numpy arrays
 //! ```
+//!
+//! Strength evaluation on the CPU (tract, like the engine), used by the
+//! background evaluator:
+//!
+//! ```python
+//! games = pz.play_match("nets/gen_0050.pzn", "nets/gen_0025.pzn", games=100)
+//! res = pz.solve_puzzles("nets/gen_0050.pzn", [(fen, moves), ...])
+//! ```
 //! Shapes are validated here and raise `ValueError` instead of panicking
 //! (the release profile aborts on panic). The heavy calls release the GIL, so
 //! self-play in a background Python thread runs alongside training.
@@ -21,6 +29,8 @@ use peazero_core::encoding::{
     ACTION_PLANES, ACTION_SIZE, ENCODING_VERSION, NUM_ACTIONS, OBS_PLANES, OBS_SIZE,
 };
 use peazero_core::Game;
+use peazero_nn::MuZeroNet;
+use peazero_selfplay::arena::{self, ArenaConfig, Evaluate, Puzzle};
 use peazero_selfplay::gumbel::GumbelConfig;
 use peazero_selfplay::pool::PoolStats;
 use peazero_selfplay::pool::{GamePool, PoolConfig};
@@ -30,6 +40,7 @@ use peazero_selfplay::search::{SearchConfig, SearchPool};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
+use rayon::prelude::*;
 
 fn shaped<'py, T: numpy::Element>(
     py: Python<'py>,
@@ -411,12 +422,138 @@ fn encode_fen<'py>(
     shaped(py, v, &[OBS_PLANES, 8, 8])
 }
 
+/// CPU networks for the arena. tract plans have a fixed batch size, so
+/// requests are split into chunks of `EVAL_BATCH` (the last one padded) that
+/// run in parallel on the arena's threads.
+const EVAL_BATCH: usize = 16;
+
+struct TractEval {
+    nets: Vec<MuZeroNet>,
+}
+
+impl TractEval {
+    fn load(paths: &[&str]) -> PyResult<TractEval> {
+        let nets = paths
+            .iter()
+            .map(|p| {
+                let bytes = std::fs::read(p)
+                    .map_err(|e| PyValueError::new_err(format!("cannot read {p}: {e}")))?;
+                MuZeroNet::from_pzn(&bytes, EVAL_BATCH, false)
+                    .map_err(|e| PyValueError::new_err(format!("cannot load {p}: {e}")))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(TractEval { nets })
+    }
+}
+
+impl Evaluate for TractEval {
+    fn evaluate(&self, net: usize, obs: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let net = &self.nets[net];
+        let n = obs.len() / OBS_SIZE;
+        let chunks: Vec<(Vec<f32>, Vec<f32>)> = obs
+            .par_chunks(EVAL_BATCH * OBS_SIZE)
+            .map(|chunk| {
+                let rows = chunk.len() / OBS_SIZE;
+                let mut padded = chunk.to_vec();
+                padded.resize(EVAL_BATCH * OBS_SIZE, 0.0);
+                let out = net.initial(&padded).expect("tract inference failed");
+                (
+                    out.policy[..rows * NUM_ACTIONS].to_vec(),
+                    out.value[..rows * 3].to_vec(),
+                )
+            })
+            .collect();
+        let mut policy = Vec::with_capacity(n * NUM_ACTIONS);
+        let mut value = Vec::with_capacity(n * 3);
+        for (p, v) in chunks {
+            policy.extend(p);
+            value.extend(v);
+        }
+        (policy, value)
+    }
+}
+
+/// Play `games` evaluation games (rounded up to even: every random opening
+/// twice, colours swapped) between two `.pzn` networks on the CPU.
+/// `simulations = 0`: searchless (best policy move); otherwise noise-free
+/// Gumbel tree search. Returns one dict per game: opening, a_white, score_a
+/// (1 / 0.5 / 0), termination, plies.
+#[pyfunction]
+#[pyo3(signature = (net_a, net_b, games=100, opening_plies=6, simulations=0, considered=16, max_plies=512, seed=0, threads=4))]
+#[allow(clippy::too_many_arguments)]
+fn play_match<'py>(
+    py: Python<'py>,
+    net_a: &str,
+    net_b: &str,
+    games: usize,
+    opening_plies: usize,
+    simulations: usize,
+    considered: usize,
+    max_plies: usize,
+    seed: u64,
+    threads: usize,
+) -> PyResult<Vec<Bound<'py, PyDict>>> {
+    peazero_core::init();
+    let eval = TractEval::load(&[net_a, net_b])?;
+    let cfg = ArenaConfig {
+        simulations,
+        considered,
+        max_plies,
+        threads,
+    };
+    let openings = arena::random_openings(games.div_ceil(2).max(1), opening_plies, seed);
+    let results = py.detach(|| arena::play_match(&openings, &cfg, &eval));
+    results
+        .iter()
+        .map(|g| {
+            let d = PyDict::new(py);
+            d.set_item("opening", g.opening)?;
+            d.set_item("a_white", g.a_white)?;
+            d.set_item("score_a", g.score_a)?;
+            d.set_item("termination", g.termination.name())?;
+            d.set_item("plies", g.plies)?;
+            Ok(d)
+        })
+        .collect()
+}
+
+/// Solve puzzles in Lichess format, `[(fen, moves), ...]` (fen before the
+/// opponent's first move), with one `.pzn` network on the CPU. Returns
+/// `[(first_move_right, solved), ...]`.
+#[pyfunction]
+#[pyo3(signature = (net, puzzles, simulations=0, considered=16, threads=4))]
+fn solve_puzzles(
+    py: Python<'_>,
+    net: &str,
+    puzzles: Vec<(String, String)>,
+    simulations: usize,
+    considered: usize,
+    threads: usize,
+) -> PyResult<Vec<(bool, bool)>> {
+    peazero_core::init();
+    let eval = TractEval::load(&[net])?;
+    let parsed = puzzles
+        .iter()
+        .map(|(fen, moves)| Puzzle::from_lichess(fen, moves).map_err(PyValueError::new_err))
+        .collect::<PyResult<Vec<_>>>()?;
+    let cfg = ArenaConfig {
+        simulations,
+        considered,
+        max_plies: 512,
+        threads,
+    };
+    let results = py.detach(|| arena::solve_puzzles(&parsed, &cfg, &eval));
+    Ok(results.iter().map(|r| (r.first_move, r.solved)).collect())
+}
+
 #[pymodule]
 fn peazero_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SelfPlay>()?;
     m.add_class::<SearchSelfPlay>()?;
     m.add_class::<Replay>()?;
     m.add_function(wrap_pyfunction!(encode_fen, m)?)?;
+    m.add_function(wrap_pyfunction!(play_match, m)?)?;
+    m.add_function(wrap_pyfunction!(solve_puzzles, m)?)?;
     m.add("ENCODING_VERSION", ENCODING_VERSION)?;
     m.add("MAX_LEGAL", MAX_LEGAL)?;
     Ok(())

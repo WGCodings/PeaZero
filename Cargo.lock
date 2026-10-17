@@ -577,8 +577,10 @@ version = "0.1.0"
 dependencies = [
  "numpy",
  "peazero-core",
+ "peazero-nn",
  "peazero-selfplay",
  "pyo3",
+ "rayon",
 ]
 
 [[package]]

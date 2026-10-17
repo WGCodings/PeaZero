@@ -196,7 +196,7 @@ fn considered_visits_sequence(m: usize, n: usize) -> Vec<u32> {
 /// Table indexed by `[num_considered][simulation]` (mctx
 /// `get_table_of_considered_visits`), one extra column so the final
 /// selection after `n` simulations can be looked up too.
-fn considered_visits_table(m: usize, n: usize) -> Vec<Vec<u32>> {
+pub(crate) fn considered_visits_table(m: usize, n: usize) -> Vec<Vec<u32>> {
     (0..=m)
         .map(|k| {
             let mut s = considered_visits_sequence(k, n);
@@ -251,28 +251,33 @@ enum Request {
     Leaf { path: Vec<(u32, usize)> },
 }
 
-struct Slot {
-    game: Game,
-    plies: Vec<PlyRecord>,
+pub(crate) struct Slot {
+    pub(crate) game: Game,
+    pub(crate) plies: Vec<PlyRecord>,
     rng: Rng,
     nodes: Vec<Node>,
     root_gumbel: Vec<f32>,
     simulations_done: usize,
     request: Request,
     /// Position to evaluate and its legal moves.
-    eval_game: Game,
-    eval_actions: Vec<(usize, Move)>,
+    pub(crate) eval_game: Game,
+    pub(crate) eval_actions: Vec<(usize, Move)>,
 }
 
-struct Outcome {
-    result: i8,
-    termination: Termination,
-    plies: Vec<PlyRecord>,
+pub(crate) struct Outcome {
+    /// 1 white won, -1 black won, 0 draw.
+    pub(crate) result: i8,
+    pub(crate) termination: Termination,
+    pub(crate) plies: Vec<PlyRecord>,
 }
 
 impl Slot {
     fn new(rng: Rng) -> Slot {
-        let game = Game::default();
+        Slot::with_game(Game::default(), rng)
+    }
+
+    /// A slot that starts searching from `game` (evaluation games, puzzles).
+    pub(crate) fn with_game(game: Game, rng: Rng) -> Slot {
         let eval_actions = legal_actions(game.position());
         Slot {
             eval_game: game.clone(),
@@ -287,7 +292,7 @@ impl Slot {
         }
     }
 
-    fn request_root(&mut self) {
+    pub(crate) fn request_root(&mut self) {
         self.nodes.clear();
         self.simulations_done = 0;
         self.eval_game = self.game.clone();
@@ -409,7 +414,7 @@ impl Slot {
     }
 
     /// Apply this slot's network output and advance to its next request.
-    fn respond(
+    pub(crate) fn respond(
         &mut self,
         logits: &[f32],
         value: &[f32],

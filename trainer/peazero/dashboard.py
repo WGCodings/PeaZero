@@ -15,7 +15,10 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
-RUN_FILES = {"/metrics.jsonl": "metrics.jsonl", "/status.json": "status.json", "/config.json": "config.json"}
+RUN_FILES = {"/metrics.jsonl": "metrics.jsonl", "/status.json": "status.json", "/config.json": "config.json",
+             "/evals.jsonl": "evals.jsonl", "/eval_status.json": "eval_status.json"}
+# Line logs that may not exist yet: served empty instead of 404.
+OPTIONAL_LOGS = ("/metrics.jsonl", "/evals.jsonl")
 
 
 class StatusWriter:
@@ -60,10 +63,10 @@ def _handler(run):
                 with open(file, "rb") as f:
                     body = f.read()
             except OSError:
-                if path != "/metrics.jsonl":
+                if path not in OPTIONAL_LOGS:
                     self.send_error(404)
                     return
-                body = b""  # no generation finished yet
+                body = b""  # nothing logged yet
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))

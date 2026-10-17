@@ -11,6 +11,7 @@
 //!
 //! No Python or GPU code here; `crates/py` wraps this for the trainer.
 
+pub mod arena;
 pub mod gumbel;
 pub mod pool;
 pub mod record;

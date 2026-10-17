@@ -52,6 +52,8 @@ main { padding: 8px 20px 32px; max-width: 1500px; margin: 0 auto; }
 .legend span::before { content: ""; display: inline-block; width: 10px; height: 3px; border-radius: 2px;
   background: var(--sw); margin-right: 5px; vertical-align: middle; }
 h2 { font-size: 15px; margin: 22px 0 8px; }
+.h2note { color: var(--muted); font-weight: 400; font-size: 13px; margin-left: 8px; }
+.evaltable { margin-top: 12px; }
 .tablewrap { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; font-size: 13px; }
 th, td { padding: 5px 8px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
@@ -84,6 +86,12 @@ th:first-child, td:first-child { text-align: left; }
   </div>
 
   <div class="tiles" id="tiles"></div>
+
+  <h2>Strength <span class="h2note" id="evalstate"></span></h2>
+  <div class="charts" id="charts-strength"></div>
+  <div class="card tablewrap evaltable"><table id="evaltable"></table></div>
+
+  <h2>Training</h2>
   <div class="charts" id="charts"></div>
 
   <h2>Recent generations</h2>
@@ -94,6 +102,7 @@ th:first-child, td:first-child { text-align: left; }
 "use strict";
 const $ = (id) => document.getElementById(id);
 let metrics = [], status = null, config = {}, metricsText = "";
+let evalsText = "", evalStatus = null, matches = [], puzzleRuns = [], ladder = [];
 
 // ------------------------------------------------------------------ formatting
 const fmtInt = (x) => x == null || isNaN(x) ? "–" : Math.round(x).toLocaleString("en-US");
@@ -158,6 +167,37 @@ const CHARTS = [
   { id: "lr", title: "Learning rate", hint: "at the end of each generation", min0: true,
     series: [{ name: "lr", key: "lr", color: "--c6" }] },
 ];
+const fmtElo = (x) => x == null || isNaN(x) ? "–" : (x >= 0 ? "+" : "−") + Math.abs(Math.round(x));
+const evalEvery = () => (evalStatus && evalStatus.every) || config.eval_every || 25;
+const BAND_SERIES = [["<1000", "--c1"], ["1000-1400", "--c3"], ["1400-1800", "--c5"], ["1800-2200", "--c2"], ["2200+", "--c4"]];
+const STRENGTH_CHARTS = [
+  { id: "ladder", title: "Elo ladder", noRecent: true, zero: true, rows: () => ladder,
+    hint: "chained matches vs. the previous milestone; first milestone = 0; band = 95%",
+    empty: () => `first match after generation ${2 * evalEvery()}`,
+    fmt: (p) => `${fmtElo(p[1])} [${fmtElo(p[2])}, ${fmtElo(p[3])}]`,
+    series: [{ name: "Elo", key: "elo", lo: (r) => r.lo, hi: (r) => r.hi, color: "--c1" }] },
+  { id: "elomatch", title: "Elo gain per milestone", noRecent: true, zero: true, whiskers: true, rows: () => matches,
+    hint: "gen N vs. gen N − interval; bars = 95%",
+    empty: () => `first match after generation ${2 * evalEvery()}`,
+    fmt: (p) => `${fmtElo(p[1])} [${fmtElo(p[2])}, ${fmtElo(p[3])}]`,
+    series: [{ name: "Elo", key: "elo", lo: (r) => r.elo_lo, hi: (r) => r.elo_hi, color: "--c3" }] },
+  { id: "puzzles", title: "Puzzles", noRecent: true, pct: true, min0: true, rows: () => puzzleRuns,
+    hint: "fixed Lichess set, raw policy (searchless)", empty: puzzleEmpty,
+    series: [{ name: "solved", key: "solved", color: "--c1" },
+             { name: "first move right", key: "first_move", color: "--c6" }] },
+  { id: "puzzlebands", title: "Puzzles solved by rating", noRecent: true, pct: true, min0: true, rows: () => puzzleRuns,
+    hint: "Lichess puzzle rating bands", empty: puzzleEmpty,
+    series: BAND_SERIES.map(([b, color]) => ({ name: b, color,
+      get: (r) => r.bands && r.bands[b] ? r.bands[b].solved : null })) },
+  { id: "puzzlerating", title: "Puzzle rating", noRecent: true, rows: () => puzzleRuns,
+    hint: "rating at which the solved share is expected (Lichess puzzle Elo)", empty: puzzleEmpty,
+    fmt: (p) => fmtInt(p[1]),
+    series: [{ name: "rating", key: "rating", color: "--c5" }] },
+];
+function puzzleEmpty() {
+  if (evalStatus && evalStatus.puzzles === 0) return "no puzzle file: run trainer/scripts/make_puzzles.py";
+  return `first puzzle run after generation ${evalEvery()}`;
+}
 function frac(r, k) { const g = r.results && r.results.games; return g ? r.results[k] / g : null; }
 function term(r, k) {
   if (!r.terminations) return null;
@@ -166,19 +206,21 @@ function term(r, k) {
 }
 
 function buildCharts() {
-  const root = $("charts");
-  for (const c of CHARTS) {
-    const el = document.createElement("div");
-    el.className = "card chart";
-    el.innerHTML = `<h3>${c.title}</h3><p class="hint" id="hint-${c.id}">${c.hint}</p>
-      <canvas id="cv-${c.id}"></canvas>
-      <div class="legend">${c.series.length > 1 ? c.series.map((s) =>
-        `<span style="--sw: var(${s.color})">${s.name}</span>`).join("") : ""}</div>`;
-    root.appendChild(el);
-    const cv = el.querySelector("canvas");
-    cv.addEventListener("mousemove", (e) => { c.hover = e.offsetX; drawChart(c); });
-    cv.addEventListener("mouseleave", () => { c.hover = null; drawChart(c); });
-  }
+  for (const c of CHARTS) buildChart(c, $("charts"));
+  for (const c of STRENGTH_CHARTS) buildChart(c, $("charts-strength"));
+}
+
+function buildChart(c, root) {
+  const el = document.createElement("div");
+  el.className = "card chart";
+  el.innerHTML = `<h3>${c.title}</h3><p class="hint" id="hint-${c.id}">${c.hint}</p>
+    <canvas id="cv-${c.id}"></canvas>
+    <div class="legend">${c.series.length > 1 ? c.series.map((s) =>
+      `<span style="--sw: var(${s.color})">${s.name}</span>`).join("") : ""}</div>`;
+  root.appendChild(el);
+  const cv = el.querySelector("canvas");
+  cv.addEventListener("mousemove", (e) => { c.hover = e.offsetX; drawChart(c); });
+  cv.addEventListener("mouseleave", () => { c.hover = null; drawChart(c); });
 }
 
 function niceTicks(lo, hi, n = 5) {
@@ -191,10 +233,12 @@ function niceTicks(lo, hi, n = 5) {
 }
 
 function chartData(c) {
-  let rows = metrics;
-  if ($("recent").checked) rows = rows.slice(-50);
+  let rows = c.rows ? c.rows() : metrics;
+  if ($("recent").checked && !c.noRecent) rows = rows.slice(-50);
   return c.series.map((s) => ({ ...s,
-    pts: rows.map((r) => [r.generation, s.get ? s.get(r) : r[s.key]]).filter((p) => p[1] != null && isFinite(p[1])) }));
+    pts: rows.map((r) => [r.generation, s.get ? s.get(r) : r[s.key],
+                          s.lo ? s.lo(r) : null, s.hi ? s.hi(r) : null])
+      .filter((p) => p[1] != null && isFinite(p[1])) }));
 }
 
 function drawChart(c) {
@@ -209,10 +253,13 @@ function drawChart(c) {
   ctx.font = "11px system-ui, sans-serif";
   if (!all.length) {
     ctx.fillStyle = muted; ctx.textAlign = "center";
-    ctx.fillText("waiting for the first generation…", W / 2, H / 2);
+    ctx.fillText(c.empty ? c.empty() : "waiting for the first generation…", W / 2, H / 2);
+    $("hint-" + c.id).textContent = c.hint;
     return;
   }
-  let xs = all.map((p) => p[0]), ys = all.map((p) => p[1]);
+  let xs = all.map((p) => p[0]);
+  const ys = all.flatMap((p) => [p[1], p[2], p[3]]).filter((v) => v != null && isFinite(v));
+  if (c.zero) ys.push(0);
   let x0 = Math.min(...xs), x1 = Math.max(...xs);
   if (x1 === x0) { x0 -= 1; x1 += 1; }
   let y0 = Math.min(...ys), y1 = Math.max(...ys);
@@ -222,7 +269,7 @@ function drawChart(c) {
   const yFmt = (v) => c.pct ? (100 * v).toFixed(yt.step * 100 < 1 ? 1 : 0) + "%"
     : Math.abs(yt.step) < 1e-3 ? v.toExponential(0) : +v.toFixed(6) + "";
   const labelW = Math.max(...yt.ticks.map((t) => ctx.measureText(yFmt(t)).width));
-  const L = labelW + 10, R = 8, T = 6, B = 20, pw = W - L - R, ph = H - T - B;
+  const L = labelW + 10, R = 14, T = 6, B = 20, pw = W - L - R, ph = H - T - B;
   const X = (x) => L + (x - x0) / (x1 - x0) * pw, Y = (y) => T + (1 - (y - yt.lo) / (yt.hi - yt.lo)) * ph;
 
   ctx.strokeStyle = line; ctx.lineWidth = 1; ctx.fillStyle = muted; ctx.textAlign = "right"; ctx.textBaseline = "middle";
@@ -238,15 +285,44 @@ function drawChart(c) {
     ctx.fillText(t, X(t), H - B + 5);
   }
 
+  if (c.zero) {
+    const y = Math.round(Y(0)) + 0.5;
+    ctx.strokeStyle = muted; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W - R, y); ctx.stroke();
+  }
+  for (const s of data) {
+    const ranged = s.pts.filter((p) => p[2] != null && p[3] != null);
+    if (!ranged.length) continue;
+    ctx.strokeStyle = ctx.fillStyle = css(s.color);
+    if (c.whiskers) {
+      ctx.globalAlpha = 0.6; ctx.lineWidth = 1.5;
+      for (const p of ranged) {
+        const x = Math.round(X(p[0])) + 0.5;
+        ctx.beginPath(); ctx.moveTo(x, Y(p[2])); ctx.lineTo(x, Y(p[3]));
+        ctx.moveTo(x - 3, Y(p[2])); ctx.lineTo(x + 3, Y(p[2]));
+        ctx.moveTo(x - 3, Y(p[3])); ctx.lineTo(x + 3, Y(p[3])); ctx.stroke();
+      }
+    } else {
+      ctx.globalAlpha = 0.15;
+      ctx.beginPath();
+      ranged.forEach((p, i) => i ? ctx.lineTo(X(p[0]), Y(p[3])) : ctx.moveTo(X(p[0]), Y(p[3])));
+      for (let i = ranged.length - 1; i >= 0; i--) ctx.lineTo(X(ranged[i][0]), Y(ranged[i][2]));
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
   for (const s of data) {
     if (!s.pts.length) continue;
     ctx.strokeStyle = css(s.color); ctx.lineWidth = 2; ctx.lineJoin = "round";
-    ctx.beginPath();
-    s.pts.forEach((p, i) => i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1])));
-    ctx.stroke();
-    if (s.pts.length < 40) {
+    if (!c.whiskers) {  // whisker charts: independent measurements, no line
+      ctx.beginPath();
+      s.pts.forEach((p, i) => i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1])));
+      ctx.stroke();
+    }
+    if (s.pts.length < 40 || c.whiskers) {
       ctx.fillStyle = css(s.color);
-      for (const p of s.pts) { ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 2.5, 0, 7); ctx.fill(); }
+      const r = c.whiskers ? 3.5 : 2.5;
+      for (const p of s.pts) { ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), r, 0, 7); ctx.fill(); }
     }
   }
 
@@ -262,7 +338,7 @@ function drawChart(c) {
       const p = s.pts.find((q) => q[0] === g);
       if (!p) continue;
       ctx.fillStyle = css(s.color); ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), 4, 0, 7); ctx.fill();
-      const v = c.pct ? fmtPct(p[1]) : Math.abs(p[1]) < 0.01 && p[1] !== 0 ? p[1].toExponential(2)
+      const v = c.fmt ? c.fmt(p) : c.pct ? fmtPct(p[1]) : Math.abs(p[1]) < 0.01 && p[1] !== 0 ? p[1].toExponential(2)
         : Math.abs(p[1]) >= 100 ? fmtInt(p[1]) : fmtNum(p[1], 3);
       parts.push((data.length > 1 ? s.name + " " : "") + v);
     }
@@ -272,7 +348,77 @@ function drawChart(c) {
     hint.textContent = c.hint; hint.style.color = "";
   }
 }
-const drawAll = () => CHARTS.forEach(drawChart);
+const drawAll = () => { CHARTS.forEach(drawChart); STRENGTH_CHARTS.forEach(drawChart); };
+const drawStrength = () => STRENGTH_CHARTS.forEach(drawChart);
+
+// ------------------------------------------------------------------ strength evaluation
+function parseEvals(text) {
+  const m = new Map(), pz = new Map();
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const r = JSON.parse(line);
+      if (r.type === "match") m.set(r.generation + ":" + r.opponent, r);
+      else if (r.type === "puzzles") pz.set(r.generation, r);
+    } catch { /* partial line */ }
+  }
+  matches = [...m.values()].sort((a, b) => a.generation - b.generation);
+  puzzleRuns = [...pz.values()].sort((a, b) => a.generation - b.generation);
+  ladder = buildLadder(matches);
+}
+
+// Chain the matches: Elo(N) = Elo(N - interval) + match Elo; the first
+// opponent is 0. Errors add up (independent matches). A gap in the chain
+// continues from the last known value.
+function buildLadder(ms) {
+  const node = new Map(), out = [];
+  for (const m of ms) {
+    if (!node.has(m.opponent)) {
+      const prev = out[out.length - 1];
+      node.set(m.opponent, prev ? { e: prev.elo, v: prev.v } : { e: 0, v: 0 });
+      if (!prev) out.push({ generation: m.opponent, elo: 0, v: 0 });
+    }
+    const b = node.get(m.opponent), se = (m.elo_hi - m.elo_lo) / (2 * 1.96);
+    const n = { e: b.e + m.elo, v: b.v + se * se };
+    node.set(m.generation, n);
+    out.push({ generation: m.generation, elo: n.e, v: n.v });
+  }
+  return out.map((p) => ({ ...p, lo: p.elo - 1.96 * Math.sqrt(p.v), hi: p.elo + 1.96 * Math.sqrt(p.v) }));
+}
+
+function renderStrength() {
+  const es = evalStatus, every = evalEvery();
+  let txt = "";
+  if (es && es.updated && Date.now() / 1000 - es.updated < 180) {
+    const what = es.games > 0 ? `${es.games}-game match${es.simulations ? ` (${es.simulations} sims)` : ""}` : "";
+    const setup = [what, es.puzzles ? `${fmtInt(es.puzzles)} puzzles` : ""].filter(Boolean).join(" + ");
+    txt = es.state === "running" ? `evaluating ${es.task}…` : es.state === "error" ? `evaluation error (${es.task}), see console`
+      : es.state === "idle" ? "evaluator finished" : `next evaluation at generation ${(Math.floor(((metrics[metrics.length - 1] || {}).generation || 0) / every) + 1) * every}`;
+    txt += ` · every ${every} gens: ${setup}`;
+  } else if (matches.length || puzzleRuns.length) {
+    txt = "evaluator not running";
+  } else {
+    txt = config.eval_every === 0 ? "evaluation off (--eval-every 0)" : "evaluator not running";
+  }
+  $("evalstate").textContent = txt;
+
+  const gens = [...new Set([...matches.map((m) => m.generation), ...puzzleRuns.map((p) => p.generation)])]
+    .sort((a, b) => b - a).slice(0, 12);
+  const byM = new Map(matches.map((m) => [m.generation, m])), byP = new Map(puzzleRuns.map((p) => [p.generation, p]));
+  const byL = new Map(ladder.map((l) => [l.generation, l]));
+  $("evaltable").innerHTML = gens.length ? `<tr><th>gen</th><th>vs</th><th>+W =D −L</th><th>score</th><th>Elo</th>
+    <th>95%</th><th>ladder</th><th>game len</th><th>puzzles solved</th><th>first move</th><th>puzzle rating</th></tr>` +
+    gens.map((g) => {
+      const m = byM.get(g), p = byP.get(g), l = byL.get(g);
+      return `<tr><td>${g}</td><td>${m ? m.opponent : "–"}</td>
+        <td>${m ? `+${m.wins} =${m.draws} −${m.losses}` : "–"}</td><td>${m ? fmtPct(m.score) : "–"}</td>
+        <td>${m ? fmtElo(m.elo) : "–"}</td><td>${m ? `${fmtElo(m.elo_lo)} … ${fmtElo(m.elo_hi)}` : "–"}</td>
+        <td>${l ? fmtElo(l.elo) : "–"}</td><td>${m ? fmtNum(m.avg_plies, 0) : "–"}</td>
+        <td>${p ? fmtPct(p.solved) : "–"}</td><td>${p ? fmtPct(p.first_move) : "–"}</td>
+        <td>${p ? fmtInt(p.rating) : "–"}</td></tr>`;
+    }).join("")
+    : `<tr><td class="empty">No evaluations yet: the first one runs after generation ${every}.</td></tr>`;
+}
 
 // ------------------------------------------------------------------ derived numbers
 function batchSize() { return (status && status.batch) || config.batch || 512; }
@@ -398,6 +544,10 @@ function render() {
     tile("Results (W/D/B)", last ? ["white_wins", "draws", "black_wins"].map((k) => Math.round(100 * frac(last, k))).join(" / ") + "%" : "–",
       last ? `${fmtPct(term(last, "checkmate"), 1)} checkmates` : ""),
     tile("Game length", last ? fmtNum(last.avg_game_length, 1) : "–", "plies, last gen"),
+    tile("Elo ladder", ladder.length ? fmtElo(ladder[ladder.length - 1].elo) : "–",
+      ladder.length ? `gen ${ladder[ladder.length - 1].generation} vs gen ${ladder[0].generation}` : "after 2 evaluations"),
+    tile("Puzzle rating", puzzleRuns.length ? fmtInt(puzzleRuns[puzzleRuns.length - 1].rating) : "–",
+      puzzleRuns.length ? `${fmtPct(puzzleRuns[puzzleRuns.length - 1].solved)} solved · gen ${puzzleRuns[puzzleRuns.length - 1].generation}` : "no puzzle run yet"),
     tile("Self-play speed", last ? fmtInt(last.moves_per_second) : "–", "moves / s"),
     tile("Gen time", last ? fmtDur(last.selfplay_seconds + last.train_seconds) : "–",
       last ? `self-play ${fmtDur(last.selfplay_seconds)} · train ${fmtDur(last.train_seconds)}` : ""),
@@ -426,7 +576,14 @@ async function fetchText(path) {
   catch { return null; }
 }
 async function poll() {
-  const [st, mt] = await Promise.all([fetchText("status.json"), fetchText("metrics.jsonl")]);
+  const [st, mt, ev, es] = await Promise.all([fetchText("status.json"), fetchText("metrics.jsonl"),
+    fetchText("evals.jsonl"), fetchText("eval_status.json")]);
+  if (es) { try { evalStatus = JSON.parse(es); } catch { } }
+  if (ev != null && ev !== evalsText) {
+    evalsText = ev;
+    parseEvals(ev);
+    drawStrength();
+  }
   if (st) { try { status = JSON.parse(st); } catch { /* partial write, keep old */ } }
   if (mt != null && mt !== metricsText) {
     metricsText = mt;
@@ -439,6 +596,7 @@ async function poll() {
     drawAll();
   }
   render();
+  renderStrength();
 }
 async function init() {
   buildCharts();
