@@ -1,7 +1,8 @@
 //! The network engine: owns the policy/value network and hands each `go` to
 //! the search method selected with the UCI option `SearchMode`
-//! (see search/mod.rs): `AlphaBeta` (default; policy move ordering, value at
-//! the leaves) or `Searchless` (one evaluation, best legal policy move).
+//! (see search/mod.rs): `Mcts` (default; PUCT with policy priors and network
+//! values), `AlphaBeta` (policy move ordering, value at the leaves) or
+//! `Searchless` (one evaluation, best legal policy move).
 
 use std::sync::atomic::AtomicBool;
 
@@ -98,7 +99,7 @@ pub struct PolicyEngine {
 }
 
 impl PolicyEngine {
-    pub const DEFAULT_MODE: SearchMode = SearchMode::AlphaBeta;
+    pub const DEFAULT_MODE: SearchMode = SearchMode::Mcts;
 
     pub fn new() -> PolicyEngine {
         PolicyEngine {
@@ -208,9 +209,22 @@ mod tests {
     }
 
     #[test]
-    fn alphabeta_is_default_and_plays_legal_moves() {
+    fn mcts_is_default_and_plays_legal_moves() {
         peazero_core::init();
         let mut engine = PolicyEngine::new();
+        assert_eq!(engine.mode, SearchMode::Mcts);
+        let limits = SearchLimits {
+            nodes: Some(50),
+            ..Default::default()
+        };
+        play(&mut engine, 10, &limits);
+    }
+
+    #[test]
+    fn alphabeta_mode_plays_legal_moves() {
+        peazero_core::init();
+        let mut engine = PolicyEngine::new();
+        assert!(engine.set_option("SearchMode", "AlphaBeta"));
         assert_eq!(engine.mode, SearchMode::AlphaBeta);
         let limits = SearchLimits {
             depth: Some(2),
@@ -235,7 +249,7 @@ mod tests {
         let line = SearchMode::uci_option(PolicyEngine::DEFAULT_MODE);
         assert_eq!(
             line,
-            "option name SearchMode type combo default AlphaBeta var Searchless var AlphaBeta"
+            "option name SearchMode type combo default Mcts var Searchless var AlphaBeta var Mcts"
         );
     }
 
