@@ -19,7 +19,7 @@ use rayon::prelude::*;
 
 use crate::gumbel::GumbelConfig;
 use crate::record::Termination;
-use crate::search::{considered_visits_table, Outcome, SearchConfig, Slot};
+use crate::search::{Outcome, SearchConfig, Slot, Tables};
 
 /// Batched network evaluation: `(network index, observations of n
 /// positions)` → `(policy logits n × NUM_ACTIONS, W/D/L value logits n × 3)`.
@@ -75,6 +75,9 @@ impl ArenaConfig {
             threads: 1,
             noise_plies: 0,
             late_gumbel_scale: 0.0,
+            fast_simulations: 0,
+            full_prob: 1.0,
+            fast_considered: 8,
         }
     }
 
@@ -103,7 +106,7 @@ fn round<E: Evaluate + ?Sized>(
     nets: usize,
     eval: &E,
     cfg: &SearchConfig,
-    table: &[Vec<u32>],
+    table: &Tables,
 ) -> Vec<Option<Played>> {
     let mut resp: Vec<Option<(Vec<f32>, [f32; 3])>> = (0..slots.len()).map(|_| None).collect();
     for net in 0..nets {
@@ -192,7 +195,7 @@ pub fn play_match<E: Evaluate + ?Sized>(
     eval: &E,
 ) -> Vec<MatchGame> {
     let scfg = cfg.search_config();
-    let table = considered_visits_table(scfg.gumbel.considered, scfg.simulations);
+    let table = Tables::new(&scfg);
     let pool = cfg.thread_pool();
     pool.install(|| {
         let n = openings.len() * 2;
@@ -290,7 +293,7 @@ pub fn solve_puzzles<E: Evaluate + ?Sized>(
     eval: &E,
 ) -> Vec<PuzzleResult> {
     let scfg = cfg.search_config();
-    let table = considered_visits_table(scfg.gumbel.considered, scfg.simulations);
+    let table = Tables::new(&scfg);
     let pool = cfg.thread_pool();
     pool.install(|| {
         let n = puzzles.len();

@@ -6,7 +6,7 @@
 //! obs = sp.observations()                    # (N, 21, 8, 8) float32
 //! acts = sp.expand(policy_logits)            # (N*m, 5, 8, 8) float32
 //! sp.finish(root_value_logits, child_value_logits)
-//! chunk, games, positions = sp.take_chunk()  # bytes in data format v0
+//! chunk, games, positions, plies = sp.take_chunk()  # bytes in the data format
 //!
 //! rb = pz.Replay(capacity=1_000_000)
 //! rb.add_chunk(chunk)
@@ -177,12 +177,18 @@ impl SelfPlay {
         Ok(py.detach(|| pool.finish(r, c)))
     }
 
-    /// Finished games as one data-format-v0 chunk: (bytes, games, positions).
-    fn take_chunk<'py>(&mut self, py: Python<'py>) -> (Bound<'py, PyBytes>, usize, usize) {
+    /// Finished games as one data chunk: (bytes, games, positions, plies);
+    /// positions = training samples (full-search plies), plies = all moves.
+    fn take_chunk<'py>(&mut self, py: Python<'py>) -> (Bound<'py, PyBytes>, usize, usize, usize) {
         let games = self.pool.take_finished();
-        let positions = games.iter().map(|g| g.plies.len()).sum();
+        let plies = games.iter().map(|g| g.plies.len()).sum();
+        let positions = games
+            .iter()
+            .flat_map(|g| &g.plies)
+            .filter(|p| p.full_search)
+            .count();
         let bytes = py.detach(|| write_chunk(&games));
-        (PyBytes::new(py, &bytes), games.len(), positions)
+        (PyBytes::new(py, &bytes), games.len(), positions, plies)
     }
 
     fn plies_in_progress(&self) -> usize {
@@ -198,6 +204,7 @@ fn stats_dict<'py>(py: Python<'py>, s: &PoolStats) -> PyResult<Bound<'py, PyDict
     let d = PyDict::new(py);
     d.set_item("games", s.games_finished)?;
     d.set_item("plies", s.plies)?;
+    d.set_item("full_plies", s.full_plies)?;
     d.set_item("white_wins", s.white_wins)?;
     d.set_item("black_wins", s.black_wins)?;
     d.set_item("draws", s.draws)?;
@@ -228,7 +235,10 @@ impl SearchSelfPlay {
     #[new]
     /// `noise_plies`: plies per game with the full Gumbel noise
     /// (`gumbel_scale`), then `late_gumbel_scale`; 0 = full noise all game.
-    #[pyo3(signature = (games=1024, simulations=64, considered=16, gumbel_scale=1.0, c_visit=50.0, c_scale=0.1, max_plies=512, seed=0, threads=0, noise_plies=0, late_gumbel_scale=0.0))]
+    /// Playout cap randomization: with `fast_simulations` > 0 each move is a
+    /// full search with probability `full_prob`, otherwise a fast search
+    /// (`fast_simulations`, `fast_considered`) that is not a training sample.
+    #[pyo3(signature = (games=1024, simulations=64, considered=16, gumbel_scale=1.0, c_visit=50.0, c_scale=0.1, max_plies=512, seed=0, threads=0, noise_plies=0, late_gumbel_scale=0.0, fast_simulations=0, full_prob=0.25, fast_considered=8))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         games: usize,
@@ -242,6 +252,9 @@ impl SearchSelfPlay {
         threads: usize,
         noise_plies: usize,
         late_gumbel_scale: f32,
+        fast_simulations: usize,
+        full_prob: f32,
+        fast_considered: usize,
     ) -> PyResult<Self> {
         if games == 0 || considered == 0 || simulations == 0 {
             return Err(PyValueError::new_err(
@@ -264,6 +277,9 @@ impl SearchSelfPlay {
                 threads,
                 noise_plies,
                 late_gumbel_scale,
+                fast_simulations,
+                full_prob: full_prob.clamp(0.0, 1.0),
+                fast_considered,
             }),
         })
     }
@@ -345,12 +361,18 @@ impl SearchSelfPlay {
         Ok(py.detach(|| pool.respond(l, v)))
     }
 
-    /// Finished games as one data-format-v0 chunk: (bytes, games, positions).
-    fn take_chunk<'py>(&mut self, py: Python<'py>) -> (Bound<'py, PyBytes>, usize, usize) {
+    /// Finished games as one data chunk: (bytes, games, positions, plies);
+    /// positions = training samples (full-search plies), plies = all moves.
+    fn take_chunk<'py>(&mut self, py: Python<'py>) -> (Bound<'py, PyBytes>, usize, usize, usize) {
         let games = self.pool.take_finished();
-        let positions = games.iter().map(|g| g.plies.len()).sum();
+        let plies = games.iter().map(|g| g.plies.len()).sum();
+        let positions = games
+            .iter()
+            .flat_map(|g| &g.plies)
+            .filter(|p| p.full_search)
+            .count();
         let bytes = py.detach(|| write_chunk(&games));
-        (PyBytes::new(py, &bytes), games.len(), positions)
+        (PyBytes::new(py, &bytes), games.len(), positions, plies)
     }
 
     fn plies_in_progress(&self) -> usize {
@@ -393,6 +415,13 @@ impl Replay {
     #[getter]
     fn games(&self) -> usize {
         self.inner.games()
+    }
+
+    /// All plies held, fast-search plies included (`positions` counts
+    /// training samples only).
+    #[getter]
+    fn plies(&self) -> usize {
+        self.inner.plies()
     }
 
     #[getter]

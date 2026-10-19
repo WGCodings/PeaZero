@@ -1,17 +1,20 @@
 //! Self-play data format. One chunk = one file (little-endian):
 //!
 //! ```text
-//! header   : "PZSP" | u32 format version (2) | u32 ENCODING_VERSION | u32 game count
+//! header   : "PZSP" | u32 format version (3) | u32 ENCODING_VERSION | u32 game count
 //! per game : u16 ply count | i8 result (+1 white wins, 0 draw, -1 black wins) | u8 termination
 //! per ply  : 12 × u64 piece bitboards (white P N B R Q K, black P N B R Q K)
 //!            u8 side to move (0 white, 1 black) | u8 castling | u8 ep square (64 = none)
 //!            u8 halfmove clock | u8 repetitions | u16 action played
 //!            u8 legal count L | L × (u16 action, u16 target probability × 65535)
-//!   v2 only: u8 has_value | if 1: u16 W × 65535, u16 D × 65535
+//!   v2+    : u8 flags | if flags & 1: u16 W × 65535, u16 D × 65535
 //!            (search value of the position for its side to move; L = 1 - W - D)
+//!            flags & 2 (v3): fast search (playout cap randomization): the
+//!            move was played after a cheap search; its targets are not used
+//!            as a policy target and the position is not a training sample
 //! ```
 //!
-//! Version 1 (no search value) is still read.
+//! Versions 1 (no search value) and 2 (flags = has_value only) are still read.
 //!
 //! The position *after* the last ply (the terminal position) is not stored;
 //! its side to move is the opposite of the last ply's.
@@ -20,7 +23,7 @@ use peazero_core::encoding::ENCODING_VERSION;
 use peazero_core::{Color, GameResult, Position, Square};
 
 pub const MAGIC: &[u8; 4] = b"PZSP";
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -88,6 +91,9 @@ pub struct PlyRecord {
     pub targets: Vec<(u16, u16)>,
     /// Search value (W, D) × 65535 for the side to move, if recorded.
     pub value: Option<(u16, u16)>,
+    /// false: played after a fast search (playout cap randomization); not a
+    /// training sample. Always true in data before format v3.
+    pub full_search: bool,
 }
 
 impl PlyRecord {
@@ -110,7 +116,14 @@ impl PlyRecord {
                 .map(|&(a, p)| (a as u16, (p.clamp(0.0, 1.0) * 65535.0).round() as u16))
                 .collect(),
             value: None,
+            full_search: true,
         }
+    }
+
+    /// Mark the ply as played after a fast search (or not).
+    pub fn with_full_search(mut self, full: bool) -> PlyRecord {
+        self.full_search = full;
+        self
     }
 
     /// Attach the search value as W/D/L probabilities for the side to move.
@@ -177,14 +190,16 @@ fn write_chunk_version(games: &[GameRecord], version: u32) -> Vec<u8> {
                 out.extend_from_slice(&a.to_le_bytes());
                 out.extend_from_slice(&prob.to_le_bytes());
             }
-            match p.value.filter(|_| version >= 2) {
-                Some((w, d)) => {
-                    out.push(1);
-                    out.extend_from_slice(&w.to_le_bytes());
-                    out.extend_from_slice(&d.to_le_bytes());
+            if version >= 2 {
+                let fast = (version >= 3 && !p.full_search) as u8;
+                match p.value {
+                    Some((w, d)) => {
+                        out.push(1 | fast << 1);
+                        out.extend_from_slice(&w.to_le_bytes());
+                        out.extend_from_slice(&d.to_le_bytes());
+                    }
+                    None => out.push(fast << 1),
                 }
-                None if version >= 2 => out.push(0),
-                None => {}
             }
         }
     }
@@ -265,7 +280,11 @@ pub fn read_chunk(bytes: &[u8]) -> Result<Vec<GameRecord>, String> {
             for _ in 0..l {
                 targets.push((r.u16()?, r.u16()?));
             }
-            let value = if version >= 2 && r.u8()? == 1 {
+            let flags = if version >= 2 { r.u8()? } else { 0 };
+            if flags > 3 || (version < 3 && flags > 1) {
+                return Err(format!("bad ply flags {flags}"));
+            }
+            let value = if flags & 1 != 0 {
                 Some((r.u16()?, r.u16()?))
             } else {
                 None
@@ -280,6 +299,7 @@ pub fn read_chunk(bytes: &[u8]) -> Result<Vec<GameRecord>, String> {
                 action,
                 targets,
                 value,
+                full_search: flags & 2 == 0,
             });
         }
         games.push(GameRecord {
@@ -320,6 +340,26 @@ mod format_tests {
         assert!((wdl[0] - 0.5).abs() < 1e-4 && (wdl[1] - 0.3).abs() < 1e-4);
         assert!((wdl.iter().sum::<f32>() - 1.0).abs() < 1e-4);
         assert!(back[0].plies[1].value_wdl().is_none());
+    }
+
+    #[test]
+    fn v3_round_trip_keeps_fast_search_flag() {
+        let mut games = sample_games();
+        games[0].plies[1] = games[0].plies[1].clone().with_full_search(false);
+        let extra = games[0].plies[0].clone().with_full_search(false);
+        games[0].plies.push(extra);
+        let back = read_chunk(&write_chunk(&games)).unwrap();
+        assert_eq!(back, games);
+        let flags: Vec<bool> = back[0].plies.iter().map(|p| p.full_search).collect();
+        assert_eq!(flags, vec![true, false, false]);
+    }
+
+    #[test]
+    fn v2_chunks_are_still_read() {
+        let games = sample_games();
+        let back = read_chunk(&write_chunk_version(&games, 2)).unwrap();
+        assert_eq!(back, games);
+        assert!(back[0].plies.iter().all(|p| p.full_search));
     }
 
     #[test]

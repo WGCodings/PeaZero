@@ -40,12 +40,37 @@ def load_net(args, dev):
     return net.to(dev).eval(), desc
 
 
-def make_pools(args, games, n_pools):
+def make_pools(args, games, n_pools, **search):
     sizes = [games // n_pools + (i < games % n_pools) for i in range(n_pools)]
-    return [pz.SearchSelfPlay(games=n, simulations=args.simulations, considered=args.considered,
-                              max_plies=args.max_plies, seed=1 + 1_000_003 * i, threads=args.threads,
-                              noise_plies=args.noise_plies)
+    kw = dict(simulations=args.simulations, considered=args.considered)
+    kw.update(search)
+    return [pz.SearchSelfPlay(games=n, max_plies=args.max_plies, seed=1 + 1_000_003 * i, threads=args.threads,
+                              noise_plies=args.noise_plies, **kw)
             for i, n in enumerate(sizes)]
+
+
+def pcr_variant(name, net, dev, amp, **search):
+    """Default pipeline (2 pools, graphs, channels_last) with these search
+    settings: moves/s and training samples/s (full-search moves)."""
+    r = SearchRunner(make_pools(ARGS, ARGS.games, 2, **search), dev, amp, cuda_graphs=True,
+                     channels_last=dev.type == "cuda")
+    r.set_net(net)
+    t_end = time.perf_counter() + ARGS.warmup
+    while time.perf_counter() < t_end:
+        r.step()
+    s0, t0 = r.stats(), time.perf_counter()
+    while time.perf_counter() - t0 < ARGS.seconds:
+        r.step()
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+    dt = time.perf_counter() - t0
+    s1 = r.stats()
+    mps = (s1["plies"] - s0["plies"]) / dt
+    sps = (s1["full_plies"] - s0["full_plies"]) / dt
+    evals = r.timing["steps"] * ARGS.games / max(s1["plies"], 1)  # whole run, incl. warm-up
+    print(f"{name:44s} {mps:7.0f} moves/s  {sps:7.0f} training samples/s  ~{evals:4.0f} evaluations/move",
+          flush=True)
+    return mps, sps
 
 
 def raw_forward(net, dev, batch, graphs, amp, reps=50, cl=False):
@@ -137,6 +162,8 @@ def main():
     ap.add_argument("--seconds", type=float, default=20, help="measured seconds per variant")
     ap.add_argument("--warmup", type=float, default=8, help="unmeasured seconds per variant first")
     ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--pcr", action="store_true",
+                    help="compare playout cap randomization settings instead (moves/s, training samples/s)")
     ap.add_argument("--only-new", action="store_true",
                     help="self-play: only the best variant and the channels_last variant")
     ap.add_argument("--cpu", action="store_true", help=argparse.SUPPRESS)  # plumbing test without a GPU
@@ -157,6 +184,17 @@ def main():
     gpu = torch.cuda.get_device_name() if dev.type == "cuda" else "CPU"
     print(f"{desc}; {ARGS.games} games, {ARGS.simulations} simulations, {ARGS.considered} considered, "
           f"threads {ARGS.threads or 'all'}; {gpu}; fp16 {amp}")
+    if ARGS.pcr:
+        sims = ARGS.simulations
+        print(f"\nplayout cap randomization ({ARGS.warmup:.0f}s warm-up + {ARGS.seconds:.0f}s each; "
+              "games per second follow moves/s):")
+        pcr_variant(f"all moves {sims} sims (current)", net, dev, amp)
+        pcr_variant("all moves 200 sims", net, dev, amp, simulations=200)
+        pcr_variant("PCR: 25% 200 sims, 75% 32 sims (8 considered)", net, dev, amp, simulations=200,
+                    fast_simulations=32, full_prob=0.25, fast_considered=8)
+        pcr_variant("PCR: 25% 128 sims, 75% 24 sims (8 considered)", net, dev, amp, simulations=128,
+                    fast_simulations=24, full_prob=0.25, fast_considered=8)
+        return
     if dev.type == "cuda":
         network_only(net, dev, amp)
     g = ARGS.games

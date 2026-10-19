@@ -37,6 +37,7 @@ Defaults for a new run (`python train.py --help`):
 | `--simulations` | 64 | tree-search simulations per move (0 = old root-only mode) |
 | `--considered` | 16 | root candidates (Sequential Halving width) |
 | `--noise-plies` / `--late-noise` | 30 / 0.0 | full Gumbel noise for the first 30 plies of a game, then none: opening variety, but games are played out properly so the result reflects who was better |
+| `--fast-simulations` / `--full-prob` / `--fast-considered` | 0 (off) / 0.25 / 8 | playout cap randomization: 25 % of moves get the full search (`--simulations`), the rest a fast search that is not a training sample; see below |
 | `--q-ratio` | 0.5 | value target = 50 % game result + 50 % search value of the position (much less noisy than the result alone) |
 | `--unroll` | 0 | AlphaZero-style training: no dynamics unroll (self-play and the engine don't use the dynamics network); training ~4× cheaper than K = 5 |
 | `--reuse` | 2.0 | average times each new position is trained on |
@@ -65,6 +66,16 @@ With `--viriformat` every generation's games are converted to **viriformat** (th
 * Appends are crash-safe (`<name>.vf.json` records the size after each complete generation; an interrupted append is cut off next time). If you move the `.vf` away, a new one starts; generations already exported aren't repeated.
 * Data folders still on disk (the newest ~20 generations) are exported when they are deleted later, or by hand while training is stopped: `python -m peazero.vf_export --run ..\runs\fourth`.
 * Generations deleted before you turned this on can't be recovered.
+
+## Playout cap randomization (`--fast-simulations`)
+
+Deep searches give better policy targets; many games give better value targets. Playout cap randomization (KataGo) gets both: each move is a **full** search with probability `--full-prob`, otherwise a cheap **fast** search that only keeps the game going and is not a training sample (docs/MUZERO.md §6.5).
+
+* Suggested start: `--simulations 200 --fast-simulations 32 --full-prob 0.25 --fast-considered 8`. That costs ~75 network evaluations per move (vs 65 now), but every policy target comes from a 200-simulation search instead of 64.
+* Only 1 in 4 moves is a training sample, so with the same `--positions-per-gen` a generation would take ~4× more moves. `--positions-per-gen` and `--replay` count training samples: use ~25,000 per generation (similar self-play time per generation as 100k now) and `--replay 500000` (the same ~20 generations of history).
+* Old data (format v2) still loads: every ply of it is a training sample. New data is format v3; the viriformat export still contains every move.
+* `metrics.jsonl` logs `full_search_share` (should be ≈ `--full-prob`); `new_positions` counts training samples, `avg_game_length` all moves.
+* Measure the trade-off on your machine first: `python scripts\bench_selfplay.py --run ..\runs\fourth --pcr` prints moves/s and training samples/s for the current setting, 200 simulations on every move, and two PCR settings.
 
 ## Quantisation-aware training (`--qat`)
 
@@ -133,7 +144,7 @@ Self-play data is only needed to refill the replay buffer on `--resume`, so olde
 
 ## What a generation does
 
-1. **Self-play.** Every move runs a Gumbel MuZero tree search with `--simulations` (default 64) leaf evaluations on the *real* board: Rust makes the moves, the `initial` network evaluates each new leaf, checkmates and draws are scored exactly. The root uses Sequential Halving over the top `--considered` (16) moves, so the best candidates are searched several plies deep. The move played and the policy target come from the search (docs/MUZERO.md §6.3). All games advance in lock-step, one simulation per step, so the GPU always sees batches of `--games` positions. `--simulations 0` selects the old root-only mode (one dynamics-network evaluation per candidate, §6.2). Every recorded position also stores the search's value (W/D/L for the side to move: W−L from the root search value, D from the network), used by `--q-ratio`. Finished games are written to `runs/<name>/data/` (data format v2; v1 files from older runs are still read).
+1. **Self-play.** Every move runs a Gumbel MuZero tree search with `--simulations` (default 64) leaf evaluations on the *real* board: Rust makes the moves, the `initial` network evaluates each new leaf, checkmates and draws are scored exactly. The root uses Sequential Halving over the top `--considered` (16) moves, so the best candidates are searched several plies deep. The move played and the policy target come from the search (docs/MUZERO.md §6.3). All games advance in lock-step, one simulation per step, so the GPU always sees batches of `--games` positions. `--simulations 0` selects the old root-only mode (one dynamics-network evaluation per candidate, §6.2). Every recorded position also stores the search's value (W/D/L for the side to move: W−L from the root search value, D from the network), used by `--q-ratio`. Finished games are written to `runs/<name>/data/` (data format v3; v1/v2 files from older runs are still read). With `--fast-simulations` only some moves get the full search (playout cap randomization, below).
 2. **Training.** Batches are sampled from the replay buffer and trained with the K = 5 unrolled MuZero loss.
 3. **Export.** BatchNorm statistics are recalibrated (see below), then `runs/<name>/nets/gen_XXXX.pzn` plus `checkpoint.pt` are written.
 

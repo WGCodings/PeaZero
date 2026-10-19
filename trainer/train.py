@@ -77,6 +77,7 @@ DEFAULTS = {
     "net": "64x6", "generations": 1000,
     # self-play
     "games": 1024, "simulations": 64, "considered": 16, "max_plies": 512, "threads": 0,
+    "fast_simulations": 0, "full_prob": 0.25, "fast_considered": 8,
     "positions_per_gen": 100_000, "noise_plies": 30, "late_noise": 0.0,
     # training
     "batch": 512, "unroll": 0, "reuse": 2.0, "lr": 1e-3, "weight_decay": 1e-4, "warmup": 500,
@@ -105,6 +106,12 @@ def parse_args():
                          "AlphaZero-style evaluation); 0 = old root-only mode through the dynamics network")
     ap.add_argument("--considered", type=int,
                     help="Gumbel m: root candidates (Sequential Halving width; root-only mode: evaluations per move)")
+    ap.add_argument("--fast-simulations", type=int,
+                    help="playout cap randomization: each move is a full search (--simulations, --considered) "
+                         "with probability --full-prob, otherwise a fast search with this many simulations "
+                         "that is not a training sample; 0 = off (every move full)")
+    ap.add_argument("--full-prob", type=float, help="share of moves with the full search (playout cap randomization)")
+    ap.add_argument("--fast-considered", type=int, help="Sequential Halving width of a fast search")
     ap.add_argument("--max-plies", type=int)
     ap.add_argument("--threads", type=int,
                     help="CPU threads for the Rust self-play work (0 = all logical CPUs); "
@@ -449,13 +456,17 @@ def train(args, status):
         if not hasattr(pz, "SearchSelfPlay"):
             sys.exit("peazero_rs is out of date (no tree search); run `pip install ./crates/py`")
         n_pools = max(1, args.pools)
+        pcr = {}
+        if args.fast_simulations > 0:
+            pcr = dict(fast_simulations=args.fast_simulations, full_prob=args.full_prob,
+                       fast_considered=args.fast_considered)
         sizes = [args.games // n_pools + (i < args.games % n_pools) for i in range(n_pools)]
         try:
             # pool i gets its own seed; with one pool this is the old single pool
             pools = [pz.SearchSelfPlay(games=n, simulations=args.simulations, considered=args.considered,
                                        max_plies=args.max_plies, seed=args.seed + gen + 1_000_003 * i,
                                        threads=args.threads, noise_plies=args.noise_plies,
-                                       late_gumbel_scale=args.late_noise)
+                                       late_gumbel_scale=args.late_noise, **pcr)
                      for i, n in enumerate(sizes)]
         except TypeError:
             sys.exit("peazero_rs is out of date (no noise schedule / data format v2); run `pip install ./crates/py`")
@@ -468,6 +479,9 @@ def train(args, status):
         else:
             sp = PlainPool(pools[0])
         mode = f"{args.simulations} simulations, {args.considered} considered"
+        if pcr:
+            mode += (f" on {args.full_prob:.0%} of moves, else {args.fast_simulations} simulations, "
+                     f"{args.fast_considered} considered (playout cap randomization)")
         if runner:
             mode += (f", {n_pools} pipelined pools" if n_pools > 1 else ", 1 pool")
             mode += ", CUDA graphs" if runner.graphs_wanted else ""
@@ -475,6 +489,8 @@ def train(args, status):
         else:
             mode += ", plain loop"
     else:
+        if args.fast_simulations > 0:
+            sys.exit("--fast-simulations needs tree-search self-play (--simulations > 0)")
         sp = PlainPool(pz.SelfPlay(games=args.games, considered=args.considered, max_plies=args.max_plies,
                                    seed=args.seed + gen, threads=args.threads))
         mode = f"root-only, {args.considered} considered"
@@ -498,7 +514,7 @@ def train(args, status):
         gen += 1
         # ---------------------------------------------------------------- self-play
         t0 = time.time()
-        new_positions, new_games, part = 0, 0, 0
+        new_positions, new_games, new_plies, part = 0, 0, 0, 0
         gen_dir = os.path.join(args.run, "data", f"gen_{gen:04d}")
         os.makedirs(gen_dir, exist_ok=True)
         stats_before = sp.stats()
@@ -524,13 +540,14 @@ def train(args, status):
                               moves_per_second=moves / max(time.time() - t0, 1e-6),
                               replay_positions=replay.positions)
             if steps % chunk_every == 0:
-                for chunk, games, positions in sp.take_chunks():
+                for chunk, games, positions, plies in sp.take_chunks():
                     path = os.path.join(gen_dir, f"part_{part:03d}.bin")
                     with open(path, "wb") as f:
                         f.write(chunk)
                     replay.add_chunk(chunk)
                     part += 1
                     new_positions += positions
+                    new_plies += plies
                     new_games += games
         sp_timing = None
         if runner:
@@ -595,7 +612,9 @@ def train(args, status):
             "generation": gen, "step": step, "lr": lr, "batch": args.batch, "time": round(time.time(), 1),
             "selfplay_seconds": round(sp_time, 1), "train_seconds": round(train_time, 1),
             "moves_per_second": round(moves / sp_time), "new_games": new_games, "new_positions": new_positions,
-            "avg_game_length": round(new_positions / max(new_games, 1), 1),
+            "avg_game_length": round(new_plies / max(new_games, 1), 1),
+            "full_search_share": round((st["full_plies"] - stats_before["full_plies"]) / max(moves, 1), 3)
+            if "full_plies" in st else 1.0,
             **({"sp_gpu_wait_seconds": round(sp_timing["gpu_wait"], 1),
                 "sp_rust_seconds": round(sp_timing["rust"], 1),
                 "sp_launch_seconds": round(sp_timing["launch"], 1)} if sp_timing else {}),

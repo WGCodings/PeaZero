@@ -10,6 +10,12 @@
 //! * value target at step k: final result from the side to move's view at
 //!   ply `t+k` as a W/D/L class (0 = win, 1 = draw, 2 = loss); the terminal
 //!   position `t+k == T` is included, beyond it is masked.
+//!
+//! Playout cap randomization (data format v3): only plies played after a
+//! full search are training samples (`t` is always one of them) and policy
+//! targets; fast-search plies stay in the buffer for unrolling (actions,
+//! value targets) with their policy masked. `positions()` and `capacity`
+//! count training samples. Data without fast plies behaves exactly as before.
 
 use std::collections::VecDeque;
 
@@ -49,7 +55,9 @@ pub struct Batch {
 
 pub struct Replay {
     games: VecDeque<GameRecord>,
-    /// cumulative ply counts, `cum[i]` = plies in games[..=i]
+    /// per game: indices of its training samples (full-search plies)
+    samples: VecDeque<Vec<u16>>,
+    /// cumulative sample counts, `cum[i]` = samples in games[..=i]
     cum: Vec<usize>,
     capacity: usize,
     rng: Rng,
@@ -70,6 +78,7 @@ impl Replay {
     pub fn new(capacity: usize, seed: u64) -> Replay {
         Replay {
             games: VecDeque::new(),
+            samples: VecDeque::new(),
             cum: Vec::new(),
             capacity,
             rng: Rng::new(seed ^ 0x2E91_A7B3),
@@ -85,27 +94,40 @@ impl Replay {
         self.games.len()
     }
 
+    /// All plies in the buffer, fast-search plies included.
+    pub fn plies(&self) -> usize {
+        self.games.iter().map(|g| g.plies.len()).sum()
+    }
+
     /// Positions ever added (including evicted ones).
     pub fn total_added(&self) -> u64 {
         self.total_added
     }
 
     pub fn add_games(&mut self, games: Vec<GameRecord>) {
-        for g in games {
-            if g.plies.is_empty() {
+        for mut g in games {
+            let samples: Vec<u16> = (0..g.plies.len() as u16)
+                .filter(|&i| g.plies[i as usize].full_search)
+                .collect();
+            if samples.is_empty() {
                 continue;
             }
-            self.total_added += g.plies.len() as u64;
+            for p in g.plies.iter_mut().filter(|p| !p.full_search) {
+                p.targets = Vec::new(); // never a policy target; saves memory
+            }
+            self.total_added += samples.len() as u64;
             self.games.push_back(g);
+            self.samples.push_back(samples);
         }
-        let mut total: usize = self.games.iter().map(|g| g.plies.len()).sum();
+        let mut total: usize = self.samples.iter().map(|s| s.len()).sum();
         while total > self.capacity && self.games.len() > 1 {
-            total -= self.games.pop_front().unwrap().plies.len();
+            self.games.pop_front();
+            total -= self.samples.pop_front().unwrap().len();
         }
         self.cum.clear();
         let mut acc = 0;
-        for g in &self.games {
-            acc += g.plies.len();
+        for s in &self.samples {
+            acc += s.len();
             self.cum.push(acc);
         }
     }
@@ -122,7 +144,7 @@ impl Replay {
         let idx = self.rng.below(total as u64) as usize;
         let g = self.cum.partition_point(|&c| c <= idx);
         let start = if g == 0 { 0 } else { self.cum[g - 1] };
-        (g, idx - start)
+        (g, self.samples[g][idx - start] as usize)
     }
 
     pub fn sample(&mut self, batch: usize, unroll: usize) -> Batch {
@@ -171,6 +193,15 @@ impl Replay {
                 }
                 if j < total {
                     let p = &plies[j];
+                    b.value_target[slot] = value_class(game.result, p.stm);
+                    b.value_mask[slot] = 1.0;
+                    if let Some(wdl) = p.value_wdl() {
+                        b.value_search[slot * 3..slot * 3 + 3].copy_from_slice(&wdl);
+                        b.value_search_mask[slot] = 1.0;
+                    }
+                    if !p.full_search {
+                        continue; // fast search: no policy target
+                    }
                     let sum: f32 = p
                         .targets
                         .iter()
@@ -182,12 +213,6 @@ impl Replay {
                         b.policy_prob[slot * MAX_LEGAL + n] = q as f32 / sum;
                     }
                     b.policy_mask[slot] = 1.0;
-                    b.value_target[slot] = value_class(game.result, p.stm);
-                    b.value_mask[slot] = 1.0;
-                    if let Some(wdl) = p.value_wdl() {
-                        b.value_search[slot * 3..slot * 3 + 3].copy_from_slice(&wdl);
-                        b.value_search_mask[slot] = 1.0;
-                    }
                 } else if j == total {
                     let stm = !plies[total - 1].stm;
                     b.value_target[slot] = value_class(game.result, stm);
@@ -271,6 +296,40 @@ mod tests {
                 peazero_core::encoding::action_to_move(game.position(), p.action as usize).unwrap(),
             );
         }
+    }
+
+    #[test]
+    fn only_full_search_plies_are_samples() {
+        peazero_core::init();
+        let mut games = make_games(6, 60);
+        let mut n_full = 0;
+        for g in &mut games {
+            for (i, p) in g.plies.iter_mut().enumerate() {
+                p.full_search = i % 4 == 1;
+                n_full += p.full_search as usize;
+            }
+        }
+        let mut replay = Replay::new(1_000_000, 3);
+        replay.add_games(games.clone());
+        assert_eq!(replay.positions(), n_full);
+        // Samples are drawn at full-search plies only: unroll 0 policy mask
+        // always set; with unroll, fast plies have value but no policy.
+        let b = replay.sample(256, 3);
+        for i in 0..256 {
+            assert_eq!(b.policy_mask[i * 4], 1.0);
+            for k in 1..4 {
+                let slot = i * 4 + k;
+                if b.policy_mask[slot] == 1.0 {
+                    assert!(b.value_mask[slot] == 1.0);
+                }
+            }
+            // ply t+1..t+3 after a full ply (i % 4 == 1) are fast plies
+            assert_eq!(b.policy_mask[i * 4 + 1], 0.0);
+        }
+        // Capacity counts samples: keeps ~capacity samples, more plies.
+        let mut small = Replay::new(n_full / 2, 1);
+        small.add_games(games);
+        assert!(small.positions() <= n_full / 2 + 60 && small.plies() > small.positions());
     }
 
     #[test]
