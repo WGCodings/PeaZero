@@ -119,15 +119,18 @@ Single thread, Intel Xeon @ 2.8 GHz (AVX2), recurrent (g + f) evals/s:
 * tract is ~2× slower than onnxruntime at batch 1, and gets *slower* per eval with batching. So the engine searches with batch 1, and a hand-written SIMD forward pass is a clear later win (~2× from ORT parity alone).
 * At OpenBench STC (8+0.08, roughly 0.2–0.3 s per move): 64×6 gives ~150 simulations/move, 32×4 ~500. Gumbel search is designed to be useful in exactly that range.
 
-### 5.1b Hand-written SIMD inference (`crates/nn/src/fast.rs`, what the engine uses now)
+### 5.1b Hand-written SIMD inference (`crates/nn/src/fast.rs`, `winograd.rs`; what the engine uses now)
 
 The engine evaluates the `initial` network (h + f) with its own kernels on x86-64; tract remains for the dynamics graph, the tests and non-x86 CPUs. Weights are read straight from the ONNX graph in the `.pzn` (minimal protobuf reader, `onnx.rs`; BatchNorm is already folded by the export), so every existing network works unchanged.
 
-* Activations square-major on a zero-padded 10×10 board (no edge checks), weights repacked per 16 output channels. Kernels: AVX-512 (8 squares × 32 channels = 16 zmm accumulators), AVX2/FMA (6 squares × 16 channels = 12 ymm), SSE2 floor (3 squares × 16 channels), chosen at runtime, so one binary runs on every x86-64 CPU. `PEAZERO_SIMD=sse2|avx2` forces a lower set (testing).
-* Matches tract to ~7e-5. AVX2 and AVX-512 are bit-identical (same fused multiply-adds in the same order), and the bench node count is the same with all three sets and as with tract (17686 with `networks/default.pzn`).
-* Batch 1, 64×6, Xeon @ 2.1 GHz (2 cores, shared VM, ±10%): tract ~1,100 µs/eval (~51 GFLOP/s); **AVX-512 ~540 µs (~105 GFLOP/s, 2.0–2.2×)**, AVX2 ~800 µs (~75 GFLOP/s, ~1.4×), SSE2 ~2,100 µs. Measured FMA peaks of that CPU: 90 GFLOP/s AVX2, 159 AVX-512. Engine `bench`: 962 → 1,695 nps (AVX-512), 1,223 (AVX2).
+* Activations square-major on a zero-padded 10×10 board (no edge checks). Kernel sets chosen at runtime, so one binary runs on every x86-64 CPU: AVX-512, AVX2/FMA/F16C, SSE2 floor. `PEAZERO_SIMD=sse2|avx2` forces a lower set, `PEAZERO_WINOGRAD=0` the direct convolutions (testing).
+* **Residual blocks: Winograd F(2×2, 3×3)**, as in Lc0's CPU backend: 16 tiles of 2×2 outputs, 2.25× fewer multiply-adds. Input/output transforms are SIMD adds over channels; the 16 per-position matrix products use register-blocked kernels (AVX2 6 tiles × 16 channels, AVX-512 8 × 32). F(2×2) rather than F(4×4) because the larger tiles need 4× the weight data, which makes batch-1 inference memory-bound.
+* **Winograd weights stored as half floats** (widened with F16C while loading; arithmetic stays f32): 12 layers of 64×6 take ~1.5 MB instead of ~3 MB and stay in L2. Without this, a layer's products took 31 µs instead of 18 µs once all 12 layers ran in turn. Effect on the output vs exact f32 (2,000 positions from random games, gen 325 of `fourth`): same best move 99.95%, move probabilities ±0.26 percentage points at most, value (W−L) ±0.001 at most.
+* Stem (21 input planes) and the 1×1 heads use direct convolutions (AVX-512 8 squares × 32 channels, AVX2 6 × 16, SSE2 3 × 16).
+* AVX2 and AVX-512 are bit-identical (same operations per lane in the same order; our f32→f16 conversion is tested to round exactly like F16C), and the bench node count is the same with every kernel set and as with tract (17686 with `networks/default.pzn`).
+* Batch 1, 64×6, best of 5 (Xeon @ 2.1 GHz, shared VM): tract ~950–1,150 µs/eval; direct AVX2 ~730 µs, direct AVX-512 ~480–570 µs; **Winograd AVX2 ~400–520 µs, Winograd AVX-512 ~400 µs (2.3–2.8× tract)**; SSE2 ~1,250 µs. Engine `bench`: 962 nps (tract) → 1,737 (AVX2) / 2,198 (AVX-512).
 * The engine binary no longer contains tract on x86-64: builds take seconds instead of minutes, need no C compiler, and the binary is 5 MB instead of 34 MB.
-* `cargo run --release -p peazero-nn --example latency -- net.pzn` compares all kernel sets with tract on any network.
+* `cargo run --release -p peazero-nn --example latency -- net.pzn` compares every kernel set (direct and Winograd) with tract; `--example accuracy` measures Winograd vs exact f32 on 2,000 positions.
 
 ### 5.2 GPU (RTX 3070)
 

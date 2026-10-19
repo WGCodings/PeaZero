@@ -24,3 +24,7 @@ required-features = ["tract"]
 [[example]]
 name = "latency"
 required-features = ["tract"]
+
+[[example]]
+name = "accuracy"
+required-features = []

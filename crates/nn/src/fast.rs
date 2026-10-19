@@ -4,6 +4,10 @@
 //! Weights come straight from the ONNX graph in a `.pzn` file (BatchNorm is
 //! already folded into the convolutions by the export).
 //!
+//! The residual-block convolutions use Winograd F(2×2, 3×3) by default
+//! (winograd.rs: 2.25× fewer multiply-adds, weights stored as half floats so
+//! they stay in L2); `PEAZERO_WINOGRAD=0` switches to the direct kernels.
+//!
 //! Network (trainer/peazero/model.py):
 //!   stem   conv3x3 21→C, ReLU
 //!   blocks B × [conv3x3, ReLU, conv3x3, + skip, ReLU]
@@ -23,6 +27,7 @@ use std::sync::Arc;
 use peazero_core::encoding::{NUM_ACTIONS, OBS_PLANES};
 
 use crate::onnx::{parse_model, Graph, Node, Tensor};
+use crate::winograd::{self, WinoConv, POS, TILES};
 
 const CB: usize = 16; // output channels per kernel block
 const PAD_SQUARES: usize = 100;
@@ -103,6 +108,9 @@ pub struct FastWeights {
     channels: usize,
     stem: Conv,
     blocks: Vec<(Conv, Conv)>,
+    /// The same block convolutions in the Winograd domain (if the channel
+    /// count is a multiple of 16).
+    wino: Vec<(WinoConv, WinoConv)>,
     policy1: Conv,
     policy2: Conv,
     value_conv: Conv,
@@ -155,8 +163,21 @@ impl FastWeights {
         }
         let channels = stem.cout;
         let mut blocks = Vec::new();
+        let mut wino = Vec::new();
+        let wino_of = |n: &Node| -> Result<WinoConv, String> {
+            let w = init(&n.inputs[1])?;
+            let zeros = vec![0.0; w.dims[0]];
+            let b = match n.inputs.get(2) {
+                Some(name) if !name.is_empty() => &init(name)?.data,
+                _ => &zeros,
+            };
+            Ok(WinoConv::new(&w.data, b, w.dims[0], w.dims[1]))
+        };
         for pair in trunk[1..].chunks(2) {
             blocks.push((conv_of(pair[0])?, conv_of(pair[1])?));
+            if channels % 16 == 0 {
+                wino.push((wino_of(pair[0])?, wino_of(pair[1])?));
+            }
         }
         // Heads: policy2 outputs the 73 move planes; policy1 feeds it (via a
         // ReLU); the remaining 1x1 conv is the value conv.
@@ -204,6 +225,7 @@ impl FastWeights {
             channels,
             stem,
             blocks,
+            wino,
             policy1,
             policy2,
             value_conv,
@@ -240,6 +262,9 @@ fn producer<'a>(g: &'a Graph, output: &str) -> Option<&'a Node> {
 pub struct FastNet {
     w: Arc<FastWeights>,
     simd: Simd,
+    winograd: bool,
+    wv: Vec<f32>,
+    wm: Vec<f32>,
     obs: Vec<f32>,
     x: Vec<f32>,
     t: Vec<f32>,
@@ -254,6 +279,10 @@ impl FastNet {
         let c = w.channels;
         FastNet {
             simd: Simd::detect(),
+            winograd: !w.wino.is_empty()
+                && std::env::var("PEAZERO_WINOGRAD").map_or(true, |v| v != "0"),
+            wv: vec![0.0; POS * TILES * c],
+            wm: vec![0.0; POS * TILES * c],
             obs: vec![0.0; PAD_SQUARES * OBS_PLANES],
             x: vec![0.0; PAD_SQUARES * c],
             t: vec![0.0; PAD_SQUARES * c],
@@ -276,6 +305,17 @@ impl FastNet {
         self.simd = simd.min(Simd::supported());
     }
 
+    /// Whether the residual blocks use Winograd convolutions.
+    pub fn winograd(&self) -> bool {
+        self.winograd
+    }
+
+    /// Use direct (`false`) or Winograd (`true`, if available) convolutions
+    /// for the residual blocks (tests, benchmarks).
+    pub fn set_winograd(&mut self, on: bool) {
+        self.winograd = on && !self.w.wino.is_empty();
+    }
+
     pub fn weights(&self) -> &Arc<FastWeights> {
         &self.w
     }
@@ -294,9 +334,20 @@ impl FastNet {
             }
         }
         self.conv(&w.stem, Src::Obs, Dst::X, false, true);
-        for (c1, c2) in &w.blocks {
-            self.conv(c1, Src::X, Dst::T, false, true);
-            self.conv(c2, Src::T, Dst::X, true, true);
+        if self.winograd {
+            for (c1, c2) in &w.wino {
+                winograd::input_transform(&self.x, c, &mut self.wv, self.simd);
+                winograd::products(c1, &self.wv, &mut self.wm, self.simd);
+                winograd::output_transform(&self.wm, c1, &mut self.t, false, true, self.simd);
+                winograd::input_transform(&self.t, c, &mut self.wv, self.simd);
+                winograd::products(c2, &self.wv, &mut self.wm, self.simd);
+                winograd::output_transform(&self.wm, c2, &mut self.x, true, true, self.simd);
+            }
+        } else {
+            for (c1, c2) in &w.blocks {
+                self.conv(c1, Src::X, Dst::T, false, true);
+                self.conv(c2, Src::T, Dst::X, true, true);
+            }
         }
         // min-max normalisation of the latent (interior squares only)
         let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
@@ -411,9 +462,9 @@ impl Simd {
     /// Best kernel set this CPU supports.
     pub fn supported() -> Simd {
         use std::arch::is_x86_feature_detected as has;
-        if has!("avx512f") && has!("avx2") && has!("fma") {
+        if has!("avx512f") && has!("avx2") && has!("fma") && has!("f16c") {
             Simd::Avx512
-        } else if has!("avx2") && has!("fma") {
+        } else if has!("avx2") && has!("fma") && has!("f16c") {
             Simd::Avx2
         } else {
             Simd::Sse2
@@ -834,15 +885,22 @@ mod tests {
         for path in NETS {
             let Some((w, _)) = load(path) else { continue };
             let w = Arc::new(w);
-            let (mut a, mut b) = (FastNet::new(w.clone()), FastNet::new(w));
-            a.set_simd(Simd::Avx512);
-            b.set_simd(Simd::Avx2);
-            for obs in positions() {
-                let (mut pa, mut pb) = (vec![0.0; NUM_ACTIONS], vec![0.0; NUM_ACTIONS]);
-                let (mut va, mut vb) = ([0.0; 3], [0.0; 3]);
-                a.evaluate(&obs, &mut pa, &mut va);
-                b.evaluate(&obs, &mut pb, &mut vb);
-                assert!(pa == pb && va == vb, "{path}: AVX2 and AVX-512 differ");
+            for wino in [false, true] {
+                let (mut a, mut b) = (FastNet::new(w.clone()), FastNet::new(w.clone()));
+                a.set_simd(Simd::Avx512);
+                b.set_simd(Simd::Avx2);
+                a.set_winograd(wino);
+                b.set_winograd(wino);
+                for obs in positions() {
+                    let (mut pa, mut pb) = (vec![0.0; NUM_ACTIONS], vec![0.0; NUM_ACTIONS]);
+                    let (mut va, mut vb) = ([0.0; 3], [0.0; 3]);
+                    a.evaluate(&obs, &mut pa, &mut va);
+                    b.evaluate(&obs, &mut pb, &mut vb);
+                    assert!(
+                        pa == pb && va == vb,
+                        "{path} winograd={wino}: AVX2 and AVX-512 differ"
+                    );
+                }
             }
         }
     }
@@ -856,10 +914,14 @@ mod tests {
                 continue;
             };
             let w = Arc::new(w);
-            for level in [Simd::Avx512, Simd::Avx2, Simd::Sse2] {
+            for (level, wino) in [Simd::Avx512, Simd::Avx2, Simd::Sse2]
+                .into_iter()
+                .flat_map(|l| [(l, false), (l, true)])
+            {
                 let mut net = FastNet::new(w.clone());
                 net.set_simd(level);
-                let portable = net.simd();
+                net.set_winograd(wino);
+                let portable = (net.simd(), net.winograd());
                 for obs in positions() {
                     let want = tract.initial(&obs).unwrap();
                     let mut policy = vec![0.0; NUM_ACTIONS];
