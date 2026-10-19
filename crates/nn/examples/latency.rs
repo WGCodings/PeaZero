@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use peazero_core::encoding::{encode_game, NUM_ACTIONS, OBS_SIZE};
 use peazero_nn::fast::{FastNet, FastWeights, Simd};
+use peazero_nn::int8::Int8Kernel;
 
 /// Best of 5 runs of `n` evaluations (µs per evaluation): robust to noise
 /// from other processes.
@@ -55,6 +56,7 @@ fn main() {
         let mut net = FastNet::new(w.clone());
         net.set_simd(level);
         net.set_winograd(wino);
+        net.set_int8(None);
         if net.simd() != level {
             continue;
         }
@@ -69,6 +71,31 @@ fn main() {
         println!(
             "{:13}: {us:6.0} us/eval {:6.0} evals/s {:5.1} GFLOP/s* (max |diff| vs tract {err:.1e})",
             format!("{}{}", level.name(), if wino { "+wino" } else { "" }),
+            1e6 / us,
+            2.0 * macs / us / 1e3
+        );
+    }
+    for k in [
+        Int8Kernel::Avx512Vnni,
+        Int8Kernel::AvxVnni,
+        Int8Kernel::Avx2,
+    ] {
+        let mut net = FastNet::new(w.clone());
+        net.set_int8(Some(k));
+        if net.int8() != Some(k) {
+            continue;
+        }
+        net.evaluate(&obs, &mut p, &mut v);
+        let err = p
+            .iter()
+            .zip(&want.policy)
+            .chain(v.iter().zip(&want.value))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let us = time(|| net.evaluate(&obs, &mut p, &mut v), 1000);
+        println!(
+            "{:13}: {us:6.0} us/eval {:6.0} evals/s {:5.1} GFLOP/s* (max |diff| vs tract {err:.1e})",
+            k.name(),
             1e6 / us,
             2.0 * macs / us / 1e3
         );

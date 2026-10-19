@@ -132,6 +132,15 @@ The engine evaluates the `initial` network (h + f) with its own kernels on x86-6
 * The engine binary no longer contains tract on x86-64: builds take seconds instead of minutes, need no C compiler, and the binary is 5 MB instead of 34 MB.
 * `cargo run --release -p peazero-nn --example latency -- net.pzn` compares every kernel set (direct and Winograd) with tract; `--example accuracy` measures Winograd vs exact f32 on 2,000 positions.
 
+### 5.1c Int8 residual blocks (`crates/nn/src/int8.rs`, branch for SPRT)
+
+When the CPU has AVX2, the residual-block convolutions run in int8 (float otherwise; `PEAZERO_INT8=0` forces float, `=avx2` / `=avxvnni` caps the kernel, for testing). Stem, heads, bias, residual and ReLU stay f32.
+
+* Weights int8 with one scale per output channel; activations (ReLU outputs) quantised per conv input and per evaluation to 0..127 (7 bits, scale = max / 127). `y = s_x · s_w[co] · Σ q_x q_w + bias`.
+* Kernels: AVX2 `vpmaddubsw` + `vpmaddwd` (7-bit activations: a pair sum ≤ 2·127·127 never saturates the i16 step), AVX-VNNI `vpdpbusd` (Intel 12th gen+), AVX-512 VNNI `vpdpbusd` on zmm (Zen 4, Intel servers). All three give the same integers and the same f32 epilogue → bit-identical; bench 17686 with every kernel.
+* Accuracy vs exact f32 (2,000 random-game positions, gen 325 of `fourth`): same best move 96.4%, move probabilities up to 18 percentage points off, value (W−L) 0.011 mean / 0.083 max. Tried and not better: 7-bit weights (worse), clipping activation outliers (much worse), per-channel calibrated activation scales (no gain), any single layer in float (no gain: the error is spread over all 12). 8-bit activations gave 97.35% but can saturate the AVX2 kernel. The real fix would be quantisation-aware training.
+* Speed, batch 1, 64×6 (Xeon @ 2.1 GHz): AVX2 int8 ~455 µs vs AVX2 Winograd ~535 µs; AVX-VNNI ~260 µs; AVX-512 VNNI ~170 µs (vs AVX-512 Winograd ~400 µs). Engine `bench`: AVX2 int8 ~1,900 nps vs AVX2 Winograd ~1,650; AVX-512 VNNI ~5,700 nps.
+
 ### 5.2 GPU (RTX 3070)
 
 Run `python trainer/scripts/bench_gpu.py` on the 3070 and fill in:
