@@ -8,8 +8,19 @@ license.workspace = true
 
 [dependencies]
 peazero-core = { path = "../core" }
-tract-onnx = "0.23"
+tract-onnx = { version = "0.23", optional = true }
+
+[features]
+# tract: reference inference for both graphs (any CPU, any batch size).
+# The engine builds without it on x86-64 (see engine/Cargo.toml).
+default = ["tract"]
+tract = ["dep:tract-onnx"]
 
 [[bin]]
 name = "nnbench"
 path = "src/bin/nnbench.rs"
+required-features = ["tract"]
+
+[[example]]
+name = "latency"
+required-features = ["tract"]

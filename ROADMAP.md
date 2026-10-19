@@ -10,7 +10,7 @@ Goal: a UCI chess engine whose move choice comes from **pure MuZero**. That mean
 - Testing: every change, whether to search or network, is validated by **SPRT on PeaOB** (OpenBench).
 - Self-play + training: locally on the RTX 3070. OpenBench workers only *play* (CPU inference).
 - Trainer: our own small PyTorch trainer; losses/tricks ported from LightZero (`gumbel_muzero`) and the MuZero paper. Search ported from DeepMind `mctx` to Rust.
-- Inference: `tract` (pure Rust) on CPU for the engine/OpenBench; hand-written SIMD later. ONNX Runtime CUDA (`ort` crate, Cargo feature) for self-play only.
+- Inference: hand-written SIMD on CPU for the engine/OpenBench (x86-64: AVX-512/AVX2/SSE2, `crates/nn/src/fast.rs`), tract as reference and on other CPUs. ONNX Runtime CUDA (`ort` crate, Cargo feature) for self-play only.
 - Repo: public at github.com/WGCodings/PeaZero, registered on PeaOB (`Engines/PeaZero.json`).
 - Details and rationale: [docs/MUZERO.md](docs/MUZERO.md).
 - Language: Rust for everything that ships. Python or an external project is allowed for training.
@@ -197,7 +197,7 @@ The random mover (Phase 4) and the MuZero engine (Phase 7) are both implementati
 - [ ] Chess960 support: in scope or not?
 - [x] Self-play location: locally on the 3070 (OB datagen workloads with a tiny net = possible later)
 - [x] Trainer: own PyTorch trainer using LightZero/mctx as references
-- [x] CPU inference: tract now, SIMD later
+- [x] CPU inference: tract, then hand-written SIMD (2× at batch 1 with AVX-512, 1.4× AVX2)
 
 ## Risks
 - **Compute.** Pure MuZero for chess from zero is very expensive. Mitigations: tiny nets, Gumbel search, reanalyze, optional supervised bootstrap.

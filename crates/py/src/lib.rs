@@ -29,7 +29,9 @@ use peazero_core::encoding::{
     ACTION_PLANES, ACTION_SIZE, ENCODING_VERSION, NUM_ACTIONS, OBS_PLANES, OBS_SIZE,
 };
 use peazero_core::Game;
-use peazero_nn::MuZeroNet;
+use std::sync::Arc;
+
+use peazero_nn::fast::{FastNet, FastWeights};
 use peazero_selfplay::arena::{self, ArenaConfig, Evaluate, Puzzle};
 use peazero_selfplay::gumbel::GumbelConfig;
 use peazero_selfplay::pool::PoolStats;
@@ -436,53 +438,46 @@ fn chunk_to_viriformat<'py>(
     Ok((PyBytes::new(py, &bytes), games, positions))
 }
 
-/// CPU networks for the arena. tract plans have a fixed batch size, so
-/// requests are split into chunks of `EVAL_BATCH` (the last one padded) that
-/// run in parallel on the arena's threads.
-const EVAL_BATCH: usize = 16;
-
-struct TractEval {
-    nets: Vec<MuZeroNet>,
+/// CPU networks for the arena: the engine's hand-written SIMD inference
+/// (peazero_nn::fast). Positions are evaluated one by one, spread over the
+/// arena's threads; each thread keeps its own scratch buffers.
+struct NetEval {
+    nets: Vec<Arc<FastWeights>>,
 }
 
-impl TractEval {
-    fn load(paths: &[&str]) -> PyResult<TractEval> {
+impl NetEval {
+    fn load(paths: &[&str]) -> PyResult<NetEval> {
         let nets = paths
             .iter()
             .map(|p| {
                 let bytes = std::fs::read(p)
                     .map_err(|e| PyValueError::new_err(format!("cannot read {p}: {e}")))?;
-                MuZeroNet::from_pzn(&bytes, EVAL_BATCH, false)
+                FastWeights::from_pzn(&bytes)
+                    .map(Arc::new)
                     .map_err(|e| PyValueError::new_err(format!("cannot load {p}: {e}")))
             })
             .collect::<PyResult<Vec<_>>>()?;
-        Ok(TractEval { nets })
+        Ok(NetEval { nets })
     }
 }
 
-impl Evaluate for TractEval {
+impl Evaluate for NetEval {
     fn evaluate(&self, net: usize, obs: &[f32]) -> (Vec<f32>, Vec<f32>) {
-        let net = &self.nets[net];
+        let w = &self.nets[net];
         let n = obs.len() / OBS_SIZE;
-        let chunks: Vec<(Vec<f32>, Vec<f32>)> = obs
-            .par_chunks(EVAL_BATCH * OBS_SIZE)
-            .map(|chunk| {
-                let rows = chunk.len() / OBS_SIZE;
-                let mut padded = chunk.to_vec();
-                padded.resize(EVAL_BATCH * OBS_SIZE, 0.0);
-                let out = net.initial(&padded).expect("tract inference failed");
-                (
-                    out.policy[..rows * NUM_ACTIONS].to_vec(),
-                    out.value[..rows * 3].to_vec(),
-                )
-            })
-            .collect();
-        let mut policy = Vec::with_capacity(n * NUM_ACTIONS);
-        let mut value = Vec::with_capacity(n * 3);
-        for (p, v) in chunks {
-            policy.extend(p);
-            value.extend(v);
-        }
+        let mut policy = vec![0.0f32; n * NUM_ACTIONS];
+        let mut value = vec![0.0f32; n * 3];
+        obs.par_chunks(OBS_SIZE)
+            .zip(policy.par_chunks_mut(NUM_ACTIONS))
+            .zip(value.par_chunks_mut(3))
+            .for_each_init(
+                || FastNet::new(Arc::clone(w)),
+                |net, ((o, p), v)| {
+                    let mut out = [0.0f32; 3];
+                    net.evaluate(o, p, &mut out);
+                    v.copy_from_slice(&out);
+                },
+            );
         (policy, value)
     }
 }
@@ -508,7 +503,7 @@ fn play_match<'py>(
     threads: usize,
 ) -> PyResult<Vec<Bound<'py, PyDict>>> {
     peazero_core::init();
-    let eval = TractEval::load(&[net_a, net_b])?;
+    let eval = NetEval::load(&[net_a, net_b])?;
     let cfg = ArenaConfig {
         simulations,
         considered,
@@ -545,7 +540,7 @@ fn solve_puzzles(
     threads: usize,
 ) -> PyResult<Vec<(bool, bool)>> {
     peazero_core::init();
-    let eval = TractEval::load(&[net])?;
+    let eval = NetEval::load(&[net])?;
     let parsed = puzzles
         .iter()
         .map(|(fen, moves)| Puzzle::from_lichess(fen, moves).map_err(PyValueError::new_err))
