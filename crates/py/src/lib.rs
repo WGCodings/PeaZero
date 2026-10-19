@@ -422,6 +422,20 @@ fn encode_fen<'py>(
     shaped(py, v, &[OBS_PLANES, 8, 8])
 }
 
+/// Convert a self-play data chunk (data format v0–v2) to viriformat bytes
+/// (Viridithas / bullet game format): `(bytes, games, positions)`.
+#[pyfunction]
+fn chunk_to_viriformat<'py>(
+    py: Python<'py>,
+    data: &[u8],
+) -> PyResult<(Bound<'py, PyBytes>, usize, usize)> {
+    peazero_core::init();
+    let (bytes, games, positions) = py
+        .detach(|| peazero_selfplay::viriformat::chunk_to_viriformat(data))
+        .map_err(PyValueError::new_err)?;
+    Ok((PyBytes::new(py, &bytes), games, positions))
+}
+
 /// CPU networks for the arena. tract plans have a fixed batch size, so
 /// requests are split into chunks of `EVAL_BATCH` (the last one padded) that
 /// run in parallel on the arena's threads.
@@ -554,6 +568,7 @@ fn peazero_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_fen, m)?)?;
     m.add_function(wrap_pyfunction!(play_match, m)?)?;
     m.add_function(wrap_pyfunction!(solve_puzzles, m)?)?;
+    m.add_function(wrap_pyfunction!(chunk_to_viriformat, m)?)?;
     m.add("ENCODING_VERSION", ENCODING_VERSION)?;
     m.add("MAX_LEGAL", MAX_LEGAL)?;
     Ok(())

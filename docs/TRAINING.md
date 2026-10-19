@@ -41,6 +41,8 @@ Defaults for a new run (`python train.py --help`):
 | `--unroll` | 0 | AlphaZero-style training: no dynamics unroll (self-play and the engine don't use the dynamics network); training ~4× cheaper than K = 5 |
 | `--reuse` | 2.0 | average times each new position is trained on |
 | `--games`, `--positions-per-gen`, `--batch`, `--replay` | 1024, 100k, 512, 1M | |
+| `--viriformat` | off | keep all self-play games: each generation is appended to `runs/<name>/<name>.vf` (viriformat) before its data folder is deleted; `--no-viriformat` turns it off again |
+| `--keep-nets` | 25 | keep the network of every 25th generation (plus every evaluation milestone and the newest), delete the rest, also the ones already on disk; 0 = keep all |
 | `--eval-every` | 25 | strength evaluation every 25 generations (match + puzzles, below); 0 = off |
 | `--match-games` | 100 | games per evaluation match (0 = puzzles only) |
 | `--match-tc` / `--match-search-mode` | 8+0.08 / Mcts | evaluation matches: the engine binary with its own search at this clock; `none` = in-process match without clock |
@@ -48,6 +50,17 @@ Defaults for a new run (`python train.py --help`):
 | `--eval-threads` | 4 | CPU threads for the evaluation = games played at the same time |
 | `--engine` | newest `target/release/peazero` or `./peazero` | engine binary for the matches (this session only) |
 | `--puzzles` | `trainer/data/puzzles.csv` | puzzle set (this session only; `none` = no puzzles) |
+
+## Keeping the games (viriformat)
+
+With `--viriformat` every generation's games are converted to **viriformat** (the Viridithas game format that bullet and other NNUE trainers read) and appended to one file per run, `runs/<name>/<name>.vf`, right before the generation's `.bin` folder is deleted. The `.bin` files keep getting deleted as before; nothing is lost.
+
+* Per game: the start position with the result (black win / draw / white win; games stopped at the ply limit count as draws), then every move with a **white-relative score** in centipawns: the position's search value from self-play (W − L of the 64-simulation search), converted with the same curve as the engine's `score cp`.
+* Size: ~4 bytes per position, about 0.4 MB per generation (100k positions).
+* Checked against the reference implementation (the `viriformat` crate): the spec example byte for byte, and every move of 300 random games decodes legally to the same positions.
+* Appends are crash-safe (`<name>.vf.json` records the size after each complete generation; an interrupted append is cut off next time). If you move the `.vf` away, a new one starts; generations already exported aren't repeated.
+* Data folders still on disk (the newest ~20 generations) are exported when they are deleted later, or by hand while training is stopped: `python -m peazero.vf_export --run ..\runs\fourth`.
+* Generations deleted before you turned this on can't be recovered.
 
 ## Strength evaluation
 
@@ -92,7 +105,9 @@ runs/first/
   metrics.jsonl        one line per generation
   status.json          live progress, read by the dashboard
   latest.pzn           copy of the newest network
-  nets/gen_0001.pzn    every generation's network (kept, ~4 MB each)
+  nets/gen_0025.pzn    every 25th generation's network (--keep-nets), ~4 MB each
+  first.vf             all exported games in viriformat (--viriformat)
+  first.vf.json        which generations are in it
   evals.jsonl          strength evaluation: one line per match / puzzle run
   eval_status.json     what the evaluator is doing, read by the dashboard
   data/gen_0012/       self-play games of generation 12 (part_000.bin, ...)

@@ -17,6 +17,7 @@ pub mod pool;
 pub mod record;
 pub mod replay;
 pub mod search;
+pub mod viriformat;
 
 /// W/D/L probabilities from W/D/L logits.
 pub fn wdl_logits_to_probs(logits: &[f32]) -> [f32; 3] {

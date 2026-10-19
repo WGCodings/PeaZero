@@ -16,7 +16,7 @@ Run directory layout:
   <run>/metrics.jsonl          one line per generation
   <run>/status.json            live progress (read by the dashboard)
   <run>/latest.pzn             copy of the newest network
-  <run>/nets/gen_XXXX.pzn      network after every generation
+  <run>/nets/gen_XXXX.pzn      network of every --keep-nets-th generation (+ the newest)
   <run>/evals.jsonl            strength evaluation (matches, puzzles; see below)
   <run>/data/gen_XXXX/*.bin    self-play games (data format v2)
 
@@ -26,7 +26,9 @@ saved. Settings that an older run never recorded keep that run's original
 behaviour (LEGACY below), so resuming an old run doesn't change it.
 
 Old data is deleted automatically once the replay buffer can no longer use
-it (see --keep-data-gens); networks are always kept.
+it (see --keep-data-gens); with --viriformat it is appended to
+<run>/<run name>.vf first (peazero/vf_export.py). Networks: every --keep-nets-th generation and
+every evaluation milestone are kept, plus the newest; the rest is deleted.
 
 A live dashboard (statistics, charts, ETA) opens at http://localhost:8765
 while training; see --dashboard-port / --no-browser.
@@ -70,7 +72,8 @@ DEFAULTS = {
     "positions_per_gen": 100_000, "noise_plies": 30, "late_noise": 0.0,
     # training
     "batch": 512, "unroll": 0, "reuse": 2.0, "lr": 1e-3, "weight_decay": 1e-4, "warmup": 500,
-    "replay": 1_000_000, "keep_data_gens": -1, "q_ratio": 0.5, "seed": 0,
+    "replay": 1_000_000, "keep_data_gens": -1, "keep_nets": 25, "viriformat": False,
+    "q_ratio": 0.5, "seed": 0,
     # background strength evaluation (CPU)
     "eval_every": 25, "match_games": 100, "match_tc": "8+0.08", "match_search_mode": "Mcts",
     "match_simulations": 0, "eval_threads": 4,
@@ -111,6 +114,12 @@ def parse_args():
     ap.add_argument("--weight-decay", type=float)
     ap.add_argument("--warmup", type=int)
     ap.add_argument("--replay", type=int, help="replay buffer size in positions")
+    ap.add_argument("--keep-nets", type=int,
+                    help="keep the network of every N-th generation (and every evaluation milestone, "
+                         "and the newest); others are deleted. 0 = keep all")
+    ap.add_argument("--viriformat", action=argparse.BooleanOptionalAction,
+                    help="append every generation's games to <run>/<run name>.vf (viriformat) before its "
+                         "data folder is deleted; --no-viriformat turns it off")
     ap.add_argument("--keep-data-gens", type=int,
                     help="generations of self-play data kept on disk; -1 = just enough to refill the "
                          "replay buffer on --resume, 0 = keep everything")
@@ -216,11 +225,42 @@ def data_gens_to_keep(args):
     return replay_gens(args)
 
 
-def prune_data(run, keep):
+def prune_nets(args, newest):
+    """Delete nets/gen_XXXX.pzn except every --keep-nets-th generation,
+    the evaluation milestones (the evaluator needs gen N and N - eval_every)
+    and `newest`. Returns the number of files deleted."""
+    if args.keep_nets <= 0:
+        return 0
+    removed = 0
+    for path in glob.glob(os.path.join(args.run, "nets", "gen_*.pzn")):
+        m = re.fullmatch(r"gen_(\d+)\.pzn", os.path.basename(path))
+        if not m:
+            continue  # hand-made copies like gen_0839fix.pzn stay
+        g = int(m.group(1))
+        if g >= newest or g % args.keep_nets == 0 or (args.eval_every > 0 and g % args.eval_every == 0):
+            continue
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def prune_data(run, keep, exporter=None):
+    """Delete all but the newest `keep` data folders; with `exporter`
+    (--viriformat) each one is appended to the run's .vf file first, and
+    kept if that fails."""
     if keep <= 0:
         return
     dirs = data_gen_dirs(run)
-    for _, path in dirs[:-keep]:
+    for gen, path in dirs[:-keep]:
+        if exporter is not None:
+            try:
+                exporter.export_gen(gen, path)
+            except Exception as e:
+                print(f"viriformat export of {path} failed ({e}); keeping the folder")
+                continue
         shutil.rmtree(path, ignore_errors=True)
 
 
@@ -301,6 +341,13 @@ def train(args, status):
         torch.backends.cudnn.benchmark = True
     migrate_flat_data(args.run)
     keep_gens = data_gens_to_keep(args)
+    exporter = None
+    if args.viriformat:
+        from peazero.vf_export import VfExporter
+        if not hasattr(pz, "chunk_to_viriformat"):
+            sys.exit("peazero_rs is out of date (no viriformat export); run `pip install ./crates/py`")
+        exporter = VfExporter(args.run)
+        print(f"viriformat: {exporter.summary()}")
     assert pz.ENCODING_VERSION == enc.ENCODING_VERSION, "rebuild peazero_rs: encoding version mismatch"
 
     ckpt_path = os.path.join(args.run, "checkpoint.pt")
@@ -337,6 +384,10 @@ def train(args, status):
                 with open(path, "rb") as f:
                     replay.add_chunk(f.read())
         print(f"replay buffer: {replay.positions:,} positions from {len(refill)} generations on disk")
+    removed = prune_nets(args, gen)
+    if removed:
+        print(f"deleted {removed} old networks: keeping every {args.keep_nets}th generation, the evaluation "
+              "milestones and the newest (--keep-nets 0 keeps all)")
 
     if args.simulations > 0:
         if not hasattr(pz, "SearchSelfPlay"):
@@ -447,7 +498,8 @@ def train(args, status):
         net_path = os.path.join(args.run, "nets", f"gen_{gen:04d}.pzn")
         export_pzn(init_net, net_path, rec_net)
         shutil.copyfile(net_path, os.path.join(args.run, "latest.pzn"))
-        prune_data(args.run, keep_gens)
+        prune_data(args.run, keep_gens, exporter)
+        prune_nets(args, gen)
         torch.save({"model": net.state_dict(), "optimizer": opt.state_dict(), "config": cfg.__dict__,
                     "generation": gen, "step": step}, ckpt_path)
 
