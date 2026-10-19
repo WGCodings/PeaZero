@@ -24,7 +24,10 @@
 //! (the release profile aborts on panic). The heavy calls release the GIL, so
 //! self-play in a background Python thread runs alongside training.
 
-use numpy::{IntoPyArray, PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn, PyUntypedArrayMethods};
+use numpy::{
+    IntoPyArray, PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn, PyReadwriteArrayDyn,
+    PyUntypedArrayMethods,
+};
 use peazero_core::encoding::{
     ACTION_PLANES, ACTION_SIZE, ENCODING_VERSION, NUM_ACTIONS, OBS_PLANES, OBS_SIZE,
 };
@@ -294,6 +297,37 @@ impl SearchSelfPlay {
             shaped(py, obs, &[n, OBS_PLANES, 8, 8])?,
             shaped(py, legal, &[n, MAX_LEGAL])?,
         ))
+    }
+
+    /// Like `requests`, but written into caller-owned C-contiguous arrays
+    /// (obs float32 with N·21·64 values, legal int32 with N·218): the
+    /// trainer passes page-locked buffers, so nothing is allocated or copied
+    /// on the way to the GPU.
+    fn requests_into(
+        &self,
+        py: Python<'_>,
+        mut obs: PyReadwriteArrayDyn<'_, f32>,
+        mut legal: PyReadwriteArrayDyn<'_, i32>,
+    ) -> PyResult<()> {
+        let n = self.pool.num_games();
+        let o = obs
+            .as_slice_mut()
+            .map_err(|_| PyValueError::new_err("obs must be a C-contiguous float32 array"))?;
+        let l = legal
+            .as_slice_mut()
+            .map_err(|_| PyValueError::new_err("legal must be a C-contiguous int32 array"))?;
+        if o.len() != n * OBS_SIZE || l.len() != n * MAX_LEGAL {
+            return Err(PyValueError::new_err(format!(
+                "requests_into: expected {} obs and {} legal values, got {} and {}",
+                n * OBS_SIZE,
+                n * MAX_LEGAL,
+                o.len(),
+                l.len()
+            )));
+        }
+        let pool = &self.pool;
+        py.detach(|| pool.requests(o, l));
+        Ok(())
     }
 
     /// Legal-move logits (N,218) gathered at `legal`, value logits (N,3).

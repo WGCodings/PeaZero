@@ -65,6 +65,7 @@ import peazero_rs as pz  # noqa: E402  (pip install ./crates/py)
 from peazero import dashboard  # noqa: E402
 from peazero import encoding as enc  # noqa: E402
 from peazero.model import MuZeroNet, NetConfig, export_pzn  # noqa: E402
+from peazero.selfplay_gpu import SearchRunner  # noqa: E402
 from peazero.train_lib import (  # noqa: E402
     batch_to_device, calibrate_bn, eval_metrics, muzero_loss, search_step, selfplay_step)
 
@@ -156,6 +157,13 @@ def parse_args():
                                       "'none' = no puzzles)")
     ap.add_argument("--engine", help="engine binary for --match-tc matches (default: newest of "
                                      "target/release/peazero and ./peazero)")
+    ap.add_argument("--pools", type=int, default=2,
+                    help="self-play speed (this session only, same results): split the games over N pools "
+                         "so the GPU evaluates one while the CPU searches the other (2, default); 1 = one "
+                         "pool; 0 = the old plain loop (no pinned buffers / CUDA graphs)")
+    ap.add_argument("--cuda-graphs", action=argparse.BooleanOptionalAction, default=True,
+                    help="self-play inference as recorded CUDA graphs (one launch per evaluation batch); "
+                         "--no-cuda-graphs = eager PyTorch")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-amp", action="store_true", help="disable fp16 autocast on CUDA")
     ap.add_argument("--dashboard-port", type=int, default=8765, help="live dashboard port; 0 = no dashboard")
@@ -344,6 +352,25 @@ def main():
         stop_evaluator(evaluator, finish=finished)
 
 
+class PlainPool:
+    """One self-play pool driven by the plain loop (train_lib.search_step /
+    selfplay_step), with the SearchRunner interface used below."""
+
+    def __init__(self, pool):
+        self.pool = pool
+
+    def stats(self):
+        return self.pool.stats()
+
+    def take_chunks(self):
+        chunk = self.pool.take_chunk()
+        return [chunk] if chunk[1] else []
+
+    @property
+    def num_threads(self):
+        return self.pool.num_threads
+
+
 def selfplay_nets(net, replay, dev, amp):
     """calibrate_bn copies for self-play and export. With --qat the
     BatchNorm statistics are measured through the int8 simulation (what the
@@ -414,19 +441,37 @@ def train(args, status):
         print(f"deleted {removed} old networks: keeping every {args.keep_nets}th generation, the evaluation "
               "milestones and the newest (--keep-nets 0 keeps all)")
 
+    runner = None
     if args.simulations > 0:
         if not hasattr(pz, "SearchSelfPlay"):
             sys.exit("peazero_rs is out of date (no tree search); run `pip install ./crates/py`")
+        n_pools = max(1, args.pools)
+        sizes = [args.games // n_pools + (i < args.games % n_pools) for i in range(n_pools)]
         try:
-            sp = pz.SearchSelfPlay(games=args.games, simulations=args.simulations, considered=args.considered,
-                                   max_plies=args.max_plies, seed=args.seed + gen, threads=args.threads,
-                                   noise_plies=args.noise_plies, late_gumbel_scale=args.late_noise)
+            # pool i gets its own seed; with one pool this is the old single pool
+            pools = [pz.SearchSelfPlay(games=n, simulations=args.simulations, considered=args.considered,
+                                       max_plies=args.max_plies, seed=args.seed + gen + 1_000_003 * i,
+                                       threads=args.threads, noise_plies=args.noise_plies,
+                                       late_gumbel_scale=args.late_noise)
+                     for i, n in enumerate(sizes)]
         except TypeError:
             sys.exit("peazero_rs is out of date (no noise schedule / data format v2); run `pip install ./crates/py`")
+        if args.pools > 0:
+            if not hasattr(pools[0], "requests_into"):
+                sys.exit("peazero_rs is out of date (no requests_into); run `pip install ./crates/py`")
+            runner = SearchRunner(pools, dev, amp, cuda_graphs=args.cuda_graphs)
+            sp = runner
+        else:
+            sp = PlainPool(pools[0])
         mode = f"{args.simulations} simulations, {args.considered} considered"
+        if runner:
+            mode += (f", {n_pools} pipelined pools" if n_pools > 1 else ", 1 pool")
+            mode += ", CUDA graphs" if runner.graphs_wanted else ""
+        else:
+            mode += ", plain loop"
     else:
-        sp = pz.SelfPlay(games=args.games, considered=args.considered, max_plies=args.max_plies,
-                         seed=args.seed + gen, threads=args.threads)
+        sp = PlainPool(pz.SelfPlay(games=args.games, considered=args.considered, max_plies=args.max_plies,
+                                   seed=args.seed + gen, threads=args.threads))
         mode = f"root-only, {args.considered} considered"
     sp_threads = sp.num_threads
     params = sum(p.numel() for p in net.parameters()) / 1e6
@@ -439,6 +484,10 @@ def train(args, status):
     # Self-play and export use eval-mode copies with recalibrated BatchNorm
     # statistics (train_lib.calibrate_bn), never `net` itself in eval mode.
     init_net, rec_net = selfplay_nets(net, replay, dev, amp)
+    if runner:
+        runner.set_net(init_net)
+        if runner.graphs_wanted and not runner.graphs:
+            print("CUDA graphs unavailable here; eager inference")
 
     while gen < args.generations:
         gen += 1
@@ -454,11 +503,15 @@ def train(args, status):
         # simulation per game (~simulations + 1 steps per move)
         chunk_every = 32 if args.simulations == 0 else 8 * (args.simulations + 1)
         steps = 0
+        if runner:
+            runner.reset_timing()
         while new_positions < args.positions_per_gen:
-            if args.simulations > 0:
-                search_step(init_net, sp, dev, amp)
+            if runner:
+                runner.step()
+            elif args.simulations > 0:
+                search_step(init_net, sp.pool, dev, amp)
             else:
-                selfplay_step(init_net, sp, dev, amp, rec_net)
+                selfplay_step(init_net, sp.pool, dev, amp, rec_net)
             steps += 1
             if time.time() - status.last_write >= 1.0:
                 moves = sp.stats()["plies"] - stats_before["plies"]
@@ -466,8 +519,7 @@ def train(args, status):
                               moves_per_second=moves / max(time.time() - t0, 1e-6),
                               replay_positions=replay.positions)
             if steps % chunk_every == 0:
-                chunk, games, positions = sp.take_chunk()
-                if games:
+                for chunk, games, positions in sp.take_chunks():
                     path = os.path.join(gen_dir, f"part_{part:03d}.bin")
                     with open(path, "wb") as f:
                         f.write(chunk)
@@ -475,6 +527,10 @@ def train(args, status):
                     part += 1
                     new_positions += positions
                     new_games += games
+        sp_timing = None
+        if runner:
+            runner.drain()  # evaluations still in flight belong to this generation's network
+            sp_timing = runner.reset_timing()
         sp_time = time.time() - t0
         st = sp.stats()
         moves = st["plies"] - stats_before["plies"]
@@ -519,6 +575,8 @@ def train(args, status):
         status.update(force=True, phase="saving", steps_done=n_steps, step=step)
         net.eval()
         init_net, rec_net = selfplay_nets(net, replay, dev, amp)
+        if runner:
+            runner.set_net(init_net)
         ev = eval_metrics(init_net, rec_net, replay, dev, amp)
         net_path = os.path.join(args.run, "nets", f"gen_{gen:04d}.pzn")
         export_pzn(init_net, net_path, rec_net)
@@ -533,11 +591,16 @@ def train(args, status):
             "selfplay_seconds": round(sp_time, 1), "train_seconds": round(train_time, 1),
             "moves_per_second": round(moves / sp_time), "new_games": new_games, "new_positions": new_positions,
             "avg_game_length": round(new_positions / max(new_games, 1), 1),
+            **({"sp_gpu_wait_seconds": round(sp_timing["gpu_wait"], 1),
+                "sp_rust_seconds": round(sp_timing["rust"], 1),
+                "sp_launch_seconds": round(sp_timing["launch"], 1)} if sp_timing else {}),
             "results": d, "terminations": terms, "replay_positions": replay.positions, "qat": net.qat, **avg, **ev,
         }
         log(args.run, record)
         print(f"gen {gen:4d} | selfplay {sp_time:6.1f}s {moves / sp_time:7.0f} mv/s "
-              f"{new_games:5d} games (W{d['white_wins']} D{d['draws']} B{d['black_wins']}, "
+              + (f"(gpu wait {sp_timing['gpu_wait']:.0f}s rust {sp_timing['rust']:.0f}s "
+                 f"launch {sp_timing['launch']:.0f}s) " if sp_timing else "")
+              + f"{new_games:5d} games (W{d['white_wins']} D{d['draws']} B{d['black_wins']}, "
               f"len {record['avg_game_length']}) | train {n_steps} steps {train_time:6.1f}s "
               f"loss {avg['loss']:.3f} (p {avg['policy_loss']:.3f} v {avg['value_loss']:.3f} "
               f"agree {avg['policy_agreement']:.2f}) | exported p {ev.get('eval_policy_loss', 0):.3f} "

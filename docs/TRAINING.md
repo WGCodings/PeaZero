@@ -51,6 +51,8 @@ Defaults for a new run (`python train.py --help`):
 | `--eval-threads` | 4 | CPU threads for the evaluation = games played at the same time |
 | `--engine` | newest `target/release/peazero` or `./peazero` | engine binary for the matches (this session only) |
 | `--puzzles` | `trainer/data/puzzles.csv` | puzzle set (this session only; `none` = no puzzles) |
+| `--pools` | 2 | self-play speed, same results (this session only): the games are split over 2 pools so the GPU evaluates one while the CPU searches the other; 1 = one pool; 0 = the old plain loop. See Speed |
+| `--cuda-graphs` | on | self-play inference as recorded CUDA graphs (one launch per batch); `--no-cuda-graphs` = eager PyTorch (this session only) |
 
 ## Keeping the games (viriformat)
 
@@ -69,7 +71,7 @@ On CPUs with AVX2 the engine runs the residual blocks in int8 (docs/MUZERO.md §
 
 * What it simulates, exactly like `crates/nn/src/int8.rs`: weights rounded to −127..127 with one scale per output channel (max |w| / 127), activations rounded to 0..127 with one scale per convolution input and per position (max / 127). Only the 12 residual-block convolutions of the representation network: stem, heads, bias, residual and ReLU stay float in the engine too. The PyTorch simulation matches the engine's int8 output to ~1e-5 (checked on 300 positions).
 * How it trains through rounding: straight-through estimator. The forward pass sees the rounded values, the backward pass treats rounding as the identity, so the float "shadow" weights keep getting gradients and drift toward values whose rounded version gives the lowest loss.
-* Only the training steps simulate int8; self-play uses the float network at full speed (simulating int8 there too slowed self-play to ~900 moves/s for little benefit: the training loss is what teaches the weights to survive rounding). BatchNorm statistics are still measured through the int8 simulation. The exported `.pzn` keeps float weights; the engine rounds them to the same integers. Float-only CPUs (no AVX2) run the float weights, which stay a good network.
+* Only the training steps simulate int8; self-play uses the float network at full speed (the training loss is what teaches the weights to survive rounding; simulating it in self-play too only costs speed). BatchNorm statistics are still measured through the int8 simulation. The exported `.pzn` keeps float weights; the engine rounds them to the same integers. Float-only CPUs (no AVX2) run the float weights, which stay a good network.
 * Cost: about 10–25 % slower training steps (a few extra element-wise operations per convolution); self-play unchanged. No change to the checkpoint format, so it can be switched on or off on `--resume` at any time.
 * When: for the last stretch of a run, together with a low learning rate: `python train.py --run ..\runs\fourth --resume --lr 1e-4 --qat`. Rounding steps are small (~1/127 of a channel's largest weight), so the net can only settle into them when the weights stop moving much; at high learning rates the updates just jump across them.
 * Measured (offline, gen 2000 of `fourth` fine-tuned toward its own float output on random-game positions, Adam lr 1e-5, 600 steps of 256): int8 vs float policy KL 0.0096 → 0.0073 (−25 %), value |W−L| difference 0.025 → 0.011 (−55 %); a float-trained control stayed at 0.0094 / 0.026. Same best move stayed ~95 %: most of the remaining disagreements are near-ties between two moves. At lr 1e-4 this fine-tuning got worse (the loss being matched is tiny, so batch noise dominates). In real training the gain should be larger than in this small test, but the SPRT decides: QAT net in int8 vs the plain net in int8.
@@ -167,7 +169,23 @@ Where a generation's time goes (64×6, RTX 3070): self-play ~12 s, training ~30�
 * **Training** samples the next batch while the GPU is still busy, keeps metrics on the GPU and uses fused AdamW, so the GPU no longer waits for the CPU between steps.
 * **Bigger batches** are the main remaining lever for a small net: `--batch 1024` halves the number of steps (steps = new positions × reuse / batch). Check the gain first with `python scripts/bench_gpu.py --sizes 64x6 --train-batch 1024`; when switching, raise the learning rate a bit (e.g. `--lr 1.4e-3`) and SPRT the result, since it changes how the net learns. Both flags can change on `--resume`.
 
-All flags are read from the command line on every start (`config.json` only records the first one), so repeat them on `--resume`.
+Stored settings: `--resume` reuses `config.json`; a flag on the command line overrides it and is saved. Starting **without** `--resume` writes the defaults into `config.json` (and starts a new network), so always pass `--resume` for an existing run.
+
+### Self-play pipeline (`peazero/selfplay_gpu.py`)
+
+One self-play step = one simulation for every game: Rust encodes the positions to evaluate, the GPU evaluates them, Rust feeds the results into the searches. Three things make a step cheaper; none changes what is played (checked: with one pool the games are byte-identical to the old loop):
+
+* **Pinned buffers**: Rust writes the requests straight into page-locked memory (`requests_into`) and results come back into page-locked memory, so the GPU copies are asynchronous and nothing is allocated per step.
+* **CUDA graphs** (`--cuda-graphs`, default on): the forward pass and the legal-move gather are recorded once per network and replayed with one launch instead of ~50; re-recorded after every generation (milliseconds). Falls back to normal inference if recording fails.
+* **Two pools** (`--pools 2`, default): while the GPU evaluates pool A, Rust works on pool B, and vice versa. Each pool has half of `--games`, so the GPU batch halves; `--games 2048` keeps batches of 1024.
+
+The console line shows where self-play time went: `gpu wait` (blocked on the GPU: GPU-bound), `rust` (tree search work: CPU-bound), `launch` (Python issuing copies and kernels); `metrics.jsonl` has them as `sp_*_seconds`.
+
+Measure on your machine (stop training first, ~4 minutes):
+```powershell
+python scripts\bench_selfplay.py --run ..\runs\fourth
+```
+It prints the network's raw speed with and without CUDA graphs, checks that both give the same outputs, and the moves/s of the old loop vs. each combination.
 
 ## Known limits (next sprint candidates)
 
