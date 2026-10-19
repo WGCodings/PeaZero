@@ -1,5 +1,5 @@
-//! Accuracy of the Winograd (half-precision weights) path against the exact
-//! direct path, on positions from random games.
+//! Accuracy of the fast paths (Winograd with half-precision weights, int8)
+//! against the exact direct f32 path, on positions from random games.
 //!     cargo run --release -p peazero-nn --example accuracy -- net.pzn
 use std::sync::Arc;
 
@@ -7,15 +7,28 @@ use peazero_core::encoding::{encode_game, legal_actions, NUM_ACTIONS, OBS_SIZE};
 use peazero_core::rng::Rng;
 use peazero_core::{Game, GameResult};
 use peazero_nn::fast::{FastNet, FastWeights};
+use peazero_nn::int8::Int8Kernel;
 use peazero_nn::wdl_probs;
 
 fn main() {
     peazero_core::init();
     let path = std::env::args().nth(1).unwrap();
     let w = Arc::new(FastWeights::from_pzn(&std::fs::read(&path).unwrap()).unwrap());
-    let (mut exact, mut fast) = (FastNet::new(w.clone()), FastNet::new(w));
+    let mut exact = FastNet::new(w.clone());
     exact.set_winograd(false);
-    fast.set_winograd(true);
+    exact.set_int8(None);
+    let mut wino = FastNet::new(w.clone());
+    wino.set_winograd(true);
+    wino.set_int8(None);
+    report("Winograd (f16 weights)", &mut exact, &mut wino);
+    if let Some(k) = Int8Kernel::detect() {
+        let mut q = FastNet::new(w);
+        q.set_int8(Some(k));
+        report("int8", &mut exact, &mut q);
+    }
+}
+
+fn report(name: &str, exact: &mut FastNet, fast: &mut FastNet) {
     let mut rng = Rng::new(1);
     let (mut n, mut same_top, mut max_dl, mut sum_dl, mut max_dq, mut sum_dq, mut max_dp) =
         (0usize, 0usize, 0f32, 0f64, 0f32, 0f64, 0f32);
@@ -74,7 +87,7 @@ fn main() {
         n += 1;
     }
     println!(
-        "{n} positions: same best move {:.2}%, logit diff mean {:.1e} max {:.1e}, move probability diff max {:.4}, value (W-L) diff mean {:.1e} max {:.1e}",
+        "{name:24} {n} positions: same best move {:.2}%, logit diff mean {:.1e} max {:.1e}, move probability diff max {:.4}, value (W-L) diff mean {:.1e} max {:.1e}",
         100.0 * same_top as f64 / n as f64,
         sum_dl / (n as f64 * 30.0),
         max_dl,

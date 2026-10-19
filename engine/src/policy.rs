@@ -52,14 +52,14 @@ impl PolicyNet {
     }
 
     /// Which inference kernels are in use (for `info string`).
-    pub fn backend_name(&self) -> &'static str {
+    pub fn backend_name(&self) -> String {
         #[cfg(target_arch = "x86_64")]
         {
-            self.net.simd().name()
+            self.net.describe()
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            "tract"
+            "tract".to_string()
         }
     }
 

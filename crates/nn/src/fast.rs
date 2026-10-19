@@ -4,7 +4,8 @@
 //! Weights come straight from the ONNX graph in a `.pzn` file (BatchNorm is
 //! already folded into the convolutions by the export).
 //!
-//! The residual-block convolutions use Winograd F(2×2, 3×3) by default
+//! The residual-block convolutions use int8 (int8.rs) when the CPU has
+//! AVX2, `PEAZERO_INT8=0` switches to float; float uses Winograd F(2×2, 3×3)
 //! (winograd.rs: 2.25× fewer multiply-adds, weights stored as half floats so
 //! they stay in L2); `PEAZERO_WINOGRAD=0` switches to the direct kernels.
 //!
@@ -26,6 +27,7 @@ use std::sync::Arc;
 
 use peazero_core::encoding::{NUM_ACTIONS, OBS_PLANES};
 
+use crate::int8::{self, Int8Kernel, QConv};
 use crate::onnx::{parse_model, Graph, Node, Tensor};
 use crate::winograd::{self, WinoConv, POS, TILES};
 
@@ -111,6 +113,9 @@ pub struct FastWeights {
     /// The same block convolutions in the Winograd domain (if the channel
     /// count is a multiple of 16).
     wino: Vec<(WinoConv, WinoConv)>,
+    /// The same block convolutions quantised to int8 (if the channel count
+    /// is a multiple of 32).
+    q8: Vec<(QConv, QConv)>,
     policy1: Conv,
     policy2: Conv,
     value_conv: Conv,
@@ -173,11 +178,22 @@ impl FastWeights {
             };
             Ok(WinoConv::new(&w.data, b, w.dims[0], w.dims[1]))
         };
+        type Raw = (Vec<f32>, Vec<f32>, usize, usize);
+        let raw_of = |n: &Node| -> Result<Raw, String> {
+            let w = init(&n.inputs[1])?;
+            let b = match n.inputs.get(2) {
+                Some(name) if !name.is_empty() => init(name)?.data.clone(),
+                _ => vec![0.0; w.dims[0]],
+            };
+            Ok((w.data.clone(), b, w.dims[0], w.dims[1]))
+        };
+        let mut raw_blocks: Vec<(Raw, Raw)> = Vec::new();
         for pair in trunk[1..].chunks(2) {
             blocks.push((conv_of(pair[0])?, conv_of(pair[1])?));
             if channels % 16 == 0 {
                 wino.push((wino_of(pair[0])?, wino_of(pair[1])?));
             }
+            raw_blocks.push((raw_of(pair[0])?, raw_of(pair[1])?));
         }
         // Heads: policy2 outputs the 73 move planes; policy1 feeds it (via a
         // ReLU); the remaining 1x1 conv is the value conv.
@@ -221,11 +237,12 @@ impl FastWeights {
                 }
             }
         }
-        Ok(FastWeights {
+        let mut weights = FastWeights {
             channels,
             stem,
             blocks,
             wino,
+            q8: Vec::new(),
             policy1,
             policy2,
             value_conv,
@@ -234,7 +251,16 @@ impl FastWeights {
             hidden,
             fc2_w: w2.data.clone(),
             fc2_b: [b2.data[0], b2.data[1], b2.data[2]],
-        })
+        };
+        if channels % 32 == 0 {
+            for ((w1, b1, co1, ci1), (w2, b2, co2, ci2)) in &raw_blocks {
+                weights.q8.push((
+                    QConv::new(w1, b1, *co1, *ci1),
+                    QConv::new(w2, b2, *co2, *ci2),
+                ));
+            }
+        }
+        Ok(weights)
     }
 
     /// From a `.pzn` file (uses its `initial` graph).
@@ -263,6 +289,9 @@ pub struct FastNet {
     w: Arc<FastWeights>,
     simd: Simd,
     winograd: bool,
+    int8: Option<Int8Kernel>,
+    qb: Vec<u8>,
+
     wv: Vec<f32>,
     wm: Vec<f32>,
     obs: Vec<f32>,
@@ -281,6 +310,23 @@ impl FastNet {
             simd: Simd::detect(),
             winograd: !w.wino.is_empty()
                 && std::env::var("PEAZERO_WINOGRAD").map_or(true, |v| v != "0"),
+            int8: if w.q8.is_empty() {
+                None
+            } else {
+                // PEAZERO_INT8=0 → float; =avx2 / =avxvnni → at most that kernel (testing)
+                let best = Int8Kernel::detect();
+                match std::env::var("PEAZERO_INT8")
+                    .map(|v| v.to_ascii_lowercase())
+                    .as_deref()
+                {
+                    Ok("0") => None,
+                    Ok("avx2") => best.map(|b| b.min(Int8Kernel::Avx2)),
+                    Ok("avxvnni") => best.map(|b| b.min(Int8Kernel::AvxVnni)),
+                    _ => best,
+                }
+            },
+            qb: vec![0; PAD_SQUARES * c],
+
             wv: vec![0.0; POS * TILES * c],
             wm: vec![0.0; POS * TILES * c],
             obs: vec![0.0; PAD_SQUARES * OBS_PLANES],
@@ -316,6 +362,34 @@ impl FastNet {
         self.winograd = on && !self.w.wino.is_empty();
     }
 
+    /// Int8 kernel used for the residual blocks (None: float).
+    pub fn int8(&self) -> Option<Int8Kernel> {
+        self.int8
+    }
+
+    /// Use int8 residual blocks with `kernel` (capped at what the CPU
+    /// supports), or float ones with `None` (tests, benchmarks).
+    pub fn set_int8(&mut self, kernel: Option<Int8Kernel>) {
+        let best = if self.w.q8.is_empty() {
+            None
+        } else {
+            Int8Kernel::detect()
+        };
+        self.int8 = match (kernel, best) {
+            (Some(k), Some(b)) => Some(k.min(b)),
+            _ => None,
+        };
+    }
+
+    /// Short description of the inference path, e.g. "AVX2 + Winograd".
+    pub fn describe(&self) -> String {
+        match self.int8 {
+            Some(k) => k.name().to_string(),
+            None if self.winograd => format!("{} + Winograd", self.simd.name()),
+            None => self.simd.name().to_string(),
+        }
+    }
+
     pub fn weights(&self) -> &Arc<FastWeights> {
         &self.w
     }
@@ -334,7 +408,18 @@ impl FastNet {
             }
         }
         self.conv(&w.stem, Src::Obs, Dst::X, false, true);
-        if self.winograd {
+        if let Some(k) = self.int8 {
+            // SAFETY: k comes from Int8Kernel::detect (CPU support checked).
+            // SAFETY: k comes from Int8Kernel::detect (CPU support checked).
+            unsafe {
+                for (c1, c2) in &w.q8 {
+                    let s = int8::quantize(&self.x, c, &mut self.qb);
+                    int8::conv(c1, &self.qb, s, &mut self.t, false, true, k);
+                    let s = int8::quantize(&self.t, c, &mut self.qb);
+                    int8::conv(c2, &self.qb, s, &mut self.x, true, true, k);
+                }
+            }
+        } else if self.winograd {
             for (c1, c2) in &w.wino {
                 winograd::input_transform(&self.x, c, &mut self.wv, self.simd);
                 winograd::products(c1, &self.wv, &mut self.wm, self.simd);
@@ -905,6 +990,87 @@ mod tests {
         }
     }
 
+    /// All int8 kernels compute the same integers and the same float
+    /// epilogue, so they must agree bit for bit.
+    #[test]
+    fn int8_kernels_are_bit_identical() {
+        peazero_core::init();
+        let Some(best) = Int8Kernel::detect() else {
+            return;
+        };
+        for path in NETS {
+            let Some((w, _)) = load(path) else { continue };
+            if w.q8.is_empty() {
+                continue;
+            }
+            let w = Arc::new(w);
+            let mut nets: Vec<FastNet> = [
+                Int8Kernel::Avx2,
+                Int8Kernel::AvxVnni,
+                Int8Kernel::Avx512Vnni,
+            ]
+            .into_iter()
+            .filter(|&k| k <= best)
+            .map(|k| {
+                let mut n = FastNet::new(w.clone());
+                n.set_int8(Some(k));
+                n
+            })
+            .collect();
+            for obs in positions() {
+                let mut outs = Vec::new();
+                for n in &mut nets {
+                    let mut p = vec![0.0; NUM_ACTIONS];
+                    let mut v = [0.0; 3];
+                    n.evaluate(&obs, &mut p, &mut v);
+                    outs.push((p, v));
+                }
+                for (k, o) in outs.iter().enumerate().skip(1) {
+                    assert!(o == &outs[0], "{path}: int8 kernel {k} differs from AVX2");
+                }
+            }
+        }
+    }
+
+    /// Int8 stays close to float on the test networks.
+    #[test]
+    fn int8_close_to_tract() {
+        peazero_core::init();
+        if Int8Kernel::detect().is_none() {
+            return;
+        }
+        for path in NETS {
+            let Some((w, tract)) = load(path) else {
+                continue;
+            };
+            if w.q8.is_empty() {
+                continue;
+            }
+            let mut net = FastNet::new(Arc::new(w));
+            net.set_int8(Int8Kernel::detect());
+            for obs in positions() {
+                let want = tract.initial(&obs).unwrap();
+                let mut p = vec![0.0; NUM_ACTIONS];
+                let mut v = [0.0; 3];
+                net.evaluate(&obs, &mut p, &mut v);
+                let perr = p
+                    .iter()
+                    .zip(&want.policy)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
+                let verr = v
+                    .iter()
+                    .zip(&want.value)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
+                assert!(
+                    perr < 0.5 && verr < 0.5,
+                    "{path}: int8 policy err {perr}, value err {verr}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn matches_tract() {
         peazero_core::init();
@@ -921,6 +1087,7 @@ mod tests {
                 let mut net = FastNet::new(w.clone());
                 net.set_simd(level);
                 net.set_winograd(wino);
+                net.set_int8(None);
                 let portable = (net.simd(), net.winograd());
                 for obs in positions() {
                     let want = tract.initial(&obs).unwrap();

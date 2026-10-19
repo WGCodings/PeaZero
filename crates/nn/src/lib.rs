@@ -22,6 +22,8 @@
 
 #[cfg(target_arch = "x86_64")]
 pub mod fast;
+#[cfg(target_arch = "x86_64")]
+pub mod int8;
 pub mod onnx;
 #[cfg(feature = "tract")]
 mod tract_net;
