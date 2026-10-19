@@ -51,14 +51,14 @@ Values are always from the side to move's view. Backing up a value from child to
 
 ### 2.5 Engine (OpenBench) use
 
-Sequential Halving needs the simulation budget `n` up front. In UCI play, `n` = measured simulations/s × soft time budget (`timeman.rs`), with `gumbel_scale = 0`. `go nodes N` sets `n = N` directly. `bench` becomes a fixed-`n` search over the bench positions (deterministic, since tract inference is deterministic single-threaded).
+Sequential Halving needs the simulation budget `n` up front. In UCI play, `n` = measured simulations/s × soft time budget (`timeman.rs`), with `gumbel_scale = 0`. `go nodes N` sets `n = N` directly. `bench` becomes a fixed-`n` search over the bench positions (deterministic: inference is single-threaded and identical across kernel sets, §5.1b).
 
 **Search modes in the engine (implemented).** `engine/src/search/` holds one file per method behind the `NetSearch` trait; `PolicyEngine` (policy.rs) owns the network and switches with the UCI option `SearchMode` (combo):
 
 | mode | what it does |
 |---|---|
-| `Mcts` (default) | plain AlphaZero-style MCTS: PUCT (`c_puct` 1.5, unvisited Q = 0) with the policy softmax as priors, each new leaf evaluated once with the network (W/D/L backed up, sides flipped per ply), exact mate/stalemate/draw values, most-visited move played. Score/`wdl` = mean W/D/L of the chosen move; `depth` = average playout depth. `go nodes N` = N playouts; `go depth N` searches until the average playout depth reaches N (cap 100,000 playouts, e.g. in forced mates); plain `go` without limits = 400 playouts. Info lines whenever depth or seldepth grows, at least once a second. No tree reuse, virtual loss, batching, noise or temperature. ~850 playouts/s per core with 64×6 |
-| `AlphaBeta` | plain iterative-deepening negamax with alpha-beta pruning; moves ordered by the policy, network value at the leaves (`q_to_cp(W−L)`, clamped ±3000); exact mate/stalemate/draw detection. Nothing else (no TT, no cache, no extensions, no quiescence): every node is one network evaluation, ~1k nodes/s per core with 64×6, enough for short mates (Morphy's mate in 2 at depth 3 in <1 s). `wdl` in the info line = network W/D/L at the last PV position (exact for mate/draw), from the root side's view. Plain `go` without limits searches depth 3 |
+| `Mcts` (default) | plain AlphaZero-style MCTS: PUCT (`c_puct` 1.5, unvisited Q = 0) with the policy softmax as priors, each new leaf evaluated once with the network (W/D/L backed up, sides flipped per ply), exact mate/stalemate/draw values, most-visited move played. Score/`wdl` = mean W/D/L of the chosen move; `depth` = average playout depth. `go nodes N` = N playouts; `go depth N` searches until the average playout depth reaches N (cap 100,000 playouts, e.g. in forced mates); plain `go` without limits = 400 playouts. Info lines whenever depth or seldepth grows, at least once a second. No tree reuse, virtual loss, batching, noise or temperature. ~1,200 (AVX2) to ~1,700 (AVX-512) playouts/s per core with 64×6 |
+| `AlphaBeta` | plain iterative-deepening negamax with alpha-beta pruning; moves ordered by the policy, network value at the leaves (`q_to_cp(W−L)`, clamped ±3000); exact mate/stalemate/draw detection. Nothing else (no TT, no cache, no extensions, no quiescence): every node is one network evaluation, ~1.2–1.8k nodes/s per core with 64×6, enough for short mates (Morphy's mate in 2 at depth 3 in <1 s). `wdl` in the info line = network W/D/L at the last PV position (exact for mate/draw), from the root side's view. Plain `go` without limits searches depth 3 |
 | `Searchless` | one evaluation, best legal policy move |
 
 A new mode is a new file in `search/`, a variant in `SearchMode` and an arm in `SearchMode::create`. `bench` runs `go depth 4` with `Mcts` (capped at 2,000 playouts per position) on the 9 bench positions and prints total playouts and overall nps. The count is deterministic but depends on the network (MCTS depth = average playout depth, which grows faster with a sharper policy): 17686 with the untrained `networks/default.pzn`, 4,000–7,000 with trained 64×6 networks (5–10 s). A new embedded network means a new bench number on OpenBench. On OpenBench, `option.SearchMode=AlphaBeta` or `option.SearchMode=Searchless` selects the other modes in games.
@@ -119,6 +119,16 @@ Single thread, Intel Xeon @ 2.8 GHz (AVX2), recurrent (g + f) evals/s:
 * tract is ~2× slower than onnxruntime at batch 1, and gets *slower* per eval with batching. So the engine searches with batch 1, and a hand-written SIMD forward pass is a clear later win (~2× from ORT parity alone).
 * At OpenBench STC (8+0.08, roughly 0.2–0.3 s per move): 64×6 gives ~150 simulations/move, 32×4 ~500. Gumbel search is designed to be useful in exactly that range.
 
+### 5.1b Hand-written SIMD inference (`crates/nn/src/fast.rs`, what the engine uses now)
+
+The engine evaluates the `initial` network (h + f) with its own kernels on x86-64; tract remains for the dynamics graph, the tests and non-x86 CPUs. Weights are read straight from the ONNX graph in the `.pzn` (minimal protobuf reader, `onnx.rs`; BatchNorm is already folded by the export), so every existing network works unchanged.
+
+* Activations square-major on a zero-padded 10×10 board (no edge checks), weights repacked per 16 output channels. Kernels: AVX-512 (8 squares × 32 channels = 16 zmm accumulators), AVX2/FMA (6 squares × 16 channels = 12 ymm), SSE2 floor (3 squares × 16 channels), chosen at runtime, so one binary runs on every x86-64 CPU. `PEAZERO_SIMD=sse2|avx2` forces a lower set (testing).
+* Matches tract to ~7e-5. AVX2 and AVX-512 are bit-identical (same fused multiply-adds in the same order), and the bench node count is the same with all three sets and as with tract (17686 with `networks/default.pzn`).
+* Batch 1, 64×6, Xeon @ 2.1 GHz (2 cores, shared VM, ±10%): tract ~1,100 µs/eval (~51 GFLOP/s); **AVX-512 ~540 µs (~105 GFLOP/s, 2.0–2.2×)**, AVX2 ~800 µs (~75 GFLOP/s, ~1.4×), SSE2 ~2,100 µs. Measured FMA peaks of that CPU: 90 GFLOP/s AVX2, 159 AVX-512. Engine `bench`: 962 → 1,695 nps (AVX-512), 1,223 (AVX2).
+* The engine binary no longer contains tract on x86-64: builds take seconds instead of minutes, need no C compiler, and the binary is 5 MB instead of 34 MB.
+* `cargo run --release -p peazero-nn --example latency -- net.pzn` compares all kernel sets with tract on any network.
+
 ### 5.2 GPU (RTX 3070)
 
 Run `python trainer/scripts/bench_gpu.py` on the 3070 and fill in:
@@ -136,7 +146,7 @@ Run `python trainer/scripts/bench_gpu.py` on the 3070 and fill in:
 | self-play & training | local, RTX 3070 | simplest loop; OpenBench workers are CPU-only |
 | trainer | own small PyTorch trainer; losses and tricks ported from LightZero's `gumbel_muzero` + the MuZero paper | frameworks are general-purpose and heavy; our chess-specific encodings/data format would fight them |
 | search | Rust port of mctx Gumbel MuZero | one implementation for self-play and the engine |
-| CPU inference (engine, OpenBench) | `tract` (pure Rust) | builds with plain `make` on any worker; SIMD forward pass later |
+| CPU inference (engine, OpenBench) | hand-written SIMD (`fast.rs`, x86-64), tract elsewhere | §5.1b; tract stays as reference and for the dynamics graph |
 | GPU inference (self-play only) | ONNX Runtime CUDA via the `ort` crate, behind a Cargo feature | OpenBench never builds it |
 | network format | two ONNX graphs (`initial.onnx`, `recurrent.onnx`) | exactly the two calls search makes |
 | first network | 64×6 (fallback 32×4 if self-play is too slow) | spike numbers above |

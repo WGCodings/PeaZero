@@ -6,9 +6,9 @@
 
 use std::sync::atomic::AtomicBool;
 
-use peazero_core::encoding::{encode_game, legal_actions, OBS_SIZE};
+use peazero_core::encoding::{encode_game, legal_actions, NUM_ACTIONS, OBS_SIZE};
 use peazero_core::{Game, Move};
-use peazero_nn::{wdl_probs, MuZeroNet};
+use peazero_nn::wdl_probs;
 
 use crate::engine::{CommonOptions, Engine, SearchLimits, SearchResult};
 use crate::search::{NetSearch, SearchContext, SearchMode};
@@ -24,18 +24,43 @@ pub struct Evaluation {
     pub wdl: [f32; 3],
 }
 
+/// x86-64: hand-written SIMD inference (peazero_nn::fast); other CPUs: tract.
+#[cfg(target_arch = "x86_64")]
+type Backend = peazero_nn::fast::FastNet;
+#[cfg(not(target_arch = "x86_64"))]
+type Backend = peazero_nn::MuZeroNet;
+
 pub struct PolicyNet {
-    net: MuZeroNet,
+    net: Backend,
     obs: Vec<f32>,
+    policy: Vec<f32>,
 }
 
 impl PolicyNet {
     pub fn from_pzn(bytes: &[u8]) -> Result<PolicyNet, String> {
-        let net = MuZeroNet::from_pzn(bytes, 1, false).map_err(|e| format!("{e:#}"))?;
+        #[cfg(target_arch = "x86_64")]
+        let net = peazero_nn::fast::FastNet::new(std::sync::Arc::new(
+            peazero_nn::fast::FastWeights::from_pzn(bytes)?,
+        ));
+        #[cfg(not(target_arch = "x86_64"))]
+        let net = peazero_nn::MuZeroNet::from_pzn(bytes, 1, false).map_err(|e| format!("{e:#}"))?;
         Ok(PolicyNet {
             net,
             obs: vec![0.0; OBS_SIZE],
+            policy: vec![0.0; NUM_ACTIONS],
         })
+    }
+
+    /// Which inference kernels are in use (for `info string`).
+    pub fn backend_name(&self) -> &'static str {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.net.simd().name()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            "tract"
+        }
     }
 
     pub fn embedded() -> PolicyNet {
@@ -47,13 +72,21 @@ impl PolicyNet {
     pub fn evaluate(&mut self, game: &Game) -> Evaluation {
         let legal = legal_actions(game.position());
         encode_game(game, &mut self.obs);
-        let out = self
-            .net
-            .initial(&self.obs)
-            .expect("network inference failed");
+        let mut value = [0.0f32; 3];
+        #[cfg(target_arch = "x86_64")]
+        self.net.evaluate(&self.obs, &mut self.policy, &mut value);
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let out = self
+                .net
+                .initial(&self.obs)
+                .expect("network inference failed");
+            self.policy.copy_from_slice(&out.policy);
+            value.copy_from_slice(&out.value);
+        }
         Evaluation {
-            moves: legal.iter().map(|&(a, m)| (m, out.policy[a])).collect(),
-            wdl: wdl_probs(&out.value),
+            moves: legal.iter().map(|&(a, m)| (m, self.policy[a])).collect(),
+            wdl: wdl_probs(&value),
         }
     }
 }
@@ -139,9 +172,12 @@ impl Engine for PolicyEngine {
                         .and_then(|b| PolicyNet::from_pzn(&b))
                     {
                         Ok(net) => {
+                            println!(
+                                "info string loaded network {value} ({} inference)",
+                                net.backend_name()
+                            );
                             self.net = net;
                             self.net_name = value.to_string();
-                            println!("info string loaded network {value}");
                         }
                         Err(e) => println!("info string failed to load {value}: {e}"),
                     }

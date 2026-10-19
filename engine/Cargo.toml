@@ -13,4 +13,11 @@ path = "src/main.rs"
 
 [dependencies]
 peazero-core = { path = "../crates/core" }
+
+# x86-64: hand-written SIMD inference only (no tract: faster builds, no C
+# compiler needed). Other CPUs (ARM): tract.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+peazero-nn = { path = "../crates/nn", default-features = false }
+
+[target.'cfg(not(target_arch = "x86_64"))'.dependencies]
 peazero-nn = { path = "../crates/nn" }
