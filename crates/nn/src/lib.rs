@@ -25,6 +25,8 @@ pub mod fast;
 pub mod onnx;
 #[cfg(feature = "tract")]
 mod tract_net;
+#[cfg(target_arch = "x86_64")]
+mod winograd;
 
 #[cfg(feature = "tract")]
 pub use tract_net::{MuZeroNet, NetOutput, TractResult};
