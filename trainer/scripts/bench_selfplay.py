@@ -48,10 +48,10 @@ def make_pools(args, games, n_pools):
             for i, n in enumerate(sizes)]
 
 
-def raw_forward(net, dev, batch, graphs, amp, reps=50):
+def raw_forward(net, dev, batch, graphs, amp, reps=50, cl=False):
     """Network-only throughput (evaluations/s) at one batch size."""
     pool = make_pools(ARGS, batch, 1)
-    r = SearchRunner(pool, dev, amp, cuda_graphs=graphs)
+    r = SearchRunner(pool, dev, amp, cuda_graphs=graphs, channels_last=cl)
     r.set_net(net)
     s = r.slots[0]
     s.obs_h.zero_()
@@ -66,12 +66,12 @@ def raw_forward(net, dev, batch, graphs, amp, reps=50):
     return batch * reps / (time.perf_counter() - t)
 
 
-def check_graph(net, dev, amp):
+def check_graph(net, dev, amp, cl=False):
     """Same requests through eager and graphed inference: max |difference|."""
     pools = make_pools(ARGS, 256, 1)
     eager = SearchRunner(pools, dev, amp, cuda_graphs=False)
     eager.set_net(net)
-    graph = SearchRunner(pools, dev, amp, cuda_graphs=True)
+    graph = SearchRunner(pools, dev, amp, cuda_graphs=True, channels_last=cl)
     graph.set_net(net)
     if not graph.graphs:
         return None
@@ -85,14 +85,14 @@ def check_graph(net, dev, amp):
     return max(float((se.logits_h - sg.logits_h).abs().max()), float((se.value_h - sg.value_h).abs().max()))
 
 
-def run_variant(name, net, dev, amp, games, pools, graphs, plain=False):
+def run_variant(name, net, dev, amp, games, pools, graphs, plain=False, cl=False):
     ps = make_pools(ARGS, games, max(1, pools))
     if plain:
         sp = ps[0]
         step = lambda: search_step(net, sp, dev, amp)  # noqa: E731
         stats = sp.stats
     else:
-        r = SearchRunner(ps, dev, amp, cuda_graphs=graphs)
+        r = SearchRunner(ps, dev, amp, cuda_graphs=graphs, channels_last=cl)
         r.set_net(net)
         step, stats = r.step, r.stats
     t_end = time.perf_counter() + ARGS.warmup
@@ -137,6 +137,8 @@ def main():
     ap.add_argument("--seconds", type=float, default=20, help="measured seconds per variant")
     ap.add_argument("--warmup", type=float, default=8, help="unmeasured seconds per variant first")
     ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--only-new", action="store_true",
+                    help="self-play: only the best variant and the channels_last variant")
     ap.add_argument("--cpu", action="store_true", help=argparse.SUPPRESS)  # plumbing test without a GPU
     ARGS = ap.parse_args()
     cfg = {}
@@ -159,6 +161,11 @@ def main():
         network_only(net, dev, amp)
     g = ARGS.games
     print(f"\nself-play ({ARGS.warmup:.0f}s warm-up + {ARGS.seconds:.0f}s each):")
+    if ARGS.only_new:
+        a = run_variant("pinned + graphs, 2 pools", net, dev, amp, g, 2, True)
+        b = run_variant("graphs + channels_last, 2 pools", net, dev, amp, g, 2, True, cl=True)
+        print(f"\nchannels_last: {b['moves_per_second'] / a['moves_per_second']:.2f}x")
+        return
     results = [
         run_variant("plain loop (current)", net, dev, amp, g, 1, False, plain=True),
         run_variant("pinned, 1 pool", net, dev, amp, g, 1, False),
@@ -166,6 +173,7 @@ def main():
         run_variant("pinned, 2 pools", net, dev, amp, g, 2, False),
         run_variant("pinned + graphs, 2 pools", net, dev, amp, g, 2, True),
         run_variant(f"pinned + graphs, 2 pools, {2 * g} games", net, dev, amp, 2 * g, 2, True),
+        run_variant("graphs + channels_last, 2 pools", net, dev, amp, g, 2, True, cl=True),
     ]
     base = results[0]["moves_per_second"]
     print("\nspeed-up vs plain loop: " + ", ".join(
@@ -177,9 +185,14 @@ def network_only(net, dev, amp):
     for b in (512, 1024, 2048):
         e = raw_forward(net, dev, b, False, amp)
         g = raw_forward(net, dev, b, True, amp)
-        print(f"  batch {b:4d}: eager {e:9,.0f}   CUDA graph {g:9,.0f}   ({g / e:.2f}x)", flush=True)
+        c = raw_forward(net, dev, b, True, amp, cl=True)
+        print(f"  batch {b:4d}: eager {e:9,.0f}   CUDA graph {g:9,.0f} ({g / e:.2f}x)   "
+              f"graph + channels_last {c:9,.0f} ({c / e:.2f}x)", flush=True)
     diff = check_graph(net, dev, amp)
     print("  graph vs eager outputs: " + ("capture failed" if diff is None else f"max |diff| {diff:.2e}"))
+    diff = check_graph(net, dev, amp, cl=True)
+    print("  graph + channels_last vs eager: " + ("capture failed" if diff is None else f"max |diff| {diff:.2e}")
+          + " (other kernels: small fp16 differences are expected)")
 
 
 if __name__ == "__main__":

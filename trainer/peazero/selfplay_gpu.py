@@ -32,6 +32,7 @@ statistics.
 """
 from __future__ import annotations
 
+import copy
 import time
 import warnings
 from types import SimpleNamespace
@@ -56,12 +57,15 @@ def merge_stats(stats: list[dict]) -> dict:
 
 
 class SearchRunner:
-    def __init__(self, pools, device: torch.device, amp: bool, cuda_graphs: bool = True):
+    def __init__(self, pools, device: torch.device, amp: bool, cuda_graphs: bool = True,
+                 channels_last: bool = False):
         self.pools = list(pools)
         self.dev = device
         self.amp = amp and device.type == "cuda"
         self.cuda = device.type == "cuda"
         self.graphs_wanted = cuda_graphs and self.cuda
+        # NHWC layout: lets cuDNN pick its tensor-core convolution kernels
+        self.channels_last = channels_last and self.cuda
         self.graphs = False  # True once capture succeeded
         self.net = None
         self.slots = [self._slot(p) for p in self.pools]
@@ -92,6 +96,8 @@ class SearchRunner:
             ctx = torch.autocast("cuda", dtype=torch.float16, cache_enabled=False)
         else:
             ctx = torch.autocast(self.dev.type, enabled=False)
+        if self.channels_last:
+            obs = obs.contiguous(memory_format=torch.channels_last)
         with ctx:
             _, policy, value = self.net.initial_inference(obs)
         legal = (s.legal_d if self.cuda else s.legal_h).long()
@@ -105,7 +111,9 @@ class SearchRunner:
             torch.cuda.synchronize()
         for s in self.slots:
             s.graph, s.out = None, None
-        self.net = net
+        # channels_last: a private copy, so the caller's network (export,
+        # eval_metrics) keeps its normal layout
+        self.net = copy.deepcopy(net).to(memory_format=torch.channels_last) if self.channels_last else net
         self.graphs = False
         if not self.graphs_wanted:
             return

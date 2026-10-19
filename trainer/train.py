@@ -164,6 +164,9 @@ def parse_args():
     ap.add_argument("--cuda-graphs", action=argparse.BooleanOptionalAction, default=True,
                     help="self-play inference as recorded CUDA graphs (one launch per evaluation batch); "
                          "--no-cuda-graphs = eager PyTorch")
+    ap.add_argument("--channels-last", action=argparse.BooleanOptionalAction, default=True,
+                    help="self-play inference in NHWC memory layout (cuDNN tensor-core kernels; 1.25x "
+                         "on an RTX 3070); --no-channels-last = normal layout (this session only)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-amp", action="store_true", help="disable fp16 autocast on CUDA")
     ap.add_argument("--dashboard-port", type=int, default=8765, help="live dashboard port; 0 = no dashboard")
@@ -459,7 +462,8 @@ def train(args, status):
         if args.pools > 0:
             if not hasattr(pools[0], "requests_into"):
                 sys.exit("peazero_rs is out of date (no requests_into); run `pip install ./crates/py`")
-            runner = SearchRunner(pools, dev, amp, cuda_graphs=args.cuda_graphs)
+            runner = SearchRunner(pools, dev, amp, cuda_graphs=args.cuda_graphs,
+                                  channels_last=args.channels_last)
             sp = runner
         else:
             sp = PlainPool(pools[0])
@@ -467,6 +471,7 @@ def train(args, status):
         if runner:
             mode += (f", {n_pools} pipelined pools" if n_pools > 1 else ", 1 pool")
             mode += ", CUDA graphs" if runner.graphs_wanted else ""
+            mode += ", channels_last" if runner.channels_last else ""
         else:
             mode += ", plain loop"
     else:

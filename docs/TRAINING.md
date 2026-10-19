@@ -53,6 +53,7 @@ Defaults for a new run (`python train.py --help`):
 | `--puzzles` | `trainer/data/puzzles.csv` | puzzle set (this session only; `none` = no puzzles) |
 | `--pools` | 2 | self-play speed, same results (this session only): the games are split over 2 pools so the GPU evaluates one while the CPU searches the other; 1 = one pool; 0 = the old plain loop. See Speed |
 | `--cuda-graphs` | on | self-play inference as recorded CUDA graphs (one launch per batch); `--no-cuda-graphs` = eager PyTorch (this session only) |
+| `--channels-last` | on | self-play inference in NHWC memory layout (cuDNN tensor-core kernels, 1.25× on the 3070); `--no-channels-last` = normal layout (this session only) |
 
 ## Keeping the games (viriformat)
 
@@ -185,7 +186,21 @@ Measure on your machine (stop training first, ~4 minutes):
 ```powershell
 python scripts\bench_selfplay.py --run ..\runs\fourth
 ```
-It prints the network's raw speed with and without CUDA graphs, checks that both give the same outputs, and the moves/s of the old loop vs. each combination.
+It prints the network's raw speed with and without CUDA graphs, checks that both give the same outputs, and the moves/s of the old loop vs. each combination (`--only-new`: just the default vs. `--channels-last`).
+
+Measured on the RTX 3070 (64×6, gen 2261 of `fourth`, 1024 games, 64 simulations, 8 threads):
+
+| variant | moves/s | |
+|---|---|---|
+| plain loop (before) | 2014 | |
+| pinned, 1 pool | 2262 | 1.12× |
+| pinned + graphs, 1 pool | 2318 | 1.15× |
+| pinned, 2 pools (no graphs) | 2003 | 0.99×: Python spends 82 % of the time launching kernels |
+| **pinned + graphs, 2 pools (default)** | **2740** | **1.36×** |
+| same with 2048 games | 2867 | 1.42× |
+| **+ channels_last (default)** | **3501** | **1.74×** |
+
+Network alone at batch 512: eager 156k evaluations/s, CUDA graph 177k, graph + channels_last 228k (identical outputs). Self-play is limited by the network itself: 3501 moves/s × 65 evaluations ≈ 228k evaluations/s, exactly that speed; the Rust work is fully hidden behind it (63 % of the time is waiting for the GPU). Further self-play gains need a faster network on the GPU or fewer evaluations per move (tree reuse, playout cap randomization). 2048 games adds 5 % but games then span more generations; 1024 stays the default.
 
 ## Known limits (next sprint candidates)
 
