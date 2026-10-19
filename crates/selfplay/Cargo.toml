@@ -9,3 +9,7 @@ license.workspace = true
 [dependencies]
 peazero-core = { path = "../core" }
 rayon = "1.10"
+
+[dev-dependencies]
+# cross-check of the viriformat export against the reference implementation
+viriformat = "3"

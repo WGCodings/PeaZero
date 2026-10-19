@@ -5,6 +5,12 @@ EXE      := peazero
 EVALFILE ?= networks/default.pzn
 export EVALFILE
 
+# OpenBench passes the engine's compiler (cargo) as CC. Don't hand that to
+# cargo: build scripts (tract-linalg's assembly kernels, via the cc crate)
+# would try to run "cargo" as their C compiler. Without CC they find the
+# system C compiler themselves.
+unexport CC CXX
+
 ifeq ($(OS),Windows_NT)
 	NAME := $(EXE).exe
 else
