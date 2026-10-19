@@ -22,8 +22,8 @@ Run directory layout:
 
 --qat (quantisation-aware training): the engine runs the residual blocks in
 int8 (crates/nn/src/int8.rs); with --qat the trainer rounds weights and
-activations the same way in every forward pass, so the network learns to
-play well after rounding. Best switched on for a run's last stretch, e.g.
+activations the same way in every training step, so the network learns to
+play well after rounding (self-play stays float, at full speed). Best switched on for a run's last stretch, e.g.
 together with the final learning-rate drop. Every generation logs
 int8_agreement (same best move, int8 vs float) either way.
 
@@ -133,8 +133,8 @@ def parse_args():
     ap.add_argument("--q-ratio", type=float,
                     help="value target = (1-q)·game result + q·search value (needs data format v2)")
     ap.add_argument("--qat", action=argparse.BooleanOptionalAction,
-                    help="quantisation-aware training: simulate the engine's int8 residual blocks in every "
-                         "forward pass (training and self-play) so the net learns weights that survive "
+                    help="quantisation-aware training: simulate the engine's int8 residual blocks in the "
+                         "training steps (self-play stays float) so the net learns weights that survive "
                          "rounding; --no-qat turns it off")
     ap.add_argument("--seed", type=int)
     # strength evaluation
@@ -344,6 +344,17 @@ def main():
         stop_evaluator(evaluator, finish=finished)
 
 
+def selfplay_nets(net, replay, dev, amp):
+    """calibrate_bn copies for self-play and export. With --qat the
+    BatchNorm statistics are measured through the int8 simulation (what the
+    engine runs), but self-play itself uses the float network: QAT only in
+    the training steps, so self-play keeps its full speed."""
+    init_net, rec_net = calibrate_bn(net, replay, dev, amp)
+    init_net.set_qat(False)
+    rec_net.set_qat(False)
+    return init_net, rec_net
+
+
 def train(args, status):
     dev = torch.device(args.device)
     amp = not args.no_amp and dev.type == "cuda"
@@ -427,7 +438,7 @@ def train(args, status):
                   session_start_generation=gen, replay_positions=replay.positions)
     # Self-play and export use eval-mode copies with recalibrated BatchNorm
     # statistics (train_lib.calibrate_bn), never `net` itself in eval mode.
-    init_net, rec_net = calibrate_bn(net, replay, dev, amp)
+    init_net, rec_net = selfplay_nets(net, replay, dev, amp)
 
     while gen < args.generations:
         gen += 1
@@ -507,7 +518,7 @@ def train(args, status):
         # ---------------------------------------------------------------- save
         status.update(force=True, phase="saving", steps_done=n_steps, step=step)
         net.eval()
-        init_net, rec_net = calibrate_bn(net, replay, dev, amp)
+        init_net, rec_net = selfplay_nets(net, replay, dev, amp)
         ev = eval_metrics(init_net, rec_net, replay, dev, amp)
         net_path = os.path.join(args.run, "nets", f"gen_{gen:04d}.pzn")
         export_pzn(init_net, net_path, rec_net)
