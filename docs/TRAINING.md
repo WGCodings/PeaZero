@@ -41,6 +41,7 @@ Defaults for a new run (`python train.py --help`):
 | `--unroll` | 0 | AlphaZero-style training: no dynamics unroll (self-play and the engine don't use the dynamics network); training ~4× cheaper than K = 5 |
 | `--reuse` | 2.0 | average times each new position is trained on |
 | `--games`, `--positions-per-gen`, `--batch`, `--replay` | 1024, 100k, 512, 1M | |
+| `--qat` | off | quantisation-aware training: the trainer simulates the engine's int8 residual blocks, so the network learns weights that still play well after rounding (below); `--no-qat` turns it off again |
 | `--viriformat` | off | keep all self-play games: each generation is appended to `runs/<name>/<name>.vf` (viriformat) before its data folder is deleted; `--no-viriformat` turns it off again |
 | `--keep-nets` | 25 | keep the network of every 25th generation (plus every evaluation milestone and the newest), delete the rest, also the ones already on disk; 0 = keep all |
 | `--eval-every` | 25 | strength evaluation every 25 generations (match + puzzles, below); 0 = off |
@@ -61,6 +62,18 @@ With `--viriformat` every generation's games are converted to **viriformat** (th
 * Appends are crash-safe (`<name>.vf.json` records the size after each complete generation; an interrupted append is cut off next time). If you move the `.vf` away, a new one starts; generations already exported aren't repeated.
 * Data folders still on disk (the newest ~20 generations) are exported when they are deleted later, or by hand while training is stopped: `python -m peazero.vf_export --run ..\runs\fourth`.
 * Generations deleted before you turned this on can't be recovered.
+
+## Quantisation-aware training (`--qat`)
+
+On CPUs with AVX2 the engine runs the residual blocks in int8 (docs/MUZERO.md §5.1c). Rounding a float-trained net costs accuracy: gen 2000 of `fourth` matches its own float output's best move in only 95 % of positions. With `--qat` the trainer rounds the same way in every forward pass, so the network adapts to the rounding instead of being surprised by it.
+
+* What it simulates, exactly like `crates/nn/src/int8.rs`: weights rounded to −127..127 with one scale per output channel (max |w| / 127), activations rounded to 0..127 with one scale per convolution input and per position (max / 127). Only the 12 residual-block convolutions of the representation network: stem, heads, bias, residual and ReLU stay float in the engine too. The PyTorch simulation matches the engine's int8 output to ~1e-5 (checked on 300 positions).
+* How it trains through rounding: straight-through estimator. The forward pass sees the rounded values, the backward pass treats rounding as the identity, so the float "shadow" weights keep getting gradients and drift toward values whose rounded version gives the lowest loss.
+* Self-play uses the simulated int8 network too, so the generated data matches what the engine plays. The exported `.pzn` keeps float weights; the engine rounds them to the same integers. Float-only CPUs (no AVX2) run the float weights, which stay a good network.
+* Cost: about 10–25 % slower training steps (a few extra element-wise operations per convolution); self-play slightly slower. No change to the checkpoint format, so it can be switched on or off on `--resume` at any time.
+* When: for the last stretch of a run, together with a low learning rate: `python train.py --run ..\runs\fourth --resume --lr 1e-4 --qat`. Rounding steps are small (~1/127 of a channel's largest weight), so the net can only settle into them when the weights stop moving much; at high learning rates the updates just jump across them.
+* Measured (offline, gen 2000 of `fourth` fine-tuned toward its own float output on random-game positions, Adam lr 1e-5, 600 steps of 256): int8 vs float policy KL 0.0096 → 0.0073 (−25 %), value |W−L| difference 0.025 → 0.011 (−55 %); a float-trained control stayed at 0.0094 / 0.026. Same best move stayed ~95 %: most of the remaining disagreements are near-ties between two moves. At lr 1e-4 this fine-tuning got worse (the loss being matched is tiny, so batch noise dominates). In real training the gain should be larger than in this small test, but the SPRT decides: QAT net in int8 vs the plain net in int8.
+* Every generation logs `int8_agreement` (same best move, simulated int8 vs float, on replay positions) and `int8_value_diff` (mean |W−L| difference), with or without `--qat`; the console line shows `int8 xx.x%`. With `--qat` the `exported p/v` losses are the int8 losses, i.e. what the engine actually plays with.
 
 ## Strength evaluation
 

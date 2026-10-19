@@ -146,6 +146,8 @@ const CHARTS = [
              { name: "exported net (eval mode)", key: "eval_value_loss", color: "--c5" }] },
   { id: "agree", title: "Policy agreement", hint: "net's top move = target's top move",
     pct: true, series: [{ name: "agreement", key: "policy_agreement", color: "--c1" }] },
+  { id: "int8", title: "Int8 agreement", hint: "engine's int8 path vs float: same best move (rises with --qat)",
+    pct: true, series: [{ name: "same best move", key: "int8_agreement", color: "--c5" }] },
   { id: "results", title: "Self-play results", hint: "share of finished games", pct: true, min0: true,
     series: [{ name: "white wins", get: (r) => frac(r, "white_wins"), color: "--c3" },
              { name: "draws", get: (r) => frac(r, "draws"), color: "--c6" },

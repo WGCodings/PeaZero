@@ -20,6 +20,13 @@ Run directory layout:
   <run>/evals.jsonl            strength evaluation (matches, puzzles; see below)
   <run>/data/gen_XXXX/*.bin    self-play games (data format v2)
 
+--qat (quantisation-aware training): the engine runs the residual blocks in
+int8 (crates/nn/src/int8.rs); with --qat the trainer rounds weights and
+activations the same way in every forward pass, so the network learns to
+play well after rounding. Best switched on for a run's last stretch, e.g.
+together with the final learning-rate drop. Every generation logs
+int8_agreement (same best move, int8 vs float) either way.
+
 Settings: every run stores its settings in config.json. --resume reuses
 them; a flag given on the command line overrides the stored value and is
 saved. Settings that an older run never recorded keep that run's original
@@ -73,7 +80,7 @@ DEFAULTS = {
     # training
     "batch": 512, "unroll": 0, "reuse": 2.0, "lr": 1e-3, "weight_decay": 1e-4, "warmup": 500,
     "replay": 1_000_000, "keep_data_gens": -1, "keep_nets": 25, "viriformat": False,
-    "q_ratio": 0.5, "seed": 0,
+    "q_ratio": 0.5, "qat": False, "seed": 0,
     # background strength evaluation (CPU)
     "eval_every": 25, "match_games": 100, "match_tc": "8+0.08", "match_search_mode": "Mcts",
     "match_simulations": 0, "eval_threads": 4,
@@ -125,6 +132,10 @@ def parse_args():
                          "replay buffer on --resume, 0 = keep everything")
     ap.add_argument("--q-ratio", type=float,
                     help="value target = (1-q)·game result + q·search value (needs data format v2)")
+    ap.add_argument("--qat", action=argparse.BooleanOptionalAction,
+                    help="quantisation-aware training: simulate the engine's int8 residual blocks in every "
+                         "forward pass (training and self-play) so the net learns weights that survive "
+                         "rounding; --no-qat turns it off")
     ap.add_argument("--seed", type=int)
     # strength evaluation
     ap.add_argument("--eval-every", type=int,
@@ -359,6 +370,9 @@ def train(args, status):
         cfg = NetConfig(**ckpt["config"])
         gen, step = ckpt["generation"], ckpt["step"]
     net = MuZeroNet(cfg).to(dev)
+    net.set_qat(args.qat)
+    if args.qat and not net.qat:
+        print(f"--qat: {cfg.channels} channels is not a multiple of 32, the engine uses float; QAT off")
     # fused: one CUDA kernel for the whole update; same optimizer state as the default
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay,
                             fused=dev.type == "cuda")
@@ -508,7 +522,7 @@ def train(args, status):
             "selfplay_seconds": round(sp_time, 1), "train_seconds": round(train_time, 1),
             "moves_per_second": round(moves / sp_time), "new_games": new_games, "new_positions": new_positions,
             "avg_game_length": round(new_positions / max(new_games, 1), 1),
-            "results": d, "terminations": terms, "replay_positions": replay.positions, **avg, **ev,
+            "results": d, "terminations": terms, "replay_positions": replay.positions, "qat": net.qat, **avg, **ev,
         }
         log(args.run, record)
         print(f"gen {gen:4d} | selfplay {sp_time:6.1f}s {moves / sp_time:7.0f} mv/s "
@@ -516,7 +530,9 @@ def train(args, status):
               f"len {record['avg_game_length']}) | train {n_steps} steps {train_time:6.1f}s "
               f"loss {avg['loss']:.3f} (p {avg['policy_loss']:.3f} v {avg['value_loss']:.3f} "
               f"agree {avg['policy_agreement']:.2f}) | exported p {ev.get('eval_policy_loss', 0):.3f} "
-              f"v {ev.get('eval_value_loss', 0):.3f} | {net_path}")
+              f"v {ev.get('eval_value_loss', 0):.3f}"
+              + (f" | int8 {ev['int8_agreement'] * 100:.1f}%" if "int8_agreement" in ev else "")
+              + f" | {net_path}")
 
 
 if __name__ == "__main__":

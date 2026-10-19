@@ -32,6 +32,38 @@ class NetConfig:
     value_hidden: int = 128
 
 
+# ---------------------------------------------------------------------------
+# Quantisation-aware training (QAT): simulate the engine's int8 residual
+# blocks (crates/nn/src/int8.rs) in the forward pass, so the network learns
+# weights whose rounded version plays well. Straight-through estimator: the
+# forward pass sees the rounded values, the gradient passes through as if
+# rounding were the identity.
+#
+# Engine (per residual-block convolution):
+#   weights     w_q = round(w / s_w) in -127..127, s_w = max|w[co]| / 127 per
+#               output channel. BatchNorm folding multiplies each output
+#               channel by one constant, so quantising the unfolded weight
+#               gives exactly the same integers.
+#   activations x_q = round(x · 127 / max x) in 0..127, one scale per
+#               convolution input per position (dynamic, no calibration).
+#   bias, residual add, ReLU, stem and heads stay float.
+QMAX = 127.0
+
+
+def fake_quant_weight(w: torch.Tensor) -> torch.Tensor:
+    w32 = w.float()
+    s = (w32.abs().amax(dim=(1, 2, 3), keepdim=True) / QMAX).clamp(min=1e-12).detach()
+    q = torch.round(w32 / s).clamp(-QMAX, QMAX) * s
+    return (w32 + (q - w32).detach()).to(w.dtype)
+
+
+def fake_quant_act(x: torch.Tensor) -> torch.Tensor:
+    x32 = x.float()
+    s = (x32.flatten(1).amax(dim=1).view(-1, 1, 1, 1) / QMAX).clamp(min=1e-12).detach()
+    q = torch.round(x32 / s).clamp(0.0, QMAX) * s
+    return (x32 + (q - x32).detach()).to(x.dtype)
+
+
 class ResBlock(nn.Module):
     def __init__(self, c: int):
         super().__init__()
@@ -39,8 +71,13 @@ class ResBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(c)
         self.conv2 = nn.Conv2d(c, c, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(c)
+        self.qat = False  # simulate the engine's int8 convolutions (MuZeroNet.set_qat)
 
     def forward(self, x):
+        if self.qat:
+            y = F.relu(self.bn1(F.conv2d(fake_quant_act(x), fake_quant_weight(self.conv1.weight), padding=1)))
+            y = self.bn2(F.conv2d(fake_quant_act(y), fake_quant_weight(self.conv2.weight), padding=1))
+            return F.relu(x + y)
         y = F.relu(self.bn1(self.conv1(x)))
         y = self.bn2(self.conv2(y))
         return F.relu(x + y)
@@ -108,6 +145,18 @@ class MuZeroNet(nn.Module):
         self.representation = Representation(cfg)
         self.dynamics = Dynamics(cfg)
         self.prediction = Prediction(cfg)
+
+    def set_qat(self, on: bool) -> None:
+        """Simulate int8 in the representation's residual blocks: the ones
+        the engine quantises (it only runs `initial`). The engine skips int8
+        when the channel count isn't a multiple of 32, so does this."""
+        on = on and self.cfg.channels % 32 == 0
+        for b in self.representation.blocks:
+            b.qat = on
+
+    @property
+    def qat(self) -> bool:
+        return any(b.qat for b in self.representation.blocks)
 
     def initial_inference(self, obs):
         s = self.representation(obs)
@@ -183,6 +232,10 @@ def export_onnx(net: MuZeroNet, out_dir: str, opset: int = 17) -> None:
 
     os.makedirs(out_dir, exist_ok=True)
     was_training = net.training
+    # Exported with float weights: the engine does the rounding itself (same
+    # integers), and the float paths (non-AVX2 CPUs, tract) need the plain graph.
+    was_qat = net.qat
+    net.set_qat(False)
     # Wrappers must be in eval mode too: torch.onnx.export restores the
     # wrapper's mode afterwards, and .train() would propagate into `net`.
     initial, recurrent = _Initial(net).eval(), _Recurrent(net).eval()
@@ -207,3 +260,4 @@ def export_onnx(net: MuZeroNet, out_dir: str, opset: int = 17) -> None:
             opset_version=opset, dynamo=False,
         )
     net.train(was_training)
+    net.set_qat(was_qat)

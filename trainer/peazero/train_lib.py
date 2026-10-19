@@ -184,7 +184,11 @@ def calibrate_bn(net: MuZeroNet, replay, device: torch.device, amp: bool,
 def eval_metrics(init_net: MuZeroNet, rec_net: MuZeroNet, replay, device: torch.device, amp: bool,
                  batches: int = 4, batch_size: int = 1024) -> dict:
     """Losses of the networks exactly as exported (eval mode): root and the
-    first dynamics step. Should be close to the training losses."""
+    first dynamics step. Should be close to the training losses. With QAT on
+    these are the int8 (engine) losses.
+
+    int8_agreement / int8_value_diff: same best move and mean |W-L|
+    difference between the int8 simulation and the float network."""
     out = {"eval_policy_loss": 0.0, "eval_value_loss": 0.0,
            "eval_policy_loss_k1": 0.0, "eval_value_loss_k1": 0.0}
     if replay.positions == 0:
@@ -203,4 +207,18 @@ def eval_metrics(init_net: MuZeroNet, rec_net: MuZeroNet, replay, device: torch.
             out[pk] += float((-(target * logp).sum(-1) * pm).sum() / pm.sum().clamp(min=1)) / batches
             vl = F.cross_entropy(v.float(), t["value_target"][:, k], reduction="none")
             out[vk] += float((vl * vm).sum() / vm.sum().clamp(min=1)) / batches
+        if init_net.cfg.channels % 32 == 0:
+            # How well the engine's int8 path will match the float network
+            # (the same comparison as `cargo run --example accuracy`).
+            qat = init_net.qat
+            init_net.set_qat(not qat)
+            with autocast(device, amp):
+                _, p_other, v_other = init_net.initial_inference(t["obs"])
+            init_net.set_qat(qat)
+            pq, vq, pf, vf = (p_other, v_other, p0, v0) if not qat else (p0, v0, p_other, v_other)
+            out["int8_agreement"] = out.get("int8_agreement", 0.0) + float(
+                (pq.float().argmax(-1) == pf.float().argmax(-1)).float().mean()) / batches
+            wl = lambda v: (lambda p: p[:, 0] - p[:, 2])(F.softmax(v.float(), dim=-1))
+            out["int8_value_diff"] = out.get("int8_value_diff", 0.0) + float(
+                (wl(vq) - wl(vf)).abs().mean()) / batches
     return out
