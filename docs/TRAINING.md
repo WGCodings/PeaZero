@@ -168,6 +168,10 @@ gen   12 | selfplay  20.1s  5100 mv/s  520 games (W80 D360 B80, len 192.3) | tra
 | `agree` | how often the network's top move equals the target's top move | rises |
 | `policy_loss_unrolled`, `value_loss_unrolled` (in `metrics.jsonl`) | the same losses on the dynamics network's imagined positions | should follow the root losses; if they stay much higher, the dynamics network isn't learning |
 
+## Capacity check (is the net too small?)
+
+`python scripts\capacity_check.py --run ..\runs\fourth` trains a 64×6 and a 128×10 from scratch, supervised, for the same number of steps on the run's data still on disk, and compares their loss on the newest 2 generations (held out, never trained on); the run's own network is measured on the same positions. A clearly lower held-out loss for the bigger net means the 64×6 is capacity-limited. Train loss far below held-out loss means over-fitting; the best held-out point counts (early stopping). Each net's best point is saved to `runs/<name>/capacity/<CxB>/` as `checkpoint.pt` (warm start for a new run) and `net.pzn` (SPRT). `--nets 64x6,96x8,128x10` tries more sizes. Stop training first (needs the GPU); ~25 minutes on the 3070.
+
 ## Testing a network
 
 * Locally: `setoption name EvalFile value C:\...\runs\first\nets\gen_0010.pzn`, or embed it with `make EXE=pz EVALFILE=...`.
