@@ -19,10 +19,10 @@ use crate::engine::{CommonOptions, SearchLimits};
 use crate::policy::PolicyNet;
 use crate::search::{mcts, SearchContext};
 
-pub const BENCH_DEPTH: u32 = 4;
+pub const BENCH_DEPTH: u32 = 10;
 /// Per-position playout cap: a flat (e.g. untrained) policy deepens the
 /// tree very slowly, so without it the bench could run for minutes.
-pub const BENCH_MAX_NODES: u64 = 2_000;
+pub const BENCH_MAX_NODES: u64 = 20_000;
 
 pub const BENCH_FENS: &[&str] = &[
     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
