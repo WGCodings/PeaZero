@@ -212,6 +212,15 @@ Training is unchanged (K-step unroll still trains the dynamics network; with `--
 * **`--unroll 0`** for new runs: AlphaZero-style loss on the root position only; the dynamics network is still in the model but no longer trained.
 * Run settings are stored in `config.json` and reused by `--resume`; settings missing from an older run's config keep that run's original behaviour.
 
+## 6.5 Playout cap randomization (KataGo; `--fast-simulations`)
+
+Policy targets want deep searches, value targets want many independent games. With `--fast-simulations N` (0 = off) each move is a **full** search (`--simulations`, `--considered`) with probability `--full-prob` (0.25), otherwise a **fast** search (N simulations, `--fast-considered` 8). Only full-search plies are training samples; every ply is still stored, so viriformat export and unrolling see complete games.
+
+* `search.rs`: the slot draws full/fast when its root is evaluated (with PCR off nothing is drawn, so games are byte-identical to before), using separate Sequential Halving tables. Both use the same Gumbel noise schedule (noise in the first `--noise-plies` keeps openings varied).
+* **Data format v3** (`record.rs`): v2's per-ply `has_value` byte becomes a flags byte (bit 0 = search value present, bit 1 = fast search). v1 and v2 are still read (all plies full); older binaries reject v3 instead of misreading it.
+* `replay.rs`: samples are drawn only at full-search plies; `positions()` and the capacity count training samples. Fast plies keep their move and value targets for unrolling (policy masked) but drop their policy targets in memory.
+* Cost per move (evaluations): full share × (full + 1) + fast share × (fast + 1); 25 % × 201 + 75 % × 33 ≈ 75 for 200/32, vs 65 for 64 on every move. Training samples per move: 25 %.
+
 ## 7. Reference implementations reviewed
 
 | project | what we take | what we don't |

@@ -18,6 +18,14 @@
 //! * Move played: Sequential Halving winner; policy target:
 //!   `softmax(logits + σ(q̂))` at the root.
 //!
+//! Playout cap randomization (KataGo; `fast_simulations > 0`): each move is
+//! a *full* search (`simulations`, `considered`) with probability
+//! `full_prob`, otherwise a *fast* search (`fast_simulations`,
+//! `fast_considered`). Fast moves just keep the game going cheaply: they are
+//! recorded with `full_search = false` and are not training samples, so
+//! every policy target comes from a full search while games (the value
+//! signal) stay cheap. Both use the same Gumbel noise schedule.
+//!
 //! The pool is stepped in lock-step rounds so the GPU sees full batches:
 //! every round each game asks for exactly one evaluation (its next leaf, or
 //! the root of its next move). A move takes about `n + 1` rounds.
@@ -51,6 +59,38 @@ pub struct SearchConfig {
     /// after that `late_gumbel_scale` is used. 0 = full noise all game.
     pub noise_plies: usize,
     pub late_gumbel_scale: f32,
+    /// Playout cap randomization: simulations of a fast move; 0 = off
+    /// (every move is a full search).
+    pub fast_simulations: usize,
+    /// Probability that a move gets the full search (with fast moves on).
+    pub full_prob: f32,
+    /// Sequential Halving width of a fast search.
+    pub fast_considered: usize,
+}
+
+impl SearchConfig {
+    fn pcr(&self) -> bool {
+        self.fast_simulations > 0 && self.full_prob < 1.0
+    }
+}
+
+/// Considered-visit tables for the full and the fast search.
+pub(crate) struct Tables {
+    full: Vec<Vec<u32>>,
+    fast: Vec<Vec<u32>>,
+}
+
+impl Tables {
+    pub(crate) fn new(cfg: &SearchConfig) -> Tables {
+        Tables {
+            full: considered_visits_table(cfg.gumbel.considered, cfg.simulations),
+            fast: if cfg.pcr() {
+                considered_visits_table(cfg.fast_considered.max(1), cfg.fast_simulations)
+            } else {
+                Vec::new()
+            },
+        }
+    }
 }
 
 impl Default for SearchConfig {
@@ -64,6 +104,9 @@ impl Default for SearchConfig {
             threads: 1,
             noise_plies: 0,
             late_gumbel_scale: 0.0,
+            fast_simulations: 0,
+            full_prob: 0.25,
+            fast_considered: 8,
         }
     }
 }
@@ -258,6 +301,8 @@ pub(crate) struct Slot {
     nodes: Vec<Node>,
     root_gumbel: Vec<f32>,
     simulations_done: usize,
+    /// This move gets the full search (playout cap randomization).
+    full: bool,
     request: Request,
     /// Position to evaluate and its legal moves.
     pub(crate) eval_game: Game,
@@ -287,6 +332,7 @@ impl Slot {
             nodes: Vec::new(),
             root_gumbel: Vec::new(),
             simulations_done: 0,
+            full: true,
             request: Request::Root,
             eval_actions,
         }
@@ -312,14 +358,23 @@ impl Slot {
 
     /// Run simulations until one needs a network evaluation (sets
     /// `request`) or the move's budget is used up (returns true).
-    fn advance(&mut self, cfg: &SearchConfig, table: &[Vec<u32>]) -> bool {
-        while self.simulations_done < cfg.simulations {
+    fn advance(&mut self, cfg: &SearchConfig, tables: &Tables) -> bool {
+        let (budget, considered, table) = if self.full {
+            (cfg.simulations, cfg.gumbel.considered, &tables.full)
+        } else {
+            (
+                cfg.fast_simulations,
+                cfg.fast_considered.max(1),
+                &tables.fast,
+            )
+        };
+        while self.simulations_done < budget {
             let mut path: Vec<(u32, usize)> = Vec::with_capacity(16);
             let mut node = 0u32;
             loop {
                 let n = &self.nodes[node as usize];
                 let a = if node == 0 {
-                    let k = n.actions.len().min(cfg.gumbel.considered).max(1);
+                    let k = n.actions.len().min(considered).max(1);
                     let s = sigma(n, &cfg.gumbel);
                     let cv = table[k][self.simulations_done];
                     score_considered(n, &self.root_gumbel, &s, cv)
@@ -392,7 +447,8 @@ impl Slot {
                 action,
                 &targets,
             )
-            .with_value(value),
+            .with_value(value)
+            .with_full_search(self.full),
         );
         self.game.push(mv);
 
@@ -419,7 +475,7 @@ impl Slot {
         logits: &[f32],
         value: &[f32],
         cfg: &SearchConfig,
-        table: &[Vec<u32>],
+        tables: &Tables,
     ) -> Option<Outcome> {
         let k = self.eval_actions.len();
         let v = wdl_logits_to_q(value);
@@ -428,6 +484,9 @@ impl Slot {
         let node = Node::new(actions, &logits[..k], v, draw);
         match std::mem::replace(&mut self.request, Request::Root) {
             Request::Root => {
+                // Drawn only with PCR on, so the games without it are unchanged.
+                self.full = !cfg.pcr()
+                    || ((self.rng.next_u64() >> 40) as f32 / (1u64 << 24) as f32) < cfg.full_prob;
                 let scale = if cfg.noise_plies > 0 && self.plies.len() >= cfg.noise_plies {
                     cfg.late_gumbel_scale
                 } else {
@@ -448,7 +507,7 @@ impl Slot {
                 self.simulations_done += 1;
             }
         }
-        if self.advance(cfg, table) {
+        if self.advance(cfg, tables) {
             self.play_move(cfg)
         } else {
             None
@@ -463,7 +522,7 @@ fn sample_gumbel(rng: &mut Rng) -> f32 {
 
 pub struct SearchPool {
     cfg: SearchConfig,
-    table: Arc<Vec<Vec<u32>>>,
+    tables: Arc<Tables>,
     slots: Vec<Slot>,
     threads: rayon::ThreadPool,
     finished: Vec<GameRecord>,
@@ -478,10 +537,7 @@ impl SearchPool {
             .thread_name(|i| format!("peazero-search-{i}"))
             .build()
             .expect("failed to start self-play threads");
-        let table = Arc::new(considered_visits_table(
-            cfg.gumbel.considered,
-            cfg.simulations,
-        ));
+        let tables = Arc::new(Tables::new(&cfg));
         SearchPool {
             slots: (0..cfg.games)
                 .map(|i| {
@@ -490,7 +546,7 @@ impl SearchPool {
                     Slot::new(Rng::new(seed))
                 })
                 .collect(),
-            table,
+            tables,
             threads,
             finished: Vec::new(),
             stats: PoolStats::default(),
@@ -540,7 +596,7 @@ impl SearchPool {
         assert_eq!(logits.len(), self.slots.len() * MAX_LEGAL);
         assert_eq!(value.len(), self.slots.len() * 3);
         let cfg = &self.cfg;
-        let table = &self.table;
+        let tables = &self.tables;
         let slots = &mut self.slots;
         let (outcomes, moves): (Vec<Option<Outcome>>, Vec<u32>) = self.threads.install(|| {
             slots
@@ -549,13 +605,21 @@ impl SearchPool {
                 .zip(value.par_chunks_exact(3))
                 .map(|((slot, l), v)| {
                     let before = slot.plies.len();
-                    let out = slot.respond(l, v, cfg, table);
+                    let out = slot.respond(l, v, cfg, tables);
                     let moved = out.is_some() || slot.plies.len() != before;
-                    (out, moved as u32)
+                    // the move just played: last ply of the slot or of the finished game
+                    let full = moved
+                        && match &out {
+                            Some(o) => o.plies.last(),
+                            None => slot.plies.last(),
+                        }
+                        .is_some_and(|p| p.full_search);
+                    (out, moved as u32 | (full as u32) << 1)
                 })
                 .unzip()
         });
-        self.stats.plies += moves.iter().map(|&m| m as u64).sum::<u64>();
+        self.stats.plies += moves.iter().map(|&m| (m & 1) as u64).sum::<u64>();
+        self.stats.full_plies += moves.iter().map(|&m| (m >> 1) as u64).sum::<u64>();
         let mut done = 0;
         for o in outcomes.into_iter().flatten() {
             self.stats.games_finished += 1;
@@ -742,6 +806,55 @@ mod tests {
         let (mv, _) = search_once(fen, 64);
         let pos = Position::from_fen(fen).unwrap();
         assert_eq!(mv, uci(&pos, "c1h6"));
+    }
+
+    #[test]
+    fn playout_cap_randomization() {
+        peazero_core::init();
+        let run = |fast: usize| {
+            let cfg = SearchConfig {
+                games: 8,
+                simulations: 32,
+                max_plies: 80,
+                threads: 2,
+                fast_simulations: fast,
+                full_prob: 0.25,
+                fast_considered: 4,
+                ..Default::default()
+            };
+            let mut pool = SearchPool::new(cfg);
+            let n = pool.num_games();
+            let mut rng = Rng::new(9);
+            let (mut obs, mut legal) = (vec![0.0; n * OBS_SIZE], vec![0i32; n * MAX_LEGAL]);
+            let mut rounds = 0u64;
+            while pool.stats().games_finished < 16 {
+                pool.requests(&mut obs, &mut legal);
+                let logits: Vec<f32> = (0..n * MAX_LEGAL)
+                    .map(|_| rng.below(100) as f32 / 40.0)
+                    .collect();
+                let value: Vec<f32> = (0..n * 3).map(|_| rng.below(100) as f32 / 40.0).collect();
+                pool.respond(&logits, &value);
+                rounds += 1;
+            }
+            let games = pool.take_finished();
+            let plies: Vec<&PlyRecord> = games.iter().flat_map(|g| &g.plies).collect();
+            let full = plies.iter().filter(|p| p.full_search).count();
+            let s = pool.stats();
+            assert!(s.full_plies <= s.plies);
+            (
+                full as f64 / plies.len() as f64,
+                rounds as f64 * n as f64 / s.plies as f64,
+            )
+        };
+        let (share_off, evals_off) = run(0);
+        assert_eq!(share_off, 1.0);
+        let (share, evals) = run(8);
+        assert!((share - 0.25).abs() < 0.08, "full-search share {share}");
+        // ~0.25 × 33 + 0.75 × 9 ≈ 15 evaluations per move instead of ~33
+        assert!(
+            evals < 0.6 * evals_off,
+            "evaluations per move {evals} vs {evals_off}"
+        );
     }
 
     #[test]

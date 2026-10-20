@@ -211,7 +211,7 @@ class SearchRunner:
         return merge_stats([p.stats() for p in self.pools])
 
     def take_chunks(self):
-        """[(chunk bytes, games, positions)] of every pool with finished games."""
+        """[(chunk bytes, games, training positions, plies)] of every pool with finished games."""
         return [c for c in (p.take_chunk() for p in self.pools) if c[1]]
 
     @property

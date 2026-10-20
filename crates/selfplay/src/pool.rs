@@ -53,6 +53,9 @@ impl Default for PoolConfig {
 pub struct PoolStats {
     pub games_finished: u64,
     pub plies: u64,
+    /// Plies played after a full search (= training samples); equals
+    /// `plies` without playout cap randomization.
+    pub full_plies: u64,
     pub white_wins: u64,
     pub black_wins: u64,
     pub draws: u64,
@@ -232,6 +235,7 @@ impl GamePool {
         });
 
         self.stats.plies += self.slots.len() as u64;
+        self.stats.full_plies += self.slots.len() as u64;
         let mut done = 0;
         for o in outcomes.into_iter().flatten() {
             self.stats.games_finished += 1;
