@@ -48,6 +48,7 @@ scripts/make_puzzles.py). The GPU keeps training meanwhile; the
 Elo ladder and puzzle curves appear on the dashboard. --eval-every 0 = off.
 """
 import argparse
+import copy
 import glob
 import json
 import math
@@ -67,9 +68,17 @@ from peazero import encoding as enc  # noqa: E402
 from peazero.model import MuZeroNet, NetConfig, export_pzn  # noqa: E402
 from peazero.selfplay_gpu import SearchRunner  # noqa: E402
 from peazero.train_lib import (  # noqa: E402
-    batch_to_device, calibrate_bn, eval_metrics, muzero_loss, search_step, selfplay_step)
+    batch_to_device, calibrate_bn, compare_losses, eval_metrics, muzero_loss, search_step, selfplay_step)
 
-SIZES = {"32x4": (32, 4), "64x6": (64, 6), "128x10": (128, 10)}
+SIZES = {"32x4": (32, 4), "64x6": (64, 6), "96x8": (96, 8), "128x6": (128, 6), "128x10": (128, 10)}
+
+
+def net_size(s):
+    """'96x8' -> (96, 8): channels x residual blocks (any size, not only SIZES)."""
+    m = re.fullmatch(r"(\d+)x(\d+)", s)
+    if not m:
+        raise argparse.ArgumentTypeError(f"--net: want CHANNELSxBLOCKS like 96x8, got {s!r}")
+    return int(m.group(1)), int(m.group(2))
 
 
 # Settings of a new run. All of these are stored in <run>/config.json.
@@ -83,6 +92,8 @@ DEFAULTS = {
     "batch": 512, "unroll": 0, "reuse": 2.0, "lr": 1e-3, "weight_decay": 1e-4, "warmup": 500,
     "replay": 1_000_000, "keep_data_gens": -1, "keep_nets": 25, "viriformat": False,
     "q_ratio": 0.5, "qat": False, "seed": 0,
+    # warm start: self-play by a stronger existing network until this one catches up
+    "teacher": None, "teacher_gens": 200,
     # background strength evaluation (CPU)
     "eval_every": 25, "match_games": 100, "match_tc": "8+0.08", "match_search_mode": "Mcts",
     "match_simulations": 0, "eval_threads": 4,
@@ -97,7 +108,7 @@ def parse_args():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", required=True, help="run directory")
     ap.add_argument("--resume", action="store_true", help="continue the run with its stored settings")
-    ap.add_argument("--net", choices=SIZES)
+    ap.add_argument("--net", help="network size CHANNELSxBLOCKS, e.g. 64x6, 96x8, 128x10")
     ap.add_argument("--generations", type=int, help="total generations to reach")
     # self-play
     ap.add_argument("--games", type=int, help="concurrent self-play games")
@@ -144,6 +155,11 @@ def parse_args():
                     help="quantisation-aware training: simulate the engine's int8 residual blocks in the "
                          "training steps (self-play stays float) so the net learns weights that survive "
                          "rounding; --no-qat turns it off")
+    ap.add_argument("--teacher",
+                    help="warm start: checkpoint.pt of an existing (stronger) network that plays the self-play "
+                         "games while this network trains on them; self-play switches to this network once its "
+                         "loss on fresh data beats the teacher's, or after --teacher-gens generations")
+    ap.add_argument("--teacher-gens", type=int, help="at most this many generations of teacher self-play")
     ap.add_argument("--seed", type=int)
     # strength evaluation
     ap.add_argument("--eval-every", type=int,
@@ -410,13 +426,15 @@ def train(args, status):
     assert pz.ENCODING_VERSION == enc.ENCODING_VERSION, "rebuild peazero_rs: encoding version mismatch"
 
     ckpt_path = os.path.join(args.run, "checkpoint.pt")
-    c, blocks = SIZES[args.net]
+    c, blocks = net_size(args.net)
     cfg = NetConfig(channels=c, repr_blocks=blocks, dyn_blocks=blocks)
     gen, step = 0, 0
+    teacher_until = None  # generation at which self-play switched from the teacher to this net
     if args.resume and os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         cfg = NetConfig(**ckpt["config"])
         gen, step = ckpt["generation"], ckpt["step"]
+        teacher_until = ckpt.get("teacher_until")
     net = MuZeroNet(cfg).to(dev)
     net.set_qat(args.qat)
     if args.qat and not net.qat:
@@ -505,8 +523,32 @@ def train(args, status):
     # Self-play and export use eval-mode copies with recalibrated BatchNorm
     # statistics (train_lib.calibrate_bn), never `net` itself in eval mode.
     init_net, rec_net = selfplay_nets(net, replay, dev, amp)
+
+    # Warm start: a stronger existing network plays the self-play games
+    # until this one's loss on fresh data beats it (or --teacher-gens).
+    teacher = None
+    if args.teacher and teacher_until is None and gen < args.teacher_gens:
+        if args.simulations <= 0:
+            sys.exit("--teacher needs tree-search self-play (--simulations > 0)")
+        tck = torch.load(args.teacher, map_location="cpu", weights_only=False)
+        teacher = MuZeroNet(NetConfig(**tck["config"])).to(dev)
+        teacher.load_state_dict(tck["model"])
+        teacher.set_qat(False)
+        tc = tck["config"]
+        print(f"teacher: {args.teacher} ({tc['channels']}x{tc['repr_blocks']}, gen {tck.get('generation')}) plays "
+              f"self-play until this net's loss beats it (at most until generation {args.teacher_gens})")
+    elif args.teacher and teacher_until is not None:
+        print(f"teacher phase ended at generation {teacher_until}; self-play by this network")
+
+    def teacher_net():
+        """Eval-mode teacher with BatchNorm statistics measured on the replay data."""
+        return calibrate_bn(teacher, replay, dev, amp)[0] if replay.positions else copy.deepcopy(teacher).eval()
+
+    teacher_sp = teacher_net() if teacher is not None else None
+    teacher_wins = 0  # consecutive generations in which this net beat the teacher on unseen games
+    sp_net = teacher_sp if teacher_sp is not None else init_net
     if runner:
-        runner.set_net(init_net)
+        runner.set_net(sp_net)
         if runner.graphs_wanted and not runner.graphs:
             print("CUDA graphs unavailable here; eager inference")
 
@@ -515,6 +557,8 @@ def train(args, status):
         # ---------------------------------------------------------------- self-play
         t0 = time.time()
         new_positions, new_games, new_plies, part = 0, 0, 0, 0
+        # this generation's games only: unseen by both networks when compared below
+        fresh = pz.Replay(capacity=10**9, seed=args.seed + gen) if teacher is not None else None
         gen_dir = os.path.join(args.run, "data", f"gen_{gen:04d}")
         os.makedirs(gen_dir, exist_ok=True)
         stats_before = sp.stats()
@@ -530,7 +574,7 @@ def train(args, status):
             if runner:
                 runner.step()
             elif args.simulations > 0:
-                search_step(init_net, sp.pool, dev, amp)
+                search_step(sp_net, sp.pool, dev, amp)
             else:
                 selfplay_step(init_net, sp.pool, dev, amp, rec_net)
             steps += 1
@@ -545,6 +589,8 @@ def train(args, status):
                     with open(path, "wb") as f:
                         f.write(chunk)
                     replay.add_chunk(chunk)
+                    if fresh is not None:
+                        fresh.add_chunk(chunk)
                     part += 1
                     new_positions += positions
                     new_plies += plies
@@ -558,6 +604,16 @@ def train(args, status):
         moves = st["plies"] - stats_before["plies"]
         d = {k: st[k] - stats_before[k] for k in ("games", "white_wins", "black_wins", "draws")}
         terms = {k: st["terminations"][k] - stats_before["terminations"][k] for k in st["terminations"]}
+
+        # Teacher phase: both networks on this generation's games, before the
+        # student trains on them (the student as of the previous generation).
+        teacher_info = {}
+        if teacher is not None and fresh is not None and fresh.positions:
+            (sp_p, sp_v), (tp, tv) = compare_losses([init_net, teacher_sp], fresh, dev, amp, batches=16)
+            teacher_wins = teacher_wins + 1 if sp_p + sp_v < tp + tv else 0
+            teacher_info = {"selfplay_by": "teacher", "student_policy_loss": round(sp_p, 4),
+                            "student_value_loss": round(sp_v, 4), "teacher_policy_loss": round(tp, 4),
+                            "teacher_value_loss": round(tv, 4), "student_wins_in_a_row": teacher_wins}
 
         # ---------------------------------------------------------------- training
         net.train()
@@ -597,15 +653,24 @@ def train(args, status):
         status.update(force=True, phase="saving", steps_done=n_steps, step=step)
         net.eval()
         init_net, rec_net = selfplay_nets(net, replay, dev, amp)
-        if runner:
-            runner.set_net(init_net)
         ev = eval_metrics(init_net, rec_net, replay, dev, amp)
+        if teacher is not None and (teacher_wins >= 2 or gen >= args.teacher_gens):
+            why = ("its loss beat the teacher's on 2 generations of unseen games in a row" if teacher_wins >= 2
+                   else f"--teacher-gens {args.teacher_gens}")
+            print(f"teacher phase over at generation {gen} ({why}): self-play by this network from now on")
+            teacher, teacher_sp, teacher_until = None, None, gen
+        elif teacher is not None:
+            teacher_sp = teacher_net()
+        sp_net = teacher_sp if teacher_sp is not None else init_net
+        if runner:
+            runner.set_net(sp_net)
         net_path = os.path.join(args.run, "nets", f"gen_{gen:04d}.pzn")
         export_pzn(init_net, net_path, rec_net)
         shutil.copyfile(net_path, os.path.join(args.run, "latest.pzn"))
         prune_data(args.run, keep_gens, exporter)
         prune_nets(args, gen)
         torch.save({"model": net.state_dict(), "optimizer": opt.state_dict(), "config": cfg.__dict__,
+                    "teacher_until": teacher_until,
                     "generation": gen, "step": step}, ckpt_path)
 
         record = {
@@ -618,6 +683,7 @@ def train(args, status):
             **({"sp_gpu_wait_seconds": round(sp_timing["gpu_wait"], 1),
                 "sp_rust_seconds": round(sp_timing["rust"], 1),
                 "sp_launch_seconds": round(sp_timing["launch"], 1)} if sp_timing else {}),
+            **teacher_info,
             "results": d, "terminations": terms, "replay_positions": replay.positions, "qat": net.qat, **avg, **ev,
         }
         log(args.run, record)
@@ -630,6 +696,9 @@ def train(args, status):
               f"agree {avg['policy_agreement']:.2f}) | exported p {ev.get('eval_policy_loss', 0):.3f} "
               f"v {ev.get('eval_value_loss', 0):.3f}"
               + (f" | int8 {ev['int8_agreement'] * 100:.1f}%" if "int8_agreement" in ev else "")
+              + (f" | teacher self-play, unseen games: this net p {teacher_info['student_policy_loss']:.3f} "
+                 f"v {teacher_info['student_value_loss']:.3f} vs teacher p {teacher_info['teacher_policy_loss']:.3f} "
+                 f"v {teacher_info['teacher_value_loss']:.3f}" if teacher_info else "")
               + f" | {net_path}")
 
 

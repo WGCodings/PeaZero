@@ -222,3 +222,27 @@ def eval_metrics(init_net: MuZeroNet, rec_net: MuZeroNet, replay, device: torch.
             out["int8_value_diff"] = out.get("int8_value_diff", 0.0) + float(
                 (wl(vq) - wl(vf)).abs().mean()) / batches
     return out
+
+
+@torch.no_grad()
+def compare_losses(nets, replay, device: torch.device, amp: bool, batches: int = 8, batch_size: int = 1024):
+    """Root policy loss (vs search target) and value loss (vs game result) of
+    several eval-mode networks on the *same* replay batches: [(policy, value)]."""
+    out = [[0.0, 0.0] for _ in nets]
+    if replay.positions == 0:
+        return [tuple(o) for o in out]
+    for _ in range(batches):
+        b = replay.sample(batch_size, 0)
+        t = {k: torch.from_numpy(v).to(device) for k, v in b.items()}
+        target = None
+        for i, net in enumerate(nets):
+            with autocast(device, amp):
+                _, p, v = net.initial_inference(t["obs"])
+            logp = F.log_softmax(p.float(), dim=-1)
+            if target is None:
+                target = torch.zeros_like(logp).scatter_add_(1, t["policy_index"][:, 0], t["policy_prob"][:, 0])
+            pm, vm = t["policy_mask"][:, 0], t["value_mask"][:, 0]
+            out[i][0] += float((-(target * logp).sum(-1) * pm).sum() / pm.sum().clamp(min=1)) / batches
+            vl = F.cross_entropy(v.float(), t["value_target"][:, 0], reduction="none")
+            out[i][1] += float((vl * vm).sum() / vm.sum().clamp(min=1)) / batches
+    return [tuple(o) for o in out]

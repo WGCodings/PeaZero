@@ -38,6 +38,7 @@ Defaults for a new run (`python train.py --help`):
 | `--considered` | 16 | root candidates (Sequential Halving width) |
 | `--noise-plies` / `--late-noise` | 30 / 0.0 | full Gumbel noise for the first 30 plies of a game, then none: opening variety, but games are played out properly so the result reflects who was better |
 | `--fast-simulations` / `--full-prob` / `--fast-considered` | 0 (off) / 0.25 / 8 | playout cap randomization: 25 % of moves get the full search (`--simulations`), the rest a fast search that is not a training sample; see below |
+| `--teacher` / `--teacher-gens` | none / 200 | warm start: an existing network's `checkpoint.pt` plays the self-play games until this network beats it on unseen games (or generation 200); see below |
 | `--q-ratio` | 0.5 | value target = 50 % game result + 50 % search value of the position (much less noisy than the result alone) |
 | `--unroll` | 0 | AlphaZero-style training: no dynamics unroll (self-play and the engine don't use the dynamics network); training ~4× cheaper than K = 5 |
 | `--reuse` | 2.0 | average times each new position is trained on |
@@ -167,6 +168,17 @@ gen   12 | selfplay  20.1s  5100 mv/s  520 games (W80 D360 B80, len 192.3) | tra
 | `v` | value loss at the root (W/D/L cross-entropy) | low at first because "draw" is easy to predict; may *rise* when decisive games appear, which is fine |
 | `agree` | how often the network's top move equals the target's top move | rises |
 | `policy_loss_unrolled`, `value_loss_unrolled` (in `metrics.jsonl`) | the same losses on the dynamics network's imagined positions | should follow the root losses; if they stay much higher, the dynamics network isn't learning |
+
+## Warm start from a teacher (`--teacher`)
+
+A new, bigger network would spend hundreds of generations self-playing badly before it reaches the old network's level. With `--teacher <checkpoint.pt>` the old network plays the self-play games (at its own speed) while the new one trains on them. Every generation, before training, both networks are scored on that generation's new games, which neither has trained on (`student_*` / `teacher_*` in `metrics.jsonl`, and on the console line; the replay buffer can't be used for this, the student has just trained on it). Once the new network's policy + value loss beats the teacher's on 2 generations in a row, or at generation `--teacher-gens`, self-play switches to the new network for good (stored in the checkpoint, so `--resume` keeps it). Copy the teacher's checkpoint first: the original `checkpoint.pt` changes whenever that run trains again.
+
+```powershell
+copy ..\runs\fourth\checkpoint.pt ..\runs\fourth\teacher_gen3000.pt
+python train.py --run ..\runs\fifth --net 96x8 --teacher ..\runs\fourth\teacher_gen3000.pt --simulations 200 --fast-simulations 32 --positions-per-gen 25000 --replay 500000
+```
+
+`--net` accepts any CHANNELSxBLOCKS (channels a multiple of 32 keeps the engine's int8 path).
 
 ## Capacity check (is the net too small?)
 
