@@ -26,6 +26,15 @@
 //! every policy target comes from a full search while games (the value
 //! signal) stay cheap. Both use the same Gumbel noise schedule.
 //!
+//! Root exploration floor (`root_explore = ε > 0`): for choosing the root
+//! candidates and the move played, the prior is mixed with a uniform share,
+//! `(1 − ε)·π + ε/k` (AlphaZero's noise share), so every legal move keeps a
+//! real chance of being considered. Without it a move whose logit has
+//! fallen far below the 16th candidate is never visited again, its policy
+//! target stays ~0 and training pushes it further down: castling collapsed
+//! this way (logit −4 vs +7..+18 for every other move). The policy target
+//! still uses the network's own logits.
+//!
 //! Temperature (lc0-style; `temperature > 0`): the move played is sampled
 //! from the policy target `π'` as `π'(a)^(1/T)` among the root actions whose
 //! search value is within `temp_value_cutoff` (W − L) of the best visited
@@ -100,6 +109,8 @@ pub struct SearchConfig {
     /// Only moves whose search value (W − L) is within this of the best
     /// visited move are sampled.
     pub temp_value_cutoff: f32,
+    /// Root exploration floor ε: candidates are drawn from (1 − ε)·prior + ε/k.
+    pub root_explore: f32,
 }
 
 /// One opening book line: a start position and the moves that follow
@@ -239,6 +250,7 @@ impl Default for SearchConfig {
             temp_decay_plies: 0,
             temp_endgame: 0.0,
             temp_value_cutoff: 0.1,
+            root_explore: 0.0,
         }
     }
 }
@@ -557,7 +569,16 @@ impl Slot {
         let s = sigma(root, &cfg.gumbel);
         let max_visit = root.visits.iter().copied().max().unwrap_or(0);
         let mut chosen = score_considered(root, &self.root_gumbel, &s, max_visit);
-        let improved: Vec<f32> = root.logits.iter().zip(&s).map(|(l, s)| l + s).collect();
+        // With the exploration floor, a move the search visited gets at least
+        // the floored prior in its target, so a collapsed move that turns out
+        // good can regain policy mass (σ alone cannot lift a logit ~20 down).
+        let floored = explore_logits(&root.logits, cfg.root_explore);
+        let improved: Vec<f32> = (0..root.actions.len())
+            .map(|a| match &floored {
+                Some(f) if root.visits[a] > 0 => root.logits[a].max(f[a]) + s[a],
+                _ => root.logits[a] + s[a],
+            })
+            .collect();
         let target = softmax(&improved);
         let temp = cfg.move_temperature(self.game.ply());
         if temp > 0.0 {
@@ -629,6 +650,13 @@ impl Slot {
                 self.root_gumbel = (0..k)
                     .map(|_| scale * sample_gumbel(&mut self.rng))
                     .collect();
+                if let Some(f) = explore_logits(&node.logits, cfg.root_explore) {
+                    // The root scores are gumbel + logit + σ: add floored − logit so
+                    // candidates and the played move see the floored prior.
+                    for ((g, &l), &fl) in self.root_gumbel.iter_mut().zip(&node.logits).zip(&f) {
+                        *g += fl - l;
+                    }
+                }
                 self.nodes.clear();
                 self.nodes.push(node);
             }
@@ -647,6 +675,31 @@ impl Slot {
             None
         }
     }
+}
+
+/// Logits of the floored prior `(1 − ε)·softmax(logits) + ε/k`, on the same
+/// scale as `logits` (max-normalised logits are log-probabilities up to a
+/// constant). None when ε = 0.
+fn explore_logits(logits: &[f32], eps: f32) -> Option<Vec<f32>> {
+    if eps <= 0.0 || logits.is_empty() {
+        return None;
+    }
+    let eps = eps.min(1.0);
+    let k = logits.len() as f32;
+    let prior = softmax(logits);
+    // ln of the mixed probability, shifted back to the logits' scale
+    let shift = logits
+        .iter()
+        .zip(&prior)
+        .map(|(&l, &p)| l - p.max(f32::MIN_POSITIVE).ln())
+        .sum::<f32>()
+        / k;
+    Some(
+        prior
+            .iter()
+            .map(|&p| ((1.0 - eps) * p + eps / k).ln() + shift)
+            .collect(),
+    )
 }
 
 /// lc0-style move sampling: `target(a)^(1/temp)` over the visited root
@@ -1032,6 +1085,90 @@ mod tests {
             evals < 0.6 * evals_off,
             "evaluations per move {evals} vs {evals_off}"
         );
+    }
+
+    #[test]
+    fn root_explore_rediscovers_a_collapsed_move() {
+        peazero_core::init();
+        // O-O is mate, but the "network" gives castling a logit 20 below
+        // every other move (what self-play training had done to it).
+        let fen = "8/1P6/B7/8/R7/5k2/4N3/3NK2R w K - 0 1";
+        let run = |root_explore: f32| {
+            let cfg = SearchConfig {
+                games: 64,
+                simulations: 200,
+                max_plies: 1,
+                threads: 2,
+                gumbel: GumbelConfig {
+                    considered: 16,
+                    ..Default::default()
+                },
+                openings: Arc::new(vec![Opening::new(Some(fen), &[]).unwrap()]),
+                book_prob: 1.0,
+                root_explore,
+                ..Default::default()
+            };
+            let mut pool = SearchPool::new(cfg);
+            let n = pool.num_games();
+            let (mut obs, mut legal) = (vec![0.0; n * OBS_SIZE], vec![0i32; n * MAX_LEGAL]);
+            while pool.stats().games_finished < 64 {
+                pool.requests(&mut obs, &mut legal);
+                let mut logits = vec![0.0f32; n * MAX_LEGAL];
+                let mut value = Vec::with_capacity(n * 3);
+                for (i, s) in pool.slots.iter().enumerate() {
+                    for (j, (_, m)) in s.eval_actions.iter().enumerate() {
+                        // a peaked prior like a trained net's: a few likely moves,
+                        // a long tail; castling collapsed far below everything
+                        logits[i * MAX_LEGAL + j] = if m.is_castle() {
+                            -20.0
+                        } else {
+                            -0.35 * j as f32
+                        };
+                    }
+                    // material on a linear scale (±40 = ±1): every white move is
+                    // good here, mate (exact +1) clearly best
+                    let m = material(s.eval_game.position()).clamp(-0.999, 0.999);
+                    let v = (m.atanh() * 10.0 / 40.0).clamp(-0.99, 0.99);
+                    value.extend_from_slice(&[v * 3.0, 0.0, -v * 3.0]);
+                }
+                pool.respond(&logits, &value);
+            }
+            let games = pool.take_finished();
+            let pos = Position::from_fen(fen).unwrap();
+            let castle = pos
+                .legal_moves()
+                .iter()
+                .copied()
+                .find(|m| m.is_castle())
+                .unwrap();
+            let a = move_to_action(castle, pos.side_to_move()) as u16;
+            let played = games.iter().filter(|g| g.plies[0].action == a).count();
+            let target: f32 = games
+                .iter()
+                .map(|g| {
+                    g.plies[0]
+                        .targets
+                        .iter()
+                        .find(|t| t.0 == a)
+                        .map_or(0.0, |t| t.1 as f32 / 65535.0)
+                })
+                .sum::<f32>()
+                / games.len() as f32;
+            (played, target)
+        };
+        let (played_off, target_off) = run(0.0);
+        assert_eq!(played_off, 0, "collapsed castling found without the floor");
+        assert!(target_off < 1e-3);
+        let (played_on, target_on) = run(0.25);
+        // With a peaked prior the floor gives castling a fair lottery chance
+        // among the ~25 low-prior moves for the last candidate slots (~1 in 7
+        // positions); where it is considered, the mate is played and its target
+        // is large, so training pulls the logit back up.
+        assert!(
+            played_on >= 4,
+            "castling mate played in only {played_on}/64 games with the floor"
+        );
+        assert!(target_on > 0.015, "mean castling target {target_on}");
     }
 
     #[test]

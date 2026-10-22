@@ -245,7 +245,9 @@ impl SearchSelfPlay {
     /// `temperature` > 0: the move played is sampled from the policy target
     /// (lc0-style; decays over `temp_decay_plies` to `temp_endgame`, only
     /// moves within `temp_value_cutoff` W−L of the best).
-    #[pyo3(signature = (games=1024, simulations=64, considered=16, gumbel_scale=1.0, c_visit=50.0, c_scale=0.1, max_plies=512, seed=0, threads=0, noise_plies=0, late_gumbel_scale=0.0, fast_simulations=0, full_prob=0.25, fast_considered=8, openings=None, book_prob=0.0, random_prob=0.0, random_plies=0, temperature=0.0, temp_decay_plies=0, temp_endgame=0.0, temp_value_cutoff=0.1))]
+    /// `root_explore` ε: root candidates drawn from (1 − ε)·prior + ε/k, so no
+    /// move's prior can collapse beyond rediscovery.
+    #[pyo3(signature = (games=1024, simulations=64, considered=16, gumbel_scale=1.0, c_visit=50.0, c_scale=0.1, max_plies=512, seed=0, threads=0, noise_plies=0, late_gumbel_scale=0.0, fast_simulations=0, full_prob=0.25, fast_considered=8, openings=None, book_prob=0.0, random_prob=0.0, random_plies=0, temperature=0.0, temp_decay_plies=0, temp_endgame=0.0, temp_value_cutoff=0.1, root_explore=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         games: usize,
@@ -270,6 +272,7 @@ impl SearchSelfPlay {
         temp_decay_plies: usize,
         temp_endgame: f32,
         temp_value_cutoff: f32,
+        root_explore: f32,
     ) -> PyResult<Self> {
         if games == 0 || considered == 0 || simulations == 0 {
             return Err(PyValueError::new_err(
@@ -312,6 +315,7 @@ impl SearchSelfPlay {
                 temp_decay_plies,
                 temp_endgame: temp_endgame.max(0.0),
                 temp_value_cutoff: temp_value_cutoff.max(0.0),
+                root_explore: root_explore.clamp(0.0, 1.0),
             }),
         })
     }

@@ -92,6 +92,8 @@ DEFAULTS = {
     # game variety (all off by default): opening book + random moves, lc0-style move temperature
     "book": None, "book_prob": 0.75, "random_prob": 0.0, "random_plies": 2,
     "temperature": 0.0, "temp_decay_plies": 30, "temp_endgame": 0.0, "temp_value_cutoff": 0.1,
+    # exploration floor at the root: no move's prior can collapse beyond rediscovery
+    "root_explore": 0.25,
     "positions_per_gen": 100_000, "noise_plies": 30, "late_noise": 0.0,
     # training
     "batch": 512, "unroll": 0, "reuse": 2.0, "lr": 1e-3, "weight_decay": 1e-4, "warmup": 500,
@@ -105,7 +107,7 @@ DEFAULTS = {
 }
 # What runs started before a setting existed did (used when their
 # config.json lacks the key).
-LEGACY = {"simulations": 0, "unroll": 5, "reuse": 4.0, "threads": 0,
+LEGACY = {"root_explore": 0.0, "simulations": 0, "unroll": 5, "reuse": 4.0, "threads": 0,
           "noise_plies": 0, "late_noise": 0.0, "q_ratio": 0.0}
 
 
@@ -141,6 +143,10 @@ def parse_args():
     ap.add_argument("--temp-endgame", type=float, help="lowest temperature for the rest of the game")
     ap.add_argument("--temp-value-cutoff", type=float,
                     help="only sample moves whose search value (W-L, -1..1) is within this of the best move")
+    ap.add_argument("--root-explore", type=float,
+                    help="root exploration floor: root candidates are drawn from (1-e)*prior + e/legal moves, "
+                         "so a move the policy has written off (e.g. castling) still gets searched; "
+                         "0.25 for new runs, 0 = off")
     ap.add_argument("--max-plies", type=int)
     ap.add_argument("--threads", type=int,
                     help="CPU threads for the Rust self-play work (0 = all logical CPUs); "
@@ -471,6 +477,8 @@ def variety_settings(args):
         kw.update(openings=load_book(args.book, args.run), book_prob=args.book_prob)
     if args.random_prob > 0 and args.random_plies > 0:
         kw.update(random_prob=args.random_prob, random_plies=args.random_plies)
+    if args.root_explore > 0:
+        kw["root_explore"] = args.root_explore
     if args.temperature > 0 or args.temp_endgame > 0:
         kw.update(temperature=args.temperature, temp_decay_plies=args.temp_decay_plies,
                   temp_endgame=args.temp_endgame, temp_value_cutoff=args.temp_value_cutoff)
@@ -581,6 +589,8 @@ def train(args, status):
             mode += f"; book {len(pcr['openings']):,} lines ({args.book_prob:.0%} of games)"
         if pcr.get("random_prob"):
             mode += f"; {args.random_prob:.0%} 1-{args.random_plies} random moves"
+        if pcr.get("root_explore"):
+            mode += f"; root exploration floor {args.root_explore:g}"
         if pcr.get("temperature"):
             mode += (f"; temperature {args.temperature:g} -> {args.temp_endgame:g} over {args.temp_decay_plies} "
                      f"plies, cutoff {args.temp_value_cutoff:g}")

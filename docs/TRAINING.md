@@ -42,6 +42,7 @@ Defaults for a new run (`python train.py --help`):
 | `--book` / `--book-prob` | none / 0.75 | opening book (`.pgn` lines or `.epd`/`.fen` positions): a share of games starts after 1..all moves of a random line; see Game variety |
 | `--random-prob` / `--random-plies` | 0 (off) / 2 | a share of games then plays 1..N uniformly random moves (not recorded) |
 | `--temperature` / `--temp-decay-plies` / `--temp-endgame` / `--temp-value-cutoff` | 0 (off) / 30 / 0 / 0.1 | lc0-style: the move played is sampled from the search policy, temperature decaying to the endgame value, only among moves within the cutoff (W−L) of the best |
+| `--root-explore` | 0.25 (new runs; 0 for runs started earlier) | exploration floor at the root of every self-play search, so no move's prior can collapse beyond rediscovery; see below |
 | `--q-ratio` | 0.5 | value target = 50 % game result + 50 % search value of the position (much less noisy than the result alone) |
 | `--unroll` | 0 | AlphaZero-style training: no dynamics unroll (self-play and the engine don't use the dynamics network); training ~4× cheaper than K = 5 |
 | `--reuse` | 2.0 | average times each new position is trained on |
@@ -70,6 +71,14 @@ With `--viriformat` every generation's games are converted to **viriformat** (th
 * Appends are crash-safe (`<name>.vf.json` records the size after each complete generation; an interrupted append is cut off next time). If you move the `.vf` away, a new one starts; generations already exported aren't repeated.
 * Data folders still on disk (the newest ~20 generations) are exported when they are deleted later, or by hand while training is stopped: `python -m peazero.vf_export --run ..\runs\fourth`.
 * Generations deleted before you turned this on can't be recovered.
+
+## Root exploration floor (`--root-explore`)
+
+**Bug found in `fourth` and `fifth`: the networks never castled.** Castling was legal in thousands of self-play positions and played 0 times; its policy target was exactly 0 in every position, and gen 3000 gave it a logit of −4 while every other move sat at +7..+18. The encoding is correct (e1g1 → action 964 → back) and the search plays O-O when it considers it; the cause is a collapse in Gumbel search: only 16 root candidates are drawn from noise + logit, a move outside them is never visited, so its target is ~0 and training pushes its logit further down until the noise can never bring it back. The engine's search inherits it (a prior of ~1e-9 is never explored).
+
+With `--root-explore ε` the root candidates and the move played are drawn from `(1 − ε)·prior + ε/legal moves` (AlphaZero's 25 % noise share), and a move the search visited gets at least that floored prior in its policy target, so a collapsed move that turns out good regains policy mass (the σ(q) bonus alone, at most ~11–15, cannot lift a logit ~20 down). Unvisited moves keep their normal target, so the policy is not flattened.
+
+Measured with gen 3000 on positions where castling is legal: floor off 0 % castled, target 0; floor 0.25: 4.6 % castled, mean target 0.016, from a starting prior of ~1e-9; recovery speeds up as the logit rises. Watch the king-square distribution of new data, and the policy for e1g1 in a castling position, over the next generations.
 
 ## Game variety (`--book`, `--random-prob`, `--temperature`)
 
