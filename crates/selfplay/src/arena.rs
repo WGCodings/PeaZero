@@ -78,6 +78,7 @@ impl ArenaConfig {
             fast_simulations: 0,
             full_prob: 1.0,
             fast_considered: 8,
+            ..SearchConfig::default()
         }
     }
 

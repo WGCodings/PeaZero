@@ -48,6 +48,7 @@ scripts/make_puzzles.py). The GPU keeps training meanwhile; the
 Elo ladder and puzzle curves appear on the dashboard. --eval-every 0 = off.
 """
 import argparse
+import collections
 import copy
 import glob
 import json
@@ -59,6 +60,7 @@ import subprocess
 import sys
 import time
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -87,6 +89,9 @@ DEFAULTS = {
     # self-play
     "games": 1024, "simulations": 64, "considered": 16, "max_plies": 512, "threads": 0,
     "fast_simulations": 0, "full_prob": 0.25, "fast_considered": 8,
+    # game variety (all off by default): opening book + random moves, lc0-style move temperature
+    "book": None, "book_prob": 0.75, "random_prob": 0.0, "random_plies": 2,
+    "temperature": 0.0, "temp_decay_plies": 30, "temp_endgame": 0.0, "temp_value_cutoff": 0.1,
     "positions_per_gen": 100_000, "noise_plies": 30, "late_noise": 0.0,
     # training
     "batch": 512, "unroll": 0, "reuse": 2.0, "lr": 1e-3, "weight_decay": 1e-4, "warmup": 500,
@@ -123,6 +128,19 @@ def parse_args():
                          "that is not a training sample; 0 = off (every move full)")
     ap.add_argument("--full-prob", type=float, help="share of moves with the full search (playout cap randomization)")
     ap.add_argument("--fast-considered", type=int, help="Sequential Halving width of a fast search")
+    ap.add_argument("--book", help="opening book (.pgn lines or .epd/.fen positions): with probability --book-prob a "
+                                   "new game starts after 1..all moves of a random line ('none' = no book)")
+    ap.add_argument("--book-prob", type=float, help="share of games that start from the book")
+    ap.add_argument("--random-prob", type=float,
+                    help="share of games that then play 1..--random-plies uniformly random moves (not recorded)")
+    ap.add_argument("--random-plies", type=int, help="at most this many random moves after the opening")
+    ap.add_argument("--temperature", type=float,
+                    help="lc0-style: sample the move played from the search policy with this temperature "
+                         "(decays over --temp-decay-plies to --temp-endgame); 0 = always the best move")
+    ap.add_argument("--temp-decay-plies", type=int, help="plies over which the temperature decays to 0 (0 = constant)")
+    ap.add_argument("--temp-endgame", type=float, help="lowest temperature for the rest of the game")
+    ap.add_argument("--temp-value-cutoff", type=float,
+                    help="only sample moves whose search value (W-L, -1..1) is within this of the best move")
     ap.add_argument("--max-plies", type=int)
     ap.add_argument("--threads", type=int,
                     help="CPU threads for the Rust self-play work (0 = all logical CPUs); "
@@ -397,6 +415,68 @@ class PlainPool:
         return self.pool.num_threads
 
 
+def load_book(path, cache_dir):
+    """Opening lines [(FEN or None, [UCI moves])] from a .pgn (move lines) or
+    .epd/.fen (positions) file; parsed PGNs are cached in cache_dir."""
+    import chess
+    path = os.path.abspath(path)
+    st = os.stat(path)
+    cache = os.path.join(cache_dir, "book_cache.json")
+    try:
+        with open(cache) as f:
+            c = json.load(f)
+        if c["path"] == path and c["size"] == st.st_size and c["mtime"] == st.st_mtime:
+            return [(fen, moves) for fen, moves in c["lines"]]
+    except (OSError, ValueError, KeyError):
+        pass
+    t = time.time()
+    lines = []
+    if path.lower().endswith(".pgn"):
+        import chess.pgn
+        with open(path, encoding="utf-8", errors="replace") as f:
+            while (g := chess.pgn.read_game(f)) is not None:
+                fen = g.headers.get("FEN")
+                moves = [m.uci() for m in g.mainline_moves()]
+                if moves or fen:
+                    lines.append((fen, moves))
+    else:  # one EPD/FEN per line
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                fields = raw.split()
+                try:
+                    board = chess.Board(" ".join(fields[:6])) if len(fields) >= 6 and fields[4].isdigit() \
+                        else chess.Board.from_epd(raw)[0]
+                except ValueError:
+                    continue
+                lines.append((board.fen(), []))
+    if not lines:
+        sys.exit(f"no openings found in {path}")
+    print(f"book: {len(lines):,} openings from {path} ({time.time() - t:.0f}s)")
+    try:
+        with open(cache, "w") as f:
+            json.dump({"path": path, "size": st.st_size, "mtime": st.st_mtime, "lines": lines}, f)
+    except OSError:
+        pass
+    return lines
+
+
+def variety_settings(args):
+    """SearchSelfPlay keyword arguments for the opening book, random moves and
+    move temperature (empty when all are off)."""
+    kw = {}
+    if args.book and args.book.lower() != "none":
+        kw.update(openings=load_book(args.book, args.run), book_prob=args.book_prob)
+    if args.random_prob > 0 and args.random_plies > 0:
+        kw.update(random_prob=args.random_prob, random_plies=args.random_plies)
+    if args.temperature > 0 or args.temp_endgame > 0:
+        kw.update(temperature=args.temperature, temp_decay_plies=args.temp_decay_plies,
+                  temp_endgame=args.temp_endgame, temp_value_cutoff=args.temp_value_cutoff)
+    return kw
+
+
 def selfplay_nets(net, replay, dev, amp):
     """calibrate_bn copies for self-play and export. With --qat the
     BatchNorm statistics are measured through the int8 simulation (what the
@@ -474,9 +554,9 @@ def train(args, status):
         if not hasattr(pz, "SearchSelfPlay"):
             sys.exit("peazero_rs is out of date (no tree search); run `pip install ./crates/py`")
         n_pools = max(1, args.pools)
-        pcr = {}
+        pcr = variety_settings(args)
         if args.fast_simulations > 0:
-            pcr = dict(fast_simulations=args.fast_simulations, full_prob=args.full_prob,
+            pcr.update(fast_simulations=args.fast_simulations, full_prob=args.full_prob,
                        fast_considered=args.fast_considered)
         sizes = [args.games // n_pools + (i < args.games % n_pools) for i in range(n_pools)]
         try:
@@ -497,7 +577,14 @@ def train(args, status):
         else:
             sp = PlainPool(pools[0])
         mode = f"{args.simulations} simulations, {args.considered} considered"
-        if pcr:
+        if pcr.get("openings"):
+            mode += f"; book {len(pcr['openings']):,} lines ({args.book_prob:.0%} of games)"
+        if pcr.get("random_prob"):
+            mode += f"; {args.random_prob:.0%} 1-{args.random_plies} random moves"
+        if pcr.get("temperature"):
+            mode += (f"; temperature {args.temperature:g} -> {args.temp_endgame:g} over {args.temp_decay_plies} "
+                     f"plies, cutoff {args.temp_value_cutoff:g}")
+        if args.fast_simulations > 0:
             mode += (f" on {args.full_prob:.0%} of moves, else {args.fast_simulations} simulations, "
                      f"{args.fast_considered} considered (playout cap randomization)")
         if runner:
@@ -546,6 +633,8 @@ def train(args, status):
 
     teacher_sp = teacher_net() if teacher is not None else None
     teacher_wins = 0  # consecutive generations in which this net beat the teacher on unseen games
+    keys_ok = hasattr(pz, "chunk_position_keys")
+    recent_keys = collections.deque(maxlen=5)  # unique position hashes of the last generations
     sp_net = teacher_sp if teacher_sp is not None else init_net
     if runner:
         runner.set_net(sp_net)
@@ -557,6 +646,7 @@ def train(args, status):
         # ---------------------------------------------------------------- self-play
         t0 = time.time()
         new_positions, new_games, new_plies, part = 0, 0, 0, 0
+        gen_keys = []  # position hashes of this generation's games (uniqueness metric)
         # this generation's games only: unseen by both networks when compared below
         fresh = pz.Replay(capacity=10**9, seed=args.seed + gen) if teacher is not None else None
         gen_dir = os.path.join(args.run, "data", f"gen_{gen:04d}")
@@ -589,6 +679,8 @@ def train(args, status):
                     with open(path, "wb") as f:
                         f.write(chunk)
                     replay.add_chunk(chunk)
+                    if keys_ok:
+                        gen_keys.append(pz.chunk_position_keys(chunk))
                     if fresh is not None:
                         fresh.add_chunk(chunk)
                     part += 1
@@ -601,6 +693,16 @@ def train(args, status):
             sp_timing = runner.reset_timing()
         sp_time = time.time() - t0
         st = sp.stats()
+        uniq = {}
+        if gen_keys:
+            # unique share within this generation, and share not seen in the previous generations kept
+            keys = np.unique(np.concatenate(gen_keys))
+            total = sum(len(k) for k in gen_keys)
+            uniq["unique_positions"] = round(len(keys) / max(total, 1), 4)
+            if recent_keys:
+                seen = np.isin(keys, np.concatenate(list(recent_keys)), assume_unique=False)
+                uniq["new_vs_recent"] = round(float((~seen).sum()) / max(total, 1), 4)
+            recent_keys.append(keys)
         moves = st["plies"] - stats_before["plies"]
         d = {k: st[k] - stats_before[k] for k in ("games", "white_wins", "black_wins", "draws")}
         terms = {k: st["terminations"][k] - stats_before["terminations"][k] for k in st["terminations"]}
@@ -683,7 +785,7 @@ def train(args, status):
             **({"sp_gpu_wait_seconds": round(sp_timing["gpu_wait"], 1),
                 "sp_rust_seconds": round(sp_timing["rust"], 1),
                 "sp_launch_seconds": round(sp_timing["launch"], 1)} if sp_timing else {}),
-            **teacher_info,
+            **teacher_info, **uniq,
             "results": d, "terminations": terms, "replay_positions": replay.positions, "qat": net.qat, **avg, **ev,
         }
         log(args.run, record)
@@ -691,7 +793,8 @@ def train(args, status):
               + (f"(gpu wait {sp_timing['gpu_wait']:.0f}s rust {sp_timing['rust']:.0f}s "
                  f"launch {sp_timing['launch']:.0f}s) " if sp_timing else "")
               + f"{new_games:5d} games (W{d['white_wins']} D{d['draws']} B{d['black_wins']}, "
-              f"len {record['avg_game_length']}) | train {n_steps} steps {train_time:6.1f}s "
+              + (f"unique {uniq['unique_positions']:.0%}, " if uniq else "")
+              + f"len {record['avg_game_length']}) | train {n_steps} steps {train_time:6.1f}s "
               f"loss {avg['loss']:.3f} (p {avg['policy_loss']:.3f} v {avg['value_loss']:.3f} "
               f"agree {avg['policy_agreement']:.2f}) | exported p {ev.get('eval_policy_loss', 0):.3f} "
               f"v {ev.get('eval_value_loss', 0):.3f}"

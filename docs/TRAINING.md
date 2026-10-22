@@ -39,6 +39,9 @@ Defaults for a new run (`python train.py --help`):
 | `--noise-plies` / `--late-noise` | 30 / 0.0 | full Gumbel noise for the first 30 plies of a game, then none: opening variety, but games are played out properly so the result reflects who was better |
 | `--fast-simulations` / `--full-prob` / `--fast-considered` | 0 (off) / 0.25 / 8 | playout cap randomization: 25 % of moves get the full search (`--simulations`), the rest a fast search that is not a training sample; see below |
 | `--teacher` / `--teacher-gens` | none / 200 | warm start: an existing network's `checkpoint.pt` plays the self-play games until this network beats it on unseen games (or generation 200); see below |
+| `--book` / `--book-prob` | none / 0.75 | opening book (`.pgn` lines or `.epd`/`.fen` positions): a share of games starts after 1..all moves of a random line; see Game variety |
+| `--random-prob` / `--random-plies` | 0 (off) / 2 | a share of games then plays 1..N uniformly random moves (not recorded) |
+| `--temperature` / `--temp-decay-plies` / `--temp-endgame` / `--temp-value-cutoff` | 0 (off) / 30 / 0 / 0.1 | lc0-style: the move played is sampled from the search policy, temperature decaying to the endgame value, only among moves within the cutoff (W−L) of the best |
 | `--q-ratio` | 0.5 | value target = 50 % game result + 50 % search value of the position (much less noisy than the result alone) |
 | `--unroll` | 0 | AlphaZero-style training: no dynamics unroll (self-play and the engine don't use the dynamics network); training ~4× cheaper than K = 5 |
 | `--reuse` | 2.0 | average times each new position is trained on |
@@ -67,6 +70,18 @@ With `--viriformat` every generation's games are converted to **viriformat** (th
 * Appends are crash-safe (`<name>.vf.json` records the size after each complete generation; an interrupted append is cut off next time). If you move the `.vf` away, a new one starts; generations already exported aren't repeated.
 * Data folders still on disk (the newest ~20 generations) are exported when they are deleted later, or by hand while training is stopped: `python -m peazero.vf_export --run ..\runs\fourth`.
 * Generations deleted before you turned this on can't be recovered.
+
+## Game variety (`--book`, `--random-prob`, `--temperature`)
+
+With only Gumbel noise the games were nearly identical up to move 10–20 (gen 3000 of `fourth`: 88 % of the positions at plies 10–19 were duplicates; the whole run's viriformat data 69 % unique): with many simulations the search term σ(q̂) is far larger than the noise, so the noise rarely changes the move. Three mechanisms, all off by default, combine (ideas from lc0 and princhess):
+
+* **Opening book** (`--book file --book-prob 0.75`): a new game starts after a random number (1..all) of moves of a random book line, otherwise from the start position. `.pgn` books give lines (e.g. `8moves_v3.pgn`), `.epd`/`.fen` books positions (e.g. UHO). The parsed book is cached in the run folder.
+* **Random moves** (`--random-prob 0.25 --random-plies 2`): then 1..2 uniformly random legal moves. Book and random moves are not recorded (no search behind them); the game record starts at the resulting position.
+* **Move temperature** (lc0; `--temperature 2.5 --temp-decay-plies 30 --temp-value-cutoff 0.1`): the move played is sampled from the search's policy target with temperature T (decaying linearly over the first 30 plies of the game, book moves included, to `--temp-endgame`), only among moves whose search value is within 0.1 (W−L; ~5 % win probability) of the best. The policy target is unchanged; only which move is played differs. **T must be above 1**: the Gumbel noise already samples from the policy target (Gumbel-max trick), so T = 1 adds nothing and its cutoff even removes alternatives.
+
+Measured with gen 3000 of `fourth` (64 simulations, first 40 plies of ~100 games): current 38 % unique; temperature 1 / cutoff 0.06: 27 %; temperature 2.5 / 0.1: 65 %; temperature 4 / 0.15: 85 %; a 5-line test book at 75 % + 25 % random moves, no temperature: 85 % (a real book with thousands of lines does better). Suggested: book + random moves for the openings, temperature 2–2.5 for variety after them.
+
+`metrics.jsonl` logs `unique_positions` (unique share within the generation) and `new_vs_recent` (share of positions not seen in the previous 5 generations); the console line shows `unique xx%`. These settings change the self-play data, so they can be switched on for a running run (`--resume` with the flags) but not undone without effect.
 
 ## Playout cap randomization (`--fast-simulations`)
 

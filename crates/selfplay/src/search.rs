@@ -26,6 +26,22 @@
 //! every policy target comes from a full search while games (the value
 //! signal) stay cheap. Both use the same Gumbel noise schedule.
 //!
+//! Temperature (lc0-style; `temperature > 0`): the move played is sampled
+//! from the policy target `π'` as `π'(a)^(1/T)` among the root actions whose
+//! search value is within `temp_value_cutoff` (W − L) of the best visited
+//! action, instead of the Sequential Halving winner. `T` decays linearly
+//! from `temperature` to 0 over `temp_decay_plies` plies of the game (0 =
+//! no decay), but never below `temp_endgame`. The policy target is
+//! unchanged; only which move is played differs. Gives game variety where
+//! Gumbel noise cannot: with many simulations σ(q̂) dwarfs the noise.
+//!
+//! Openings (`openings`): each new game starts, with probability
+//! `book_prob`, after a random number (1..=all) of moves of a random book
+//! line, else from the start position; then, with probability
+//! `random_prob`, 1..=`random_plies` uniformly random legal moves follow.
+//! Book and random moves are not recorded (no search behind them): the game
+//! record starts at the resulting position.
+//!
 //! The pool is stepped in lock-step rounds so the GPU sees full batches:
 //! every round each game asks for exactly one evaluation (its next leaf, or
 //! the root of its next move). A move takes about `n + 1` rounds.
@@ -66,6 +82,114 @@ pub struct SearchConfig {
     pub full_prob: f32,
     /// Sequential Halving width of a fast search.
     pub fast_considered: usize,
+    /// Opening book lines (start position + moves); empty = no book.
+    pub openings: Arc<Vec<Opening>>,
+    /// Probability that a new game starts from a book line.
+    pub book_prob: f32,
+    /// Probability of random moves after the opening.
+    pub random_prob: f32,
+    /// At most this many random moves (uniform 1..=random_plies).
+    pub random_plies: usize,
+    /// Move-selection temperature at the start of the game; 0 = off (play
+    /// the Sequential Halving winner).
+    pub temperature: f32,
+    /// Plies over which the temperature decays linearly to 0 (0 = constant).
+    pub temp_decay_plies: usize,
+    /// Lower bound of the temperature for the rest of the game.
+    pub temp_endgame: f32,
+    /// Only moves whose search value (W − L) is within this of the best
+    /// visited move are sampled.
+    pub temp_value_cutoff: f32,
+}
+
+/// One opening book line: a start position and the moves that follow
+/// (empty for EPD/FEN books: the position itself is the opening).
+#[derive(Clone, Debug)]
+pub struct Opening {
+    pub start: Game,
+    pub moves: Vec<Move>,
+}
+
+impl Opening {
+    /// From a FEN (None = start position) and UCI moves; errors on illegal moves.
+    pub fn new(fen: Option<&str>, moves: &[String]) -> Result<Opening, String> {
+        let start = match fen {
+            Some(f) => Game::from_fen(f).map_err(|e| format!("bad FEN {f:?}: {e}"))?,
+            None => Game::default(),
+        };
+        let mut g = start.clone();
+        let mut out = Vec::with_capacity(moves.len());
+        for m in moves {
+            let mv = g
+                .position()
+                .parse_uci_move(m)
+                .ok_or_else(|| format!("illegal move {m} in opening line"))?;
+            g.push(mv);
+            if g.result() != GameResult::Ongoing {
+                return Err(format!("opening line ends the game at {m}"));
+            }
+            out.push(mv);
+        }
+        Ok(Opening { start, moves: out })
+    }
+}
+
+fn uniform(rng: &mut Rng) -> f32 {
+    (rng.next_u64() >> 40) as f32 / (1u64 << 24) as f32
+}
+
+impl SearchConfig {
+    /// Move-selection temperature at game ply `ply` (0 = play the best move).
+    fn move_temperature(&self, ply: usize) -> f32 {
+        let t = if self.temp_decay_plies > 0 {
+            self.temperature * (1.0 - ply as f32 / self.temp_decay_plies as f32).max(0.0)
+        } else {
+            self.temperature
+        };
+        t.max(self.temp_endgame)
+    }
+
+    /// The start of a new game: book line and/or random moves, or the start
+    /// position. Draws nothing from `rng` when neither is configured.
+    fn new_game(&self, rng: &mut Rng) -> Game {
+        let use_book = !self.openings.is_empty() && uniform(rng) < self.book_prob;
+        let use_random =
+            self.random_plies > 0 && self.random_prob > 0.0 && uniform(rng) < self.random_prob;
+        if !use_book && !use_random {
+            return Game::default();
+        }
+        for _attempt in 0..16 {
+            let mut g = if use_book {
+                let o = &self.openings[rng.below(self.openings.len() as u64) as usize];
+                let mut g = o.start.clone();
+                let n = if o.moves.is_empty() {
+                    0
+                } else {
+                    1 + rng.below(o.moves.len() as u64) as usize
+                };
+                for &m in &o.moves[..n] {
+                    g.push(m);
+                }
+                g
+            } else {
+                Game::default()
+            };
+            if use_random {
+                let n = 1 + rng.below(self.random_plies as u64) as usize;
+                for _ in 0..n {
+                    let moves = legal_actions(g.position());
+                    if moves.is_empty() {
+                        break;
+                    }
+                    g.push(moves[rng.below(moves.len() as u64) as usize].1);
+                }
+            }
+            if g.result() == GameResult::Ongoing {
+                return g; // history kept: repetitions of book positions still count
+            }
+        }
+        Game::default()
+    }
 }
 
 impl SearchConfig {
@@ -107,6 +231,14 @@ impl Default for SearchConfig {
             fast_simulations: 0,
             full_prob: 0.25,
             fast_considered: 8,
+            openings: Arc::new(Vec::new()),
+            book_prob: 0.0,
+            random_prob: 0.0,
+            random_plies: 0,
+            temperature: 0.0,
+            temp_decay_plies: 0,
+            temp_endgame: 0.0,
+            temp_value_cutoff: 0.1,
         }
     }
 }
@@ -317,10 +449,6 @@ pub(crate) struct Outcome {
 }
 
 impl Slot {
-    fn new(rng: Rng) -> Slot {
-        Slot::with_game(Game::default(), rng)
-    }
-
     /// A slot that starts searching from `game` (evaluation games, puzzles).
     pub(crate) fn with_game(game: Game, rng: Rng) -> Slot {
         let eval_actions = legal_actions(game.position());
@@ -428,9 +556,15 @@ impl Slot {
         let root = &self.nodes[0];
         let s = sigma(root, &cfg.gumbel);
         let max_visit = root.visits.iter().copied().max().unwrap_or(0);
-        let chosen = score_considered(root, &self.root_gumbel, &s, max_visit);
+        let mut chosen = score_considered(root, &self.root_gumbel, &s, max_visit);
         let improved: Vec<f32> = root.logits.iter().zip(&s).map(|(l, s)| l + s).collect();
         let target = softmax(&improved);
+        let temp = cfg.move_temperature(self.game.ply());
+        if temp > 0.0 {
+            chosen =
+                sample_with_temperature(root, &target, temp, cfg.temp_value_cutoff, &mut self.rng)
+                    .unwrap_or(chosen);
+        }
         let targets: Vec<(usize, f32)> = root.actions.iter().map(|&(a, _)| a).zip(target).collect();
         let (action, mv) = root.actions[chosen];
         // Search value of the root: mean of the network value and all backed-up
@@ -458,7 +592,7 @@ impl Slot {
             None => None,
         };
         let finished = outcome.map(|(result, termination)| {
-            self.game = Game::default();
+            self.game = cfg.new_game(&mut self.rng);
             Outcome {
                 result,
                 termination,
@@ -515,6 +649,47 @@ impl Slot {
     }
 }
 
+/// lc0-style move sampling: `target(a)^(1/temp)` over the visited root
+/// actions whose Q is within `cutoff` of the best visited action's Q.
+fn sample_with_temperature(
+    root: &Node,
+    target: &[f32],
+    temp: f32,
+    cutoff: f32,
+    rng: &mut Rng,
+) -> Option<usize> {
+    let q = |a: usize| root.value_sum[a] / root.visits[a] as f32;
+    let visited: Vec<usize> = (0..root.actions.len())
+        .filter(|&a| root.visits[a] > 0)
+        .collect();
+    let best = visited
+        .iter()
+        .map(|&a| q(a))
+        .fold(f32::NEG_INFINITY, f32::max);
+    let eligible: Vec<usize> = visited
+        .into_iter()
+        .filter(|&a| q(a) >= best - cutoff)
+        .collect();
+    // weights relative to the largest target, so 1/temp powers stay in range
+    let top = eligible.iter().map(|&a| target[a]).fold(0.0f32, f32::max);
+    if top <= 0.0 {
+        return None;
+    }
+    let w: Vec<f64> = eligible
+        .iter()
+        .map(|&a| ((target[a] / top) as f64).powf(1.0 / temp as f64))
+        .collect();
+    let total: f64 = w.iter().sum();
+    let mut x = uniform(rng) as f64 * total;
+    for (i, &wi) in w.iter().enumerate() {
+        if x < wi {
+            return Some(eligible[i]);
+        }
+        x -= wi;
+    }
+    eligible.last().copied()
+}
+
 fn sample_gumbel(rng: &mut Rng) -> f32 {
     let u = ((rng.next_u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
     (-(-u.ln()).ln()) as f32
@@ -543,7 +718,9 @@ impl SearchPool {
                 .map(|i| {
                     let seed = (cfg.seed ^ 0x5EA8_C411)
                         .wrapping_add((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-                    Slot::new(Rng::new(seed))
+                    let mut rng = Rng::new(seed);
+                    let game = cfg.new_game(&mut rng);
+                    Slot::with_game(game, rng)
                 })
                 .collect(),
             tables,
@@ -854,6 +1031,149 @@ mod tests {
         assert!(
             evals < 0.6 * evals_off,
             "evaluations per move {evals} vs {evals_off}"
+        );
+    }
+
+    #[test]
+    fn temperature_varies_the_moves_played() {
+        peazero_core::init();
+        // Every game sees the same evaluations, so without temperature (and
+        // without Gumbel noise) all games play the same moves.
+        let distinct_starts = |temperature: f32, cutoff: f32, fen: Option<&str>| {
+            let openings = fen
+                .map(|f| vec![Opening::new(Some(f), &[]).unwrap()])
+                .unwrap_or_default();
+            let cfg = SearchConfig {
+                openings: Arc::new(openings),
+                book_prob: 1.0,
+                games: 48,
+                simulations: 16,
+                max_plies: 3,
+                threads: 2,
+                gumbel: GumbelConfig {
+                    gumbel_scale: 0.0,
+                    considered: 8,
+                    ..Default::default()
+                },
+                temperature,
+                temp_value_cutoff: cutoff,
+                ..Default::default()
+            };
+            let mut pool = SearchPool::new(cfg);
+            let n = pool.num_games();
+            let (mut obs, mut legal) = (vec![0.0; n * OBS_SIZE], vec![0i32; n * MAX_LEGAL]);
+            while pool.stats().games_finished < 48 {
+                pool.requests(&mut obs, &mut legal);
+                let logits: Vec<f32> = (0..n * MAX_LEGAL)
+                    .map(|i| (((i % MAX_LEGAL) * 7919) % 13) as f32 / 4.0)
+                    .collect();
+                let mut value = Vec::with_capacity(n * 3);
+                for s in &pool.slots {
+                    let v = material(s.eval_game.position());
+                    value.extend_from_slice(&[v * 3.0, 0.0, -v * 3.0]);
+                }
+                pool.respond(&logits, &value);
+            }
+            let games = pool.take_finished();
+            let lines = games
+                .iter()
+                .map(|g| g.plies.iter().map(|p| p.action).collect::<Vec<_>>())
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            let first = games
+                .iter()
+                .map(|g| g.plies[0].action)
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            (lines, first)
+        };
+        assert_eq!(distinct_starts(0.0, 0.1, None).0, 1);
+        let (varied, _) = distinct_starts(1.0, 1.0, None);
+        assert!(varied > 10, "{varied} different games with temperature 1");
+        // A free rook: the target puts almost everything on the capture. At a
+        // high temperature other moves get sampled, unless the value cutoff
+        // excludes them.
+        let fen = Some("4k3/8/7r/8/8/8/8/2B1K3 w - - 0 1");
+        assert_eq!(distinct_starts(5.0, 0.0, fen).1, 1);
+        assert!(distinct_starts(5.0, 2.0, fen).1 > 1);
+        // decay schedule
+        let cfg = SearchConfig {
+            temperature: 1.0,
+            temp_decay_plies: 20,
+            temp_endgame: 0.2,
+            ..Default::default()
+        };
+        assert_eq!(cfg.move_temperature(0), 1.0);
+        assert!((cfg.move_temperature(10) - 0.5).abs() < 1e-6);
+        assert_eq!(cfg.move_temperature(30), 0.2);
+    }
+
+    #[test]
+    fn openings_and_random_moves() {
+        peazero_core::init();
+        let line = |m: &str| m.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let book = vec![
+            Opening::new(None, &line("e2e4 e7e5 g1f3 b8c6 f1b5 a7a6")).unwrap(),
+            Opening::new(None, &line("d2d4 d7d5 c2c4 e7e6 b1c3 g8f6")).unwrap(),
+            Opening::new(
+                Some("rnbqkb1r/pppppppp/5n2/8/2PP4/8/PP2PPPP/RNBQKBNR b KQkq - 0 2"),
+                &[],
+            )
+            .unwrap(),
+        ];
+        assert!(Opening::new(None, &line("e2e5")).is_err());
+        let cfg = SearchConfig {
+            games: 64,
+            simulations: 4,
+            max_plies: 6,
+            threads: 2,
+            gumbel: GumbelConfig {
+                considered: 4,
+                ..Default::default()
+            },
+            openings: Arc::new(book),
+            book_prob: 0.5,
+            random_prob: 0.5,
+            random_plies: 2,
+            ..Default::default()
+        };
+        let mut pool = SearchPool::new(cfg);
+        let n = pool.num_games();
+        let mut rng = Rng::new(3);
+        let (mut obs, mut legal) = (vec![0.0; n * OBS_SIZE], vec![0i32; n * MAX_LEGAL]);
+        while pool.stats().games_finished < 200 {
+            pool.requests(&mut obs, &mut legal);
+            let logits: Vec<f32> = (0..n * MAX_LEGAL)
+                .map(|_| rng.below(100) as f32 / 40.0)
+                .collect();
+            let value: Vec<f32> = (0..n * 3).map(|_| rng.below(100) as f32 / 40.0).collect();
+            pool.respond(&logits, &value);
+        }
+        let games = pool.take_finished();
+        let start = Position::startpos();
+        let mut starts = std::collections::HashSet::new();
+        let mut fresh = 0;
+        for g in &games {
+            // every game replays legally from its first recorded position
+            let first = g.plies[0].position();
+            fresh += (first.to_fen() == start.to_fen()) as usize;
+            starts.insert(first.to_fen());
+            let mut game = Game::new(first);
+            for p in &g.plies {
+                let key = |f: String| f.split(' ').take(5).collect::<Vec<_>>().join(" ");
+                assert_eq!(key(game.position().to_fen()), key(p.position().to_fen()));
+                let mv = peazero_core::encoding::action_to_move(game.position(), p.action as usize)
+                    .unwrap();
+                game.push(mv);
+            }
+        }
+        // P(no book, no random moves) = 0.25
+        let share = fresh as f64 / games.len() as f64;
+        assert!((share - 0.25).abs() < 0.1, "fresh starts {share}");
+        assert!(
+            starts.len() > 40,
+            "only {} different start positions",
+            starts.len()
         );
     }
 
