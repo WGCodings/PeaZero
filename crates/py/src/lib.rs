@@ -39,9 +39,9 @@ use peazero_selfplay::arena::{self, ArenaConfig, Evaluate, Puzzle};
 use peazero_selfplay::gumbel::GumbelConfig;
 use peazero_selfplay::pool::PoolStats;
 use peazero_selfplay::pool::{GamePool, PoolConfig};
-use peazero_selfplay::record::{write_chunk, Termination};
+use peazero_selfplay::record::{read_chunk, write_chunk, Termination};
 use peazero_selfplay::replay::{Replay as RustReplay, MAX_LEGAL};
-use peazero_selfplay::search::{SearchConfig, SearchPool};
+use peazero_selfplay::search::{Opening, SearchConfig, SearchPool};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -238,7 +238,16 @@ impl SearchSelfPlay {
     /// Playout cap randomization: with `fast_simulations` > 0 each move is a
     /// full search with probability `full_prob`, otherwise a fast search
     /// (`fast_simulations`, `fast_considered`) that is not a training sample.
-    #[pyo3(signature = (games=1024, simulations=64, considered=16, gumbel_scale=1.0, c_visit=50.0, c_scale=0.1, max_plies=512, seed=0, threads=0, noise_plies=0, late_gumbel_scale=0.0, fast_simulations=0, full_prob=0.25, fast_considered=8))]
+    /// `openings`: [(FEN or None for the start position, [UCI moves])]; a new
+    /// game starts after 1..=all moves of a random line with probability
+    /// `book_prob`, then plays 1..=`random_plies` random moves with
+    /// probability `random_prob`. Those moves are not recorded.
+    /// `temperature` > 0: the move played is sampled from the policy target
+    /// (lc0-style; decays over `temp_decay_plies` to `temp_endgame`, only
+    /// moves within `temp_value_cutoff` W−L of the best).
+    /// `root_explore` ε: root candidates drawn from (1 − ε)·prior + ε/k, so no
+    /// move's prior can collapse beyond rediscovery.
+    #[pyo3(signature = (games=1024, simulations=64, considered=16, gumbel_scale=1.0, c_visit=50.0, c_scale=0.1, max_plies=512, seed=0, threads=0, noise_plies=0, late_gumbel_scale=0.0, fast_simulations=0, full_prob=0.25, fast_considered=8, openings=None, book_prob=0.0, random_prob=0.0, random_plies=0, temperature=0.0, temp_decay_plies=0, temp_endgame=0.0, temp_value_cutoff=0.1, root_explore=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         games: usize,
@@ -255,6 +264,15 @@ impl SearchSelfPlay {
         fast_simulations: usize,
         full_prob: f32,
         fast_considered: usize,
+        openings: Option<Vec<(Option<String>, Vec<String>)>>,
+        book_prob: f32,
+        random_prob: f32,
+        random_plies: usize,
+        temperature: f32,
+        temp_decay_plies: usize,
+        temp_endgame: f32,
+        temp_value_cutoff: f32,
+        root_explore: f32,
     ) -> PyResult<Self> {
         if games == 0 || considered == 0 || simulations == 0 {
             return Err(PyValueError::new_err(
@@ -262,6 +280,15 @@ impl SearchSelfPlay {
             ));
         }
         peazero_core::init();
+        let openings = openings
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(i, (fen, moves))| {
+                Opening::new(fen.as_deref(), moves)
+                    .map_err(|e| PyValueError::new_err(format!("opening {i}: {e}")))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
         Ok(SearchSelfPlay {
             pool: SearchPool::new(SearchConfig {
                 games,
@@ -280,6 +307,15 @@ impl SearchSelfPlay {
                 fast_simulations,
                 full_prob: full_prob.clamp(0.0, 1.0),
                 fast_considered,
+                openings: std::sync::Arc::new(openings),
+                book_prob: book_prob.clamp(0.0, 1.0),
+                random_prob: random_prob.clamp(0.0, 1.0),
+                random_plies,
+                temperature: temperature.max(0.0),
+                temp_decay_plies,
+                temp_endgame: temp_endgame.max(0.0),
+                temp_value_cutoff: temp_value_cutoff.max(0.0),
+                root_explore: root_explore.clamp(0.0, 1.0),
             }),
         })
     }
@@ -487,6 +523,146 @@ fn encode_fen<'py>(
     shaped(py, v, &[OBS_PLANES, 8, 8])
 }
 
+/// Random positions from viriformat files (ours or another engine's, e.g.
+/// Pea's NNUE data) for supervised training / distillation.
+///
+/// ```python
+/// vs = pz.VfStream(["fifth.vf"], buffer=500_000, holdout_every=100)
+/// b = vs.batch(1024)   # obs, legal_index, legal_mask, played, score, result, ply
+/// ```
+/// `holdout_every` > 0: every N-th game is held out; `holdout=True` streams
+/// only those (evaluation), False the rest (training). `skip_plies`: skip
+/// the first plies of each game record.
+#[pyclass]
+struct VfStream {
+    inner: peazero_selfplay::vf_reader::VfStream,
+}
+
+#[pymethods]
+impl VfStream {
+    #[new]
+    #[pyo3(signature = (paths, buffer=500_000, seed=0, holdout_every=0, holdout=false, skip_plies=0))]
+    fn new(
+        paths: Vec<String>,
+        buffer: usize,
+        seed: u64,
+        holdout_every: u64,
+        holdout: bool,
+        skip_plies: u16,
+    ) -> PyResult<Self> {
+        peazero_core::init();
+        let files = paths.into_iter().map(std::path::PathBuf::from).collect();
+        let inner = peazero_selfplay::vf_reader::VfStream::new(
+            files,
+            buffer,
+            seed,
+            holdout_every,
+            holdout,
+            skip_plies,
+        )
+        .map_err(PyValueError::new_err)?;
+        Ok(VfStream { inner })
+    }
+
+    /// A batch of `n` random positions as numpy arrays:
+    /// obs (n,21,8,8) f32; legal_index (n,218) i64 policy indices of the legal
+    /// moves (padded 0) with legal_mask (n,218) f32; played (n,) i64 policy
+    /// index of the move played; score (n,) f32 centipawns and result (n,)
+    /// i64 W/D/L class (0 win, 1 draw, 2 loss), both for the side to move;
+    /// ply (n,) i32.
+    fn batch<'py>(&mut self, py: Python<'py>, n: usize) -> PyResult<Bound<'py, PyDict>> {
+        let inner = &mut self.inner;
+        let positions = py.detach(|| inner.take(n)).map_err(PyValueError::new_err)?;
+        let encoded: Vec<_> = py.detach(|| {
+            positions
+                .par_iter()
+                .map(|p| {
+                    let mut obs = vec![0.0f32; OBS_SIZE];
+                    peazero_core::encoding::encode_observation(&p.pos, 0, &mut obs);
+                    let stm = p.pos.side_to_move();
+                    let legal = peazero_core::encoding::legal_actions(&p.pos);
+                    let played = peazero_core::encoding::move_to_action(p.mv, stm) as i64;
+                    (
+                        obs,
+                        legal.iter().map(|&(a, _)| a as i64).collect::<Vec<_>>(),
+                        played,
+                    )
+                })
+                .collect()
+        });
+        let mut obs = Vec::with_capacity(n * OBS_SIZE);
+        let mut legal_index = vec![0i64; n * MAX_LEGAL];
+        let mut legal_mask = vec![0f32; n * MAX_LEGAL];
+        let mut played = Vec::with_capacity(n);
+        for (i, (o, legal, a)) in encoded.into_iter().enumerate() {
+            obs.extend_from_slice(&o);
+            for (j, &x) in legal.iter().take(MAX_LEGAL).enumerate() {
+                legal_index[i * MAX_LEGAL + j] = x;
+                legal_mask[i * MAX_LEGAL + j] = 1.0;
+            }
+            played.push(a);
+        }
+        let d = PyDict::new(py);
+        d.set_item("obs", shaped(py, obs, &[n, OBS_PLANES, 8, 8])?)?;
+        d.set_item("legal_index", shaped(py, legal_index, &[n, MAX_LEGAL])?)?;
+        d.set_item("legal_mask", shaped(py, legal_mask, &[n, MAX_LEGAL])?)?;
+        d.set_item("played", shaped(py, played, &[n])?)?;
+        d.set_item(
+            "score",
+            shaped(py, positions.iter().map(|p| p.score as f32).collect(), &[n])?,
+        )?;
+        let class = |r: i8| match r {
+            1 => 0i64,
+            0 => 1,
+            _ => 2,
+        };
+        d.set_item(
+            "result",
+            shaped(
+                py,
+                positions.iter().map(|p| class(p.result)).collect(),
+                &[n],
+            )?,
+        )?;
+        d.set_item(
+            "ply",
+            shaped(py, positions.iter().map(|p| p.ply as i32).collect(), &[n])?,
+        )?;
+        Ok(d)
+    }
+
+    /// Completed passes over all files.
+    #[getter]
+    fn epochs(&self) -> u64 {
+        self.inner.epochs()
+    }
+
+    #[getter]
+    fn positions_read(&self) -> u64 {
+        self.inner.positions_read
+    }
+
+    /// Games skipped because their moves could not be replayed.
+    #[getter]
+    fn bad_games(&self) -> u64 {
+        self.inner.bad_games()
+    }
+}
+
+/// Position hashes (Zobrist) of every ply in a data chunk, as uint64:
+/// for counting unique positions.
+#[pyfunction]
+fn chunk_position_keys<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Bound<'py, PyArrayDyn<u64>>> {
+    peazero_core::init();
+    let games = read_chunk(data).map_err(PyValueError::new_err)?;
+    let keys: Vec<u64> = games
+        .iter()
+        .flat_map(|g| g.plies.iter().map(|p| p.position().hash()))
+        .collect();
+    let n = keys.len();
+    shaped(py, keys, &[n])
+}
+
 /// Convert a self-play data chunk (data format v0–v2) to viriformat bytes
 /// (Viridithas / bullet game format): `(bytes, games, positions)`.
 #[pyfunction]
@@ -627,6 +803,8 @@ fn peazero_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(play_match, m)?)?;
     m.add_function(wrap_pyfunction!(solve_puzzles, m)?)?;
     m.add_function(wrap_pyfunction!(chunk_to_viriformat, m)?)?;
+    m.add_function(wrap_pyfunction!(chunk_position_keys, m)?)?;
+    m.add_class::<VfStream>()?;
     m.add("ENCODING_VERSION", ENCODING_VERSION)?;
     m.add("MAX_LEGAL", MAX_LEGAL)?;
     Ok(())

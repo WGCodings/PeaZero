@@ -362,4 +362,51 @@ mod reference {
             "castles {castles} ep {eps} promos {promos}"
         );
     }
+
+    /// Games written by the reference implementation (as other engines' data
+    /// is, e.g. Pea's NNUE data) read back correctly with vf_reader.
+    #[test]
+    fn vf_reader_reads_reference_written_games() {
+        peazero_core::init();
+        let mut rng = Rng::new(23);
+        let (mut castles, mut eps, mut promos) = (0, 0, 0);
+        for _ in 0..300 {
+            let (g, fens) = random_game(&mut rng);
+            let mut ours = Vec::new();
+            write_game(&g, &mut ours).unwrap();
+            let vg =
+                ViriGame::deserialise_from(&mut BufReader::new(&ours[..]), Vec::new()).unwrap();
+            let mut theirs = Vec::new();
+            vg.serialise_into(&mut theirs).unwrap();
+            let back = crate::vf_reader::read_all(&theirs).unwrap();
+            assert_eq!(back.len(), 1);
+            let b = &back[0];
+            assert_eq!(b.len(), fens.len());
+            for (i, (v, p)) in b.iter().zip(&g.plies).enumerate() {
+                assert_eq!(key(&v.pos.to_fen()), key(&fens[i]), "ply {i}");
+                assert_eq!(
+                    move_to_action(v.mv, v.pos.side_to_move()) as u16,
+                    p.action,
+                    "ply {i}"
+                );
+                castles += v.mv.is_castle() as u32;
+                eps += v.mv.is_ep() as u32;
+                promos += v.mv.is_promo() as u32;
+                let cp = white_score(p);
+                assert_eq!(v.score, if p.stm == Color::White { cp } else { -cp });
+                assert_eq!(
+                    v.result,
+                    if p.stm == Color::White {
+                        g.result
+                    } else {
+                        -g.result
+                    }
+                );
+            }
+        }
+        assert!(
+            castles > 0 && eps > 0 && promos > 0,
+            "castles {castles} ep {eps} promos {promos}"
+        );
+    }
 }

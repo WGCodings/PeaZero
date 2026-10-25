@@ -17,6 +17,7 @@ pub mod pool;
 pub mod record;
 pub mod replay;
 pub mod search;
+pub mod vf_reader;
 pub mod viriformat;
 
 /// W/D/L probabilities from W/D/L logits.

@@ -221,6 +221,20 @@ Policy targets want deep searches, value targets want many independent games. Wi
 * `replay.rs`: samples are drawn only at full-search plies; `positions()` and the capacity count training samples. Fast plies keep their move and value targets for unrolling (policy masked) but drop their policy targets in memory.
 * Cost per move (evaluations): full share × (full + 1) + fast share × (fast + 1); 25 % × 201 + 75 % × 33 ≈ 75 for 200/32, vs 65 for 64 on every move. Training samples per move: 25 %.
 
+## 6.6 Game variety: openings, random moves, move temperature
+
+Gumbel noise on the root logits barely varies the games once the search is deep: the played move is `argmax(g + logits + σ(q̂))` and σ reaches ±15 at 200 simulations while the noise is ~1. `fourth`'s data was 69 % unique, most duplicates in the first 40 plies. `search.rs` now has (all off by default):
+
+* **Openings** (`openings`, `book_prob`): a new game starts after 1..all moves of a random book line; **random moves** (`random_prob`, `random_plies`) follow. Neither is recorded; `Game` history is kept so repetitions still count.
+* **Move temperature** (lc0's temperature with value cutoff): the played move is sampled from `π'(a)^(1/T)` over visited root actions whose Q is within `temp_value_cutoff` of the best; `T` decays linearly over `temp_decay_plies` (game plies, book moves included) to `temp_endgame`. The policy target is unchanged.
+* With all settings off no random numbers are drawn, so games are byte-identical to before.
+
+## 6.7 Root exploration floor (castling collapse)
+
+Gumbel MuZero draws only m = 16 root candidates from Gumbel noise + logits. A move outside them is never visited; its improved-policy target `softmax(logits + σ)` is then ~0 (σ of an unvisited action comes from the mixed value) and training lowers its logit further, until the noise (~±3) can never lift it into the candidates again. In `fourth`/`fifth` castling collapsed this way: 0 castles in thousands of legal positions, logit −4 vs +7..+18. Even when found, σ (≤ ~(c_visit + max N)·c_scale ≈ 11–15) cannot overcome a logit gap of ~20, so the target would stay tiny.
+
+`root_explore = ε` (`search.rs`): root candidates and the played move use the floored prior `(1 − ε)·π + ε/k` (folded into the per-action root noise term), and for *visited* actions the policy target uses `max(logit, floored logit) + σ`; unvisited actions keep `logit + σ`. ε = 0 is byte-identical to before. Test: castling mate with castling's logit 20 below the rest is never found without the floor, found in ~1/7 positions with ε = 0.25 under a peaked prior, with a mean target of 0.26 where found.
+
 ## 7. Reference implementations reviewed
 
 | project | what we take | what we don't |
