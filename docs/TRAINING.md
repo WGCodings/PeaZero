@@ -204,6 +204,21 @@ python train.py --run ..\runs\fifth --net 96x8 --teacher ..\runs\fourth\teacher_
 
 `--net` accepts any CHANNELSxBLOCKS (channels a multiple of 32 keeps the engine's int8 path).
 
+## Training on viriformat data: distillation and supervised (`scripts/train_vf.py`)
+
+Trains a network on positions from viriformat files — PeaZero's own (`runs/<name>/<name>.vf`) or another engine's NNUE data (e.g. Pea's) — streamed at random through a shuffle buffer (`peazero_rs.VfStream`, Rust: `crates/selfplay/src/vf_reader.rs`; checked against the reference `viriformat` crate's writer, castling/en passant/promotions included). Every `--holdout-every`-th game (200) is held out for evaluation.
+
+* **Distillation** (`--teacher <checkpoint.pt>`): the teacher network labels each position on the fly (policy over the legal moves, W/D/L value; `--result-weight` blends in the game result) and the student copies it. No search, no new games. Use: a fast 64×6 from the slower 96×8, starting from `fourth`'s weights:
+  ```powershell
+  python scripts\train_vf.py --data ..\runs\fifth\fifth.vf ..\runs\fourth\fourth.vf --teacher ..\runs\fifth\checkpoint.pt --init ..\runs\fourth\teacher_gen3000.pt --out ..\runs\distill64 --positions 200e6
+  ```
+* **Data labels** (no `--teacher`): value = `--score-weight` (0.5) × W/D/L of the stored score + the rest game result; the score → W/D/L mapping is fitted on the data itself (per 25 cp bin, the frequency of each result; saved as `wdl_table.npy`), so any engine's centipawn scale works. Policy = the move played, smoothed by `--policy-smoothing` (0.1) and weighted `--policy-weight` (0.5), since one move is a weaker target than a search distribution. Use: pre-train a network on Pea's 5k-node data:
+  ```powershell
+  python scripts\train_vf.py --data D:\pea_data\*.vf --net 96x8 --out ..\runs\pea96 --positions 500e6
+  ```
+
+Student: `--init <checkpoint.pt>` (size + weights) or a new `--net CxB`. Cosine learning rate from `--lr` (1e-3) after `--warmup` steps. Every `--eval-every` steps the held-out policy / value loss and top-1 agreement with the target are printed and logged (`log.jsonl`); the best point is saved as `checkpoint.pt` (train.py format: copy it into a new run folder and `--resume` to continue with self-play) and `net.pzn` (engine, SPRT). `--skip-plies N` skips the first plies of every game record (book duplicates). Distillation runs at roughly the speed of a teacher forward pass plus a student training step per batch.
+
 ## Capacity check (is the net too small?)
 
 `python scripts\capacity_check.py --run ..\runs\fourth` trains a 64×6 and a 128×10 from scratch, supervised, for the same number of steps on the run's data still on disk, and compares their loss on the newest 2 generations (held out, never trained on); the run's own network is measured on the same positions. A clearly lower held-out loss for the bigger net means the 64×6 is capacity-limited. Train loss far below held-out loss means over-fitting; the best held-out point counts (early stopping). Each net's best point is saved to `runs/<name>/capacity/<CxB>/` as `checkpoint.pt` (warm start for a new run) and `net.pzn` (SPRT). `--nets 64x6,96x8,128x10` tries more sizes. Stop training first (needs the GPU); ~25 minutes on the 3070.
