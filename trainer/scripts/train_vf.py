@@ -36,7 +36,9 @@ import glob
 import json
 import math
 import os
+import queue
 import sys
+import threading
 import time
 
 import numpy as np
@@ -58,6 +60,28 @@ def load_net(path, dev):
 
 def to_dev(b, dev):
     return {k: torch.from_numpy(v).to(dev, non_blocking=True) for k, v in b.items()}
+
+
+class Prefetcher:
+    """Prepares batches in a background thread (the Rust stream releases the
+    GIL), in pinned memory, so data loading overlaps with the GPU work."""
+
+    def __init__(self, stream, batch, depth=6):
+        self.q = queue.Queue(maxsize=depth)
+        self.stream, self.batch = stream, batch
+        self.pin = torch.cuda.is_available()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            b = self.stream.batch(self.batch)
+            t = {k: torch.from_numpy(v) for k, v in b.items()}
+            if self.pin:
+                t = {k: v.pin_memory() for k, v in t.items()}
+            self.q.put(t)
+
+    def get(self, dev):
+        return {k: v.to(dev, non_blocking=True) for k, v in self.q.get().items()}
 
 
 def fit_wdl_table(stream, positions, bin_cp=25, max_cp=2000):
@@ -234,12 +258,16 @@ def main():
     log = open(os.path.join(args.out, "log.jsonl"), "a")
     best, t0, seen = None, time.time(), 0
     sums = np.zeros(2)
+    feed = Prefetcher(train, args.batch)
+    wait = 0.0  # seconds the GPU loop waited for data
     print(f"training {steps:,} steps of {args.batch} ({args.positions / 1e6:.0f}M positions)", flush=True)
     for step in range(1, steps + 1):
         lr = args.lr * min(1.0, step / args.warmup) * (0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * step / steps)))
         for g in opt.param_groups:
             g["lr"] = lr
-        t = to_dev(train.batch(args.batch), dev)
+        tw = time.time()
+        t = feed.get(dev)
+        wait += time.time() - tw
         policy, value = targets(t, amp)
         net.train()
         pl, vl, _, _ = losses(net, t, policy, value, amp)
@@ -271,7 +299,7 @@ def main():
             log.flush()
             print(f"step {step:7d} | {seen / 1e6:7.1f}M pos ({seen / el:6.0f}/s) | held-out policy {ev['policy']:.4f} "
                   f"value {ev['value']:.4f} agree {ev['agree']:.3f} vs result {ev['value_vs_result']:.4f} | "
-                  f"lr {lr:.1e}{mark}", flush=True)
+                  f"lr {lr:.1e} | waiting for data {wait / el * 100:.0f}%{mark}", flush=True)
     print(f"done: best checkpoint and net.pzn in {args.out}")
 
 
