@@ -103,9 +103,9 @@ impl UciLoop {
                 self.stop_search();
                 crate::bench::run(&mut crate::policy::PolicyNet::embedded());
             }
-            // OpenBench SPSA input for the tunable search parameters
+            // OpenBench SPSA input: the tunable parameters, current values
             "spsa" => {
-                for l in crate::search::params::spsa_lines() {
+                for l in self.engine.lock().unwrap().spsa_lines() {
                     println!("{l}");
                 }
             }

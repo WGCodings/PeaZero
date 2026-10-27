@@ -92,7 +92,7 @@ impl PolicyNet {
 }
 
 /// Map an expected score `q = W - L` in [-1, 1] to centipawns
-/// (same shape as Lc0's default conversion).
+/// (tangent curve: q 0.5 ≈ 111 cp, q 0.9 ≈ 671 cp, ±0.999 ≈ ±10800 cp).
 pub fn q_to_cp(q: f32) -> i32 {
     let q = q.clamp(-0.999, 0.999) as f64;
     (111.714_640_912 * (1.562_068_842_1 * q).tan()).round() as i32
@@ -162,6 +162,10 @@ impl Engine for PolicyEngine {
         ];
         options.extend(params::uci_options());
         options
+    }
+
+    fn spsa_lines(&self) -> Vec<String> {
+        params::spsa_lines(&self.params)
     }
 
     fn set_option(&mut self, name: &str, value: &str) -> bool {
@@ -318,9 +322,7 @@ mod tests {
     fn search_params_are_uci_options() {
         let mut engine = PolicyEngine::new();
         let opts = engine.uci_options();
-        assert!(
-            opts.contains(&"option name CPuct type spin default 215 min 50 max 600".to_string())
-        );
+        assert!(opts.contains(&"option name CPuct type spin default 150 min 1 max 600".to_string()));
         assert!(opts
             .iter()
             .any(|o| o.starts_with("option name PolicyTempRoot type spin")));

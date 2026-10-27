@@ -7,11 +7,15 @@
 //! get their exact value. The move played is the most visited one.
 //!
 //! Tunable (UCI options, see params.rs):
-//! * cpuct grows with the parent's visits (lc0's formula);
-//! * first-play urgency: an unvisited child is scored as the parent's Q
-//!   minus a reduction that grows with the policy mass already visited
-//!   (lc0's "reduction" FPU), with a separate reduction at the root;
+//! * exploration U = cpuct(N) · gini_scale · N^exponent · P / (1 + n), with
+//!   optional logarithmic growth of cpuct and gini scaling;
+//! * first-play urgency: an unvisited child is scored as a weighted parent
+//!   Q minus a reduction that grows with the policy mass already visited,
+//!   with separate settings at the root;
 //! * policy softmax temperature, separate at the root.
+//!
+//! The defaults reproduce the original search (cpuct 1.5, unvisited
+//! children at Q = 0, temperature 1).
 //!
 //! Not (yet): tree reuse between moves, virtual loss or batching, NN cache,
 //! proven-result propagation, smart pruning.
@@ -145,36 +149,46 @@ impl Tree<'_> {
         eval.wdl
     }
 
-    /// Value of an unvisited child of `node`, from the view of the side to
-    /// move at `node`: the parent's own Q minus the FPU reduction times
-    /// √(policy mass of the children already visited).
-    fn fpu(&self, node: usize) -> f32 {
+    /// (FPU, gini) of `node`. FPU: value of an unvisited child, from the
+    /// view of the side to move at `node`: the parent's own Q minus the FPU
+    /// reduction times √(policy mass of the children already visited).
+    /// gini = 1 − Σ prior² of the children.
+    fn fpu_and_gini(&self, node: usize) -> (f32, f32) {
         let n = &self.nodes[node];
-        let children = &self.nodes[n.first..n.first + n.count];
-        let visited: f32 = children
-            .iter()
-            .filter(|c| c.visits > 0)
-            .map(|c| c.prior)
-            .sum();
-        let reduction = if node == ROOT {
-            self.params.fpu_reduction_root
+        let (mut visited, mut squares) = (0.0f32, 0.0f32);
+        for c in &self.nodes[n.first..n.first + n.count] {
+            squares += c.prior * c.prior;
+            if c.visits > 0 {
+                visited += c.prior;
+            }
+        }
+        let p = &self.params;
+        let (weight, reduction) = if node == ROOT {
+            (p.fpu_parent_weight_root, p.fpu_reduction_root)
         } else {
-            self.params.fpu_reduction
+            (p.fpu_parent_weight, p.fpu_reduction)
         };
         // `n.q()` is from the view of the side that moved into `node`
-        -n.q() - reduction * visited.sqrt()
+        let fpu = -weight * n.q() - reduction * visited.sqrt();
+        (fpu, 1.0 - squares)
+    }
+
+    #[cfg(test)]
+    fn fpu(&self, node: usize) -> f32 {
+        self.fpu_and_gini(node).0
     }
 
     fn select(&self, node: usize) -> usize {
         let n = &self.nodes[node];
-        let u = self.params.cpuct_at(n.visits) * (n.visits.max(1) as f32).sqrt();
-        let fpu = self.fpu(node);
+        let (fpu, gini) = self.fpu_and_gini(node);
+        let u = self.params.explore_coef(n.visits, gini);
         let mut best = (n.first, f32::NEG_INFINITY);
         for c in n.first..n.first + n.count {
             let child = &self.nodes[c];
             let q = if child.visits == 0 { fpu } else { child.q() };
             let score = q + u * child.prior / (1.0 + child.visits as f32);
-            if score > best.1 {
+            // ties go to the later child (as `max_by` did)
+            if score >= best.1 {
                 best = (c, score);
             }
         }
@@ -476,34 +490,45 @@ mod tests {
     fn fpu_follows_the_parent_value() {
         peazero_core::init();
         let mut net = PolicyNet::embedded();
-        let p = SearchParams::default();
-        let r = p.fpu_reduction_root * 0.5f32.sqrt();
-        // lost parent: unvisited moves look lost too, not like a draw
+        // defaults: unvisited moves are a draw, whatever the parent's value
+        let d = SearchParams::default();
+        assert_eq!(small_tree(&mut net, -0.8, d).fpu(ROOT), 0.0);
+        assert_eq!(small_tree(&mut net, 0.8, d).fpu(ROOT), 0.0);
+        // weight 1, reduction 1: the parent's Q minus √(visited prior mass)
+        let p = SearchParams {
+            fpu_parent_weight_root: 1.0,
+            fpu_reduction_root: 1.0,
+            ..Default::default()
+        };
+        let r = 0.5f32.sqrt();
         let lost = small_tree(&mut net, -0.8, p).fpu(ROOT);
         assert!((lost - (-0.8 - r)).abs() < 1e-5, "{lost}");
         let won = small_tree(&mut net, 0.8, p).fpu(ROOT);
         assert!((won - (0.8 - r)).abs() < 1e-5, "{won}");
-        // no reduction: exactly the parent's Q
-        let mut p0 = p;
-        p0.fpu_reduction_root = 0.0;
-        assert!((small_tree(&mut net, 0.3, p0).fpu(ROOT) - 0.3).abs() < 1e-5);
+        // half weight, no reduction
+        let h = SearchParams {
+            fpu_parent_weight_root: 0.5,
+            ..Default::default()
+        };
+        assert!((small_tree(&mut net, 0.3, h).fpu(ROOT) - 0.15).abs() < 1e-5);
     }
 
     #[test]
-    fn won_parent_explores_less_than_lost_parent() {
-        // with the old Q = 0 FPU a lost parent tries unvisited moves early,
-        // a won one never; now the decision depends on the reduction only
+    fn fpu_changes_which_move_is_explored() {
         peazero_core::init();
         let mut net = PolicyNet::embedded();
-        // huge reduction: never leave the visited move
-        let mut p = SearchParams {
+        // defaults (FPU = draw): in a lost position every unvisited move
+        // looks better than the visited one
+        let d = SearchParams::default();
+        assert_eq!(small_tree(&mut net, -0.8, d).select(ROOT), 2);
+        // parent-Q FPU with a huge reduction: stay on the visited move
+        let p = SearchParams {
+            fpu_parent_weight_root: 1.0,
             fpu_reduction_root: 3.0,
             ..Default::default()
         };
         assert_eq!(small_tree(&mut net, -0.8, p).select(ROOT), 1);
         assert_eq!(small_tree(&mut net, 0.8, p).select(ROOT), 1);
-        p.fpu_reduction_root = 0.0; // none: unvisited moves look as good as the parent
-        assert_eq!(small_tree(&mut net, -0.8, p).select(ROOT), 2);
     }
 
     #[test]
@@ -521,7 +546,7 @@ mod tests {
 
     #[test]
     fn default_params_find_mate_at_small_budget() {
-        // mate in one with lc0-style parameters at a small budget
+        // mate in one at a small budget
         let (m, g) = run("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1", 100);
         assert_eq!(m, g.position().parse_uci_move("a1a8").unwrap());
     }

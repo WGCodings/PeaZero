@@ -89,7 +89,7 @@ DEFAULTS = {
     # self-play
     "games": 1024, "simulations": 64, "considered": 16, "max_plies": 512, "threads": 0,
     "fast_simulations": 0, "full_prob": 0.25, "fast_considered": 8,
-    # game variety (all off by default): opening book + random moves, lc0-style move temperature
+    # game variety (all off by default): opening book + random moves, move temperature
     "book": None, "book_prob": 0.75, "random_prob": 0.0, "random_plies": 2,
     "temperature": 0.0, "temp_decay_plies": 30, "temp_endgame": 0.0, "temp_value_cutoff": 0.1,
     # exploration floor at the root: no move's prior can collapse beyond rediscovery
@@ -137,7 +137,7 @@ def parse_args():
                     help="share of games that then play 1..--random-plies uniformly random moves (not recorded)")
     ap.add_argument("--random-plies", type=int, help="at most this many random moves after the opening")
     ap.add_argument("--temperature", type=float,
-                    help="lc0-style: sample the move played from the search policy with this temperature "
+                    help="sample the move played from the search policy with this temperature "
                          "(decays over --temp-decay-plies to --temp-endgame); 0 = always the best move")
     ap.add_argument("--temp-decay-plies", type=int, help="plies over which the temperature decays to 0 (0 = constant)")
     ap.add_argument("--temp-endgame", type=float, help="lowest temperature for the rest of the game")

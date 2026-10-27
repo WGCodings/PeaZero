@@ -243,7 +243,7 @@ impl SearchSelfPlay {
     /// `book_prob`, then plays 1..=`random_plies` random moves with
     /// probability `random_prob`. Those moves are not recorded.
     /// `temperature` > 0: the move played is sampled from the policy target
-    /// (lc0-style; decays over `temp_decay_plies` to `temp_endgame`, only
+    /// (decays over `temp_decay_plies` to `temp_endgame`, only
     /// moves within `temp_value_cutoff` W−L of the best).
     /// `root_explore` ε: root candidates drawn from (1 − ε)·prior + ε/k, so no
     /// move's prior can collapse beyond rediscovery.
