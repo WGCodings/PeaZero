@@ -20,7 +20,11 @@ meant to be its own SPRT.
 - First-play urgency: an unvisited child scores
   `FpuParentWeight · Q(parent) − FpuReduction · √(prior mass of the visited children)`, with separate `...Root` values at the root.
 - Policy priors: a softmax over the legal moves' logits, with temperature `PolicyTemp`, and `PolicyTempRoot` at the root.
-- The defaults reproduce the original search: constant cpuct 1.5 · √N, unvisited children at Q = 0, temperature 1. Bench is unchanged.
+- Defaults:
+  - cpuct 2.15, growing logarithmically (factor 2.82, base 18368), times √N; gini scaling off;
+  - FPU = parent Q − 0.44 · √(visited prior mass) in the tree, and parent Q − 1.0 · √(...) at the root;
+  - policy temperature 1.61.
+- The original search (constant cpuct 1.5, unvisited children at Q = 0, temperature 1) is still reachable: CPuct 150, CPuctFactor 0, all four FPU values 0, both temperatures 100.
 - One network evaluation per new leaf: policy plus W/D/L.
 - W/D/L is backed up per node and flipped each ply. Q = W − L.
 
@@ -69,14 +73,14 @@ meant to be its own SPRT.
 
 ### 2.1 First-play urgency
 
-**Problem with the default.** An unvisited move scores Q = 0, which is a draw.
+**Problem with the original search.** An unvisited move scored Q = 0, which is a draw.
 - In a lost position, every unexplored move looks better than every explored one, so the search spreads its few playouts over junk moves.
 - In a won position it is the reverse: good alternatives are never tried.
 
 **Options.**
 - `FpuParentWeight` = 1: unvisited moves start at the parent's own value.
 - `FpuReduction` > 0: they start lower the more prior mass has already been visited.
-- Typical starting values: weight 1, reduction about 0.4 in the tree and about 1.0 at the root.
+- Defaults: weight 1; reduction 0.44 in the tree and 1.0 at the root.
 
 **Sign convention.** In our `Node`, Q is stored from the view of the side that moved into the node. A child of `node` is scored from the view of the side to move at `node`, which is `−node.q()`. A unit test covers this.
 
@@ -86,7 +90,7 @@ meant to be its own SPRT.
 - **`CPuctFactor` / `CPuctBase`:** logarithmic growth with the parent's visits. With a large base (around 18k) the growth only matters at long time controls.
 - **`CPuctExponent`:** the power of N; 0.5 = √N. Values around 0.8 with a small CPuct (around 0.16) are a different but equally valid regime: much more exploration at large N.
 - **Gini scaling:** more exploration where the policy is sharp. One working setting is base 0.68, factor 1.63, max 2.1.
-- **Why our value is open:** 1.5 was never tuned, and our policy comes from Gumbel training, which changes how sharp it is.
+- **Why it's worth tuning:** neither the original 1.5 nor the current 2.15 was tuned for our network, and our policy comes from Gumbel training, which changes how sharp it is.
 
 ### 2.3 Policy temperature
 
@@ -99,14 +103,12 @@ meant to be its own SPRT.
 1. Start the engine and type `spsa`. It prints the current values, including any `setoption` you made, so you can start a tune from any point.
 2. Paste the printed lines into the SPSA field of a new OpenBench tune. `c_end` is 7% of each value.
 3. When the tune finishes, copy the final values into the `default` column of the `tunables!` table in `engine/src/search/params.rs`.
-4. SPRT the tuned values against the old defaults.
+4. SPRT the tuned values against the current defaults.
 
 **Which parameters to tune.** Leave out the lines of parameters you don't want tuned. Fewer parameters converge faster.
 
-**SPSA is a local search.** It tunes around its starting point and won't move between very different regimes by itself. For example, CPuct 1.5 with exponent 0.84 explodes. To compare regimes:
-1. SPRT a few hand-picked starting points against each other, set through the dev engine's options. Two examples:
-   - √N with log growth: CPuct 215, CPuctFactor 282, FpuParentWeight 100, FpuReduction 44, FpuParentWeightRoot 100, FpuReductionRoot 100, PolicyTemp 161, PolicyTempRoot 161.
-   - N^0.84 with gini scaling: CPuct 16, CPuctExponent 84, CPuctGiniBase 68, CPuctGiniFactor 163, CPuctGiniMax 210, FpuParentWeight 100, PolicyTemp 130, PolicyTempRoot 130.
+**SPSA is a local search.** It tunes around its starting point and won't move between very different regimes by itself. For example, CPuct 2.15 with exponent 0.84 explodes. The ranges are wide enough for other regimes. To try one:
+1. SPRT it against the defaults, set through the dev engine's options. For example, N^0.84 with gini scaling: CPuct 16, CPuctExponent 84, CPuctFactor 0, CPuctGiniBase 68, CPuctGiniFactor 163, CPuctGiniMax 210, FpuReduction 0, FpuParentWeightRoot 0, FpuReductionRoot 0, PolicyTemp 130, PolicyTempRoot 130.
 2. Run the SPSA from the winner.
 
 **Practical notes:**
@@ -248,8 +250,8 @@ At 264 µs per evaluation, inference probably dominates, so measure before worki
 
 | # | Change | Test | Expected | Effort |
 |---|---|---|---|---|
-| 1 | Tunable FPU, exploration term and policy temperatures as UCI options **(done; defaults = original search)** | — | — | small |
-| 2 | Pick a starting point (§2.4), then SPSA | SPRT tuned vs original | +30–80 | games only |
+| 1 | Tunable FPU, exploration term and policy temperatures as UCI options **(done; bench 5572)** | SPRT vs original | done (gain) | small |
+| 2 | SPSA from the defaults (§2.4) | SPRT tuned vs #1 | +10–30 | games only |
 | 3 | Tree reuse | SPRT 8+0.08 | +20–50 | medium |
 | 4 | Early stop + use `hard` / extension multiplier | SPRT 8+0.08, then SPSA TM constants | +15–40 | small–medium |
 | 5 | Certainty propagation + mate scores | SPRT 8+0.08 | +5–20 | medium |
@@ -273,7 +275,7 @@ won't simply add up.
 - **Correctness tests to keep green:**
   - `mate_in_one`, `go_depth_stops_at_depth_and_is_deterministic`, `single_playout_plays_policy_move`;
   - the FPU tests (`fpu_follows_the_parent_value`, `fpu_changes_which_move_is_explored`);
-  - a bench equal to the original search's with default parameters.
+  - bench 5572 with the current defaults and network (4736 with the original-search values).
 - **Tests to add with later items:**
   - a tree-reuse round-trip test: the reused subtree's visits equal those of the old child;
   - solver tests: mate in two found and reported as `mate 2`; the root proven and stopped early.

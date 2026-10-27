@@ -14,8 +14,8 @@
 //!   with separate settings at the root;
 //! * policy softmax temperature, separate at the root.
 //!
-//! The defaults reproduce the original search (cpuct 1.5, unvisited
-//! children at Q = 0, temperature 1).
+//! The original search (cpuct 1.5, unvisited children at Q = 0,
+//! temperature 1) is still reachable through the options.
 //!
 //! Not (yet): tree reuse between moves, virtual loss or batching, NN cache,
 //! proven-result propagation, smart pruning.
@@ -187,8 +187,7 @@ impl Tree<'_> {
             let child = &self.nodes[c];
             let q = if child.visits == 0 { fpu } else { child.q() };
             let score = q + u * child.prior / (1.0 + child.visits as f32);
-            // ties go to the later child (as `max_by` did)
-            if score >= best.1 {
+            if score > best.1 {
                 best = (c, score);
             }
         }
@@ -490,16 +489,18 @@ mod tests {
     fn fpu_follows_the_parent_value() {
         peazero_core::init();
         let mut net = PolicyNet::embedded();
-        // defaults: unvisited moves are a draw, whatever the parent's value
-        let d = SearchParams::default();
-        assert_eq!(small_tree(&mut net, -0.8, d).fpu(ROOT), 0.0);
-        assert_eq!(small_tree(&mut net, 0.8, d).fpu(ROOT), 0.0);
-        // weight 1, reduction 1: the parent's Q minus √(visited prior mass)
-        let p = SearchParams {
-            fpu_parent_weight_root: 1.0,
-            fpu_reduction_root: 1.0,
+        // weight 0, reduction 0: unvisited moves are a draw, whatever the
+        // parent's value (the original search)
+        let d = SearchParams {
+            fpu_parent_weight_root: 0.0,
+            fpu_reduction_root: 0.0,
             ..Default::default()
         };
+        assert_eq!(small_tree(&mut net, -0.8, d).fpu(ROOT), 0.0);
+        assert_eq!(small_tree(&mut net, 0.8, d).fpu(ROOT), 0.0);
+        // defaults (weight 1, reduction 1 at the root): the parent's Q
+        // minus √(visited prior mass)
+        let p = SearchParams::default();
         let r = 0.5f32.sqrt();
         let lost = small_tree(&mut net, -0.8, p).fpu(ROOT);
         assert!((lost - (-0.8 - r)).abs() < 1e-5, "{lost}");
@@ -508,6 +509,7 @@ mod tests {
         // half weight, no reduction
         let h = SearchParams {
             fpu_parent_weight_root: 0.5,
+            fpu_reduction_root: 0.0,
             ..Default::default()
         };
         assert!((small_tree(&mut net, 0.3, h).fpu(ROOT) - 0.15).abs() < 1e-5);
@@ -517,13 +519,16 @@ mod tests {
     fn fpu_changes_which_move_is_explored() {
         peazero_core::init();
         let mut net = PolicyNet::embedded();
-        // defaults (FPU = draw): in a lost position every unvisited move
-        // looks better than the visited one
-        let d = SearchParams::default();
+        // FPU = draw (the original search): in a lost position every
+        // unvisited move looks better than the visited one
+        let d = SearchParams {
+            fpu_parent_weight_root: 0.0,
+            fpu_reduction_root: 0.0,
+            ..Default::default()
+        };
         assert_eq!(small_tree(&mut net, -0.8, d).select(ROOT), 2);
         // parent-Q FPU with a huge reduction: stay on the visited move
         let p = SearchParams {
-            fpu_parent_weight_root: 1.0,
             fpu_reduction_root: 3.0,
             ..Default::default()
         };

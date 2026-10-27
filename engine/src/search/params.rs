@@ -25,9 +25,12 @@
 //! with separate `...Root` values at the root. Priors are
 //! softmax(logit / PolicyTemp), `PolicyTempRoot` at the root.
 //!
-//! The defaults are the original search: constant cpuct 1.5 (factor 0,
-//! exponent 0.5 = √N, no gini scaling), unvisited children at Q = 0
-//! (weight 0, reduction 0) and policy temperature 1.
+//! Defaults: cpuct 2.15 growing logarithmically (factor 2.82, base 18368),
+//! exponent 0.5 = √N, no gini scaling; FPU = parent Q minus 0.44 · √(visited
+//! prior mass) in the tree, minus 1.0 · √(...) at the root; policy
+//! temperature 1.61. The original search (constant cpuct 1.5, unvisited
+//! children at Q = 0, temperature 1) is CPuct 150, CPuctFactor 0, all FPU
+//! values 0, both temperatures 100.
 //!
 //! The non-standard UCI command `spsa` prints the *current* values (after
 //! any `setoption`) in OpenBench's SPSA input format
@@ -86,29 +89,29 @@ macro_rules! tunables {
 
 tunables! {
     /// PUCT exploration constant (at small visit counts if CPuctFactor > 0).
-    "CPuct" => cpuct: default 150, min 1, max 600, scale 100, step 1;
+    "CPuct" => cpuct: default 215, min 1, max 1000, scale 100, step 1;
     /// Power of the parent's visits in the exploration term (0.5 = √N).
-    "CPuctExponent" => cpuct_exponent: default 50, min 20, max 100, scale 100, step 2;
+    "CPuctExponent" => cpuct_exponent: default 50, min 10, max 120, scale 100, step 2;
     /// Logarithmic growth of cpuct with the parent's visits (0 = constant).
-    "CPuctFactor" => cpuct_factor: default 0, min 0, max 1000, scale 100, step 5;
-    "CPuctBase" => cpuct_base: default 18368, min 500, max 100000, scale 1, step 200;
+    "CPuctFactor" => cpuct_factor: default 282, min 0, max 2000, scale 100, step 5;
+    "CPuctBase" => cpuct_base: default 18368, min 100, max 200000, scale 1, step 200;
     /// Gini scaling: more exploration where the policy is sharp.
     /// Base 1, factor 0 = off.
-    "CPuctGiniBase" => cpuct_gini_base: default 100, min 0, max 500, scale 100, step 3;
-    "CPuctGiniFactor" => cpuct_gini_factor: default 0, min 0, max 500, scale 100, step 5;
-    "CPuctGiniMax" => cpuct_gini_max: default 300, min 0, max 1000, scale 100, step 5;
+    "CPuctGiniBase" => cpuct_gini_base: default 100, min 0, max 1000, scale 100, step 3;
+    "CPuctGiniFactor" => cpuct_gini_factor: default 0, min 0, max 1000, scale 100, step 5;
+    "CPuctGiniMax" => cpuct_gini_max: default 300, min 0, max 2000, scale 100, step 5;
     /// FPU inside the tree: weight of the parent's Q (0 = unvisited
     /// children start from a draw) ...
-    "FpuParentWeight" => fpu_parent_weight: default 0, min 0, max 100, scale 100, step 5;
+    "FpuParentWeight" => fpu_parent_weight: default 100, min 0, max 200, scale 100, step 5;
     /// ... minus this times √(prior mass of the visited children).
-    "FpuReduction" => fpu_reduction: default 0, min 0, max 200, scale 100, step 2;
+    "FpuReduction" => fpu_reduction: default 44, min 0, max 400, scale 100, step 2;
     /// The same at the root.
-    "FpuParentWeightRoot" => fpu_parent_weight_root: default 0, min 0, max 100, scale 100, step 5;
-    "FpuReductionRoot" => fpu_reduction_root: default 0, min 0, max 300, scale 100, step 3;
+    "FpuParentWeightRoot" => fpu_parent_weight_root: default 100, min 0, max 200, scale 100, step 5;
+    "FpuReductionRoot" => fpu_reduction_root: default 100, min 0, max 600, scale 100, step 3;
     /// Softmax temperature of the policy priors inside the tree.
-    "PolicyTemp" => policy_temp: default 100, min 50, max 400, scale 100, step 3;
+    "PolicyTemp" => policy_temp: default 161, min 25, max 800, scale 100, step 3;
     /// Softmax temperature of the policy priors at the root.
-    "PolicyTempRoot" => policy_temp_root: default 100, min 50, max 600, scale 100, step 3;
+    "PolicyTempRoot" => policy_temp_root: default 161, min 25, max 2000, scale 100, step 3;
 }
 
 impl SearchParams {
@@ -157,42 +160,61 @@ pub fn spsa_lines(params: &SearchParams) -> Vec<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn defaults_are_the_original_search() {
-        let p = SearchParams::default();
-        assert_eq!(p.cpuct, 1.5);
-        assert_eq!(p.policy_temp, 1.0);
-        assert_eq!(p.policy_temp_root, 1.0);
-        assert_eq!(p.fpu_parent_weight + p.fpu_reduction, 0.0);
-        assert_eq!(p.fpu_parent_weight_root + p.fpu_reduction_root, 0.0);
-        // constant cpuct · √N, independent of the policy's shape
-        for (n, gini) in [(1u32, 0.0f32), (400, 0.3), (10_000, 0.9)] {
-            let want = 1.5 * (n as f32).sqrt();
-            assert!((p.explore_coef(n, gini) - want).abs() < 1e-3 * want);
+    fn with(values: &[(&str, &str)]) -> SearchParams {
+        let mut p = SearchParams::default();
+        for (k, v) in values {
+            assert!(p.set(k, v), "{k}");
         }
+        p
     }
 
     #[test]
-    fn log_growth_and_gini_scaling() {
-        let mut p = SearchParams::default();
-        assert!(p.set("CPuctFactor", "282"));
-        assert!(p.cpuct_at(1000) > p.cpuct_at(10) && p.cpuct_at(100_000) > 4.0);
-        assert!((p.cpuct_at(0) - 1.5).abs() < 1e-6);
+    fn defaults() {
+        let p = SearchParams::default();
+        assert_eq!(p.cpuct, 2.15);
+        assert_eq!(p.policy_temp, 1.61);
+        assert_eq!((p.fpu_parent_weight, p.fpu_reduction), (1.0, 0.44));
+        assert_eq!((p.fpu_parent_weight_root, p.fpu_reduction_root), (1.0, 1.0));
+        // cpuct(N) · √N, independent of the policy's shape (gini off)
+        for (n, gini) in [(1u32, 0.0f32), (400, 0.3), (10_000, 0.9)] {
+            let want = p.cpuct_at(n) * (n as f32).sqrt();
+            assert!((p.explore_coef(n, gini) - want).abs() < 1e-3 * want);
+        }
+        // the log term is ~0 at small N and grows with N
+        assert!((p.cpuct_at(0) - 2.15).abs() < 1e-6);
+        assert!(p.cpuct_at(1000) > p.cpuct_at(10) && p.cpuct_at(100_000) > 5.0);
+    }
+
+    #[test]
+    fn original_search_is_reachable() {
+        let p = with(&[
+            ("CPuct", "150"),
+            ("CPuctFactor", "0"),
+            ("FpuParentWeight", "0"),
+            ("FpuReduction", "0"),
+            ("FpuParentWeightRoot", "0"),
+            ("FpuReductionRoot", "0"),
+            ("PolicyTemp", "100"),
+            ("PolicyTempRoot", "100"),
+        ]);
+        assert!((p.explore_coef(400, 0.5) - 1.5 * 20.0).abs() < 1e-4);
+        assert_eq!(p.policy_temp, 1.0);
+    }
+
+    #[test]
+    fn gini_scaling_and_exponent() {
         // gini scaling: a sharp policy (low gini) explores more, capped at max
-        let mut g = SearchParams::default();
-        for (k, v) in [
+        let g = with(&[
+            ("CPuctFactor", "0"),
             ("CPuctGiniBase", "68"),
             ("CPuctGiniFactor", "163"),
             ("CPuctGiniMax", "210"),
-        ] {
-            assert!(g.set(k, v));
-        }
+        ]);
         assert!(g.explore_coef(100, 0.1) > g.explore_coef(100, 0.8));
-        assert!((g.explore_coef(100, 0.0) - 1.5 * 2.1 * 10.0).abs() < 1e-3);
+        assert!((g.explore_coef(100, 0.0) - 2.15 * 2.1 * 10.0).abs() < 1e-3);
         // exponent: N^0.84 instead of √N
-        let mut e = SearchParams::default();
-        assert!(e.set("CPuctExponent", "84"));
-        assert!((e.explore_coef(1000, 0.5) - 1.5 * 1000f32.powf(0.84)).abs() < 1e-2);
+        let e = with(&[("CPuctFactor", "0"), ("CPuctExponent", "84")]);
+        assert!((e.explore_coef(1000, 0.5) - 2.15 * 1000f32.powf(0.84)).abs() < 1e-2);
     }
 
     #[test]
@@ -200,12 +222,12 @@ mod tests {
         let mut p = SearchParams::default();
         assert!(p.set("cpuct", "300"));
         assert_eq!(p.cpuct, 3.0);
-        assert!(p.set("CPuct", "214.6")); // OpenBench sends decimals
-        assert_eq!(p.cpuct, 2.15);
+        assert!(p.set("CPuct", "149.6")); // OpenBench sends decimals
+        assert_eq!(p.cpuct, 1.5);
         assert!(p.set("FpuReduction", "100000"));
-        assert_eq!(p.fpu_reduction, 2.0);
+        assert_eq!(p.fpu_reduction, 4.0);
         assert!(p.set("PolicyTempRoot", "junk")); // known name, bad value: unchanged
-        assert_eq!(p.policy_temp_root, 1.0);
+        assert_eq!(p.policy_temp_root, 1.61);
         assert!(!p.set("Hash", "16"));
     }
 
@@ -218,7 +240,7 @@ mod tests {
         assert_eq!(uci_options().len(), TUNABLES.len());
         let lines = spsa_lines(&SearchParams::default());
         assert_eq!(lines.len(), TUNABLES.len());
-        assert_eq!(lines[0], "CPuct, int, 150, 1, 600, 10.5, 0.002");
-        assert!(lines.contains(&"FpuReduction, int, 0, 0, 200, 2, 0.002".to_string()));
+        assert_eq!(lines[0], "CPuct, int, 215, 1, 1000, 15.1, 0.002");
+        assert!(lines.contains(&"CPuctGiniFactor, int, 0, 0, 1000, 5, 0.002".to_string()));
     }
 }
