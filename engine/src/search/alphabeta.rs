@@ -283,6 +283,7 @@ mod tests {
             stop: &stop,
             show_wdl: true,
             verbose_move_stats: false,
+            params: &crate::search::SearchParams::default(),
         };
         let r = AlphaBeta.search(&mut net, &game, &ctx);
         (r.best, game)
@@ -322,6 +323,7 @@ mod tests {
             stop: &stop,
             show_wdl: true,
             verbose_move_stats: false,
+            params: &crate::search::SearchParams::default(),
         };
         let mut w = Worker {
             net: &mut net,
@@ -383,6 +385,7 @@ mod tests {
             stop: &stop,
             show_wdl: false,
             verbose_move_stats: false,
+            params: &crate::search::SearchParams::default(),
         };
         for (fen, depth) in [
             (
