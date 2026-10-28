@@ -112,9 +112,40 @@ tunables! {
     "PolicyTemp" => policy_temp: default 162, min 25, max 800, scale 100, step 3;
     /// Softmax temperature of the policy priors at the root.
     "PolicyTempRoot" => policy_temp_root: default 212, min 25, max 2000, scale 100, step 3;
+    /// Time management (timeman.rs, mcts.rs): moves to go when the GUI
+    /// sends none ...
+    "TmMovesToGo" => tm_moves_to_go: default 30, min 10, max 80, scale 1, step 2;
+    /// ... share of the increment in the target time ...
+    "TmIncPercent" => tm_inc_share: default 75, min 0, max 100, scale 100, step 5;
+    /// ... and the hard limit as a multiple of the target time.
+    "TmHardMult" => tm_hard_mult: default 300, min 100, max 800, scale 100, step 15;
+    /// Target-time factor from the best move's share of the root visits:
+    /// factor = (TmVisitsBase − share) · TmVisitsMult, clamped to
+    /// [TmMinMult, TmMaxMult]. A clear best move gives less time, visits
+    /// spread over several moves more.
+    "TmVisitsBase" => tm_visits_base: default 140, min 100, max 300, scale 100, step 5;
+    "TmVisitsMult" => tm_visits_mult: default 139, min 0, max 400, scale 100, step 8;
+    "TmMinMult" => tm_min_mult: default 30, min 5, max 100, scale 100, step 3;
+    "TmMaxMult" => tm_max_mult: default 300, min 100, max 800, scale 100, step 15;
 }
 
 impl SearchParams {
+    /// The time-budget constants.
+    pub fn time_config(&self) -> crate::timeman::TimeConfig {
+        crate::timeman::TimeConfig {
+            moves_to_go: self.tm_moves_to_go.round() as u64,
+            inc_share: self.tm_inc_share as f64,
+            hard_mult: self.tm_hard_mult as f64,
+        }
+    }
+
+    /// Target-time factor for a best move holding `share` of the root's
+    /// visits (0..1).
+    pub fn time_factor(&self, share: f32) -> f32 {
+        ((self.tm_visits_base - share) * self.tm_visits_mult)
+            .clamp(self.tm_min_mult, self.tm_max_mult)
+    }
+
     /// cpuct for a node with `visits` visits (without the gini scaling).
     pub fn cpuct_at(&self, visits: u32) -> f32 {
         self.cpuct + self.cpuct_factor * ((visits as f32 + self.cpuct_base) / self.cpuct_base).ln()
