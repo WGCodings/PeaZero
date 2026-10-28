@@ -23,6 +23,7 @@ pub mod alphabeta;
 pub mod mcts;
 pub mod params;
 pub mod searchless;
+pub mod tt;
 
 /// Everything a search needs besides the network and the position.
 pub struct SearchContext<'a> {
