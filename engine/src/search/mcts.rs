@@ -17,22 +17,37 @@
 //! The original search (cpuct 1.5, unvisited children at Q = 0,
 //! temperature 1) is still reachable through the options.
 //!
+//! Memory: `Hash` is the whole budget. `TREE_SHARE_PERCENT` of it holds the
+//! tree (24-byte nodes in one arena, allocated once), the rest the
+//! evaluation table (tt.rs). When the arena is full the search prunes and
+//! goes on: the least-visited expanded nodes are collapsed back into
+//! leaves (they keep their own visits and W/L, only their children go)
+//! until the tree fits in half the arena. Most of the arena is unvisited
+//! children, so this frees a lot while the well-visited part of the tree,
+//! which decides the move, is untouched. A collapsed node that becomes
+//! interesting again is simply expanded again (usually a table hit).
+//!
 //! Tree reuse: after a search the tree is kept with the game it was built
 //! for. When the next `go` comes for the same game plus some moves (usually
 //! our move and the opponent's reply), those moves are followed down the
 //! tree and that node's subtree becomes the new root: its visits and values
 //! carry over, so the search starts with work already done. The subtree is
-//! copied into a second buffer (compaction), so memory stays bounded and
-//! nothing else has to be freed. The rest of the tree is thrown away.
+//! compacted in place to the front of the arena; the rest is dropped.
 //!
-//! Not (yet): virtual loss or batching, NN cache, proven-result
-//! propagation, smart pruning.
+//! Transpositions: network evaluations go through the evaluation table, so
+//! a position reached again by another move order costs a table probe
+//! instead of a network call. Each tree node still collects its own visits.
+//!
+//! Not (yet): virtual loss or batching, proven-result propagation, smart
+//! pruning.
 
+use std::ops::Range;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use peazero_core::{Game, Move};
 
+use super::tt::EvalTable;
 use super::{NetSearch, SearchContext, SearchParams};
 use crate::engine::SearchResult;
 use crate::policy::{q_to_cp, wdl_string, PolicyNet};
@@ -45,36 +60,68 @@ const DEFAULT_PLAYOUTS: u64 = 400;
 const DEPTH_PLAYOUT_CAP: u64 = 100_000;
 /// At least one info line this often.
 const INFO_MS: u128 = 1000;
+/// Share of `Hash` for the tree; the rest is the evaluation table.
+const TREE_SHARE_PERCENT: usize = 75;
 
 const ROOT: usize = 0;
 
-#[derive(Clone)]
+/// `Node::flags` bits.
+const EXPANDED: u8 = 1;
+const TERMINAL_DRAW: u8 = 2;
+const TERMINAL_LOSS: u8 = 4;
+
+/// One tree node: 24 bytes.
+#[derive(Clone, Copy)]
 struct Node {
     /// Move that leads here from the parent.
     mv: Move,
+    /// Number of children (at most 218 legal moves).
+    count: u8,
+    /// `EXPANDED`, `TERMINAL_DRAW`, `TERMINAL_LOSS`.
+    flags: u8,
     prior: f32,
-    /// Children are `first..first + count` in the arena.
-    first: usize,
-    count: usize,
-    expanded: bool,
-    /// Exact W/D/L for the side to move here, if the game is over.
-    terminal: Option<[f32; 3]>,
+    /// Children are `first..first + count` in the arena; they always come
+    /// after their parent.
+    first: u32,
     visits: u32,
-    /// Summed W/D/L from the point of view of the side that played `mv`.
-    wdl: [f32; 3],
+    /// Summed W and L from the point of view of the side that played `mv`
+    /// (D = visits − W − L: every playout adds a W/D/L summing to 1).
+    w: f32,
+    l: f32,
 }
+
+const _: () = assert!(std::mem::size_of::<Node>() == 24);
 
 impl Node {
     fn new(mv: Move, prior: f32) -> Node {
         Node {
             mv,
+            count: 0,
+            flags: 0,
             prior,
             first: 0,
-            count: 0,
-            expanded: false,
-            terminal: None,
             visits: 0,
-            wdl: [0.0; 3],
+            w: 0.0,
+            l: 0.0,
+        }
+    }
+
+    fn children(&self) -> Range<usize> {
+        self.first as usize..self.first as usize + self.count as usize
+    }
+
+    fn expanded(&self) -> bool {
+        self.flags & EXPANDED != 0
+    }
+
+    /// Exact W/D/L for the side to move here, if the game is over.
+    fn terminal(&self) -> Option<[f32; 3]> {
+        if self.flags & TERMINAL_LOSS != 0 {
+            Some([0.0, 0.0, 1.0])
+        } else if self.flags & TERMINAL_DRAW != 0 {
+            Some([0.0, 1.0, 0.0])
+        } else {
+            None
         }
     }
 
@@ -83,8 +130,18 @@ impl Node {
         if self.visits == 0 {
             0.0
         } else {
-            (self.wdl[0] - self.wdl[2]) / self.visits as f32
+            (self.w - self.l) / self.visits as f32
         }
+    }
+
+    /// Mean W/D/L for the side that played `mv`.
+    fn mean_wdl(&self) -> [f32; 3] {
+        if self.visits == 0 {
+            return [0.0, 1.0, 0.0];
+        }
+        let n = self.visits as f32;
+        let (w, l) = (self.w / n, self.l / n);
+        [w, (1.0 - w - l).max(0.0), l]
     }
 }
 
@@ -105,47 +162,98 @@ fn priors(moves: &[(Move, f32)], temp: f32) -> Vec<(Move, f32)> {
         .collect()
 }
 
-/// The MCTS search mode; keeps the last tree for reuse.
-#[derive(Default)]
-pub struct Mcts {
-    saved: Option<Saved>,
-    /// Spare arena for compaction (keeps its allocation between moves).
-    spare: Vec<Node>,
+/// (tree nodes, evaluation-table bytes) for `Hash` = `mb`.
+fn budget(mb: usize) -> (usize, usize) {
+    let bytes = mb.max(1) << 20;
+    let tree = bytes * TREE_SHARE_PERCENT / 100;
+    (tree / std::mem::size_of::<Node>(), bytes - tree)
 }
 
-/// A finished search's tree and what it was built for.
-struct Saved {
+/// The MCTS search mode; keeps the arena (with the last tree, for reuse)
+/// and the evaluation table between moves.
+#[derive(Default)]
+pub struct Mcts {
+    /// The arena: allocated once with room for `max_nodes`.
     nodes: Vec<Node>,
+    max_nodes: usize,
+    /// What the tree in `nodes` was built for (None: nothing reusable).
+    saved: Option<Saved>,
+    /// Created on the first search, sized by `Hash`.
+    tt: Option<EvalTable>,
+    hash_mb: usize,
+}
+
+/// The game and parameters the saved tree was searched with.
+struct Saved {
     game: Game,
     params: SearchParams,
 }
 
 struct Tree<'a> {
     net: &'a mut PolicyNet,
+    tt: &'a mut EvalTable,
     params: SearchParams,
-    nodes: Vec<Node>,
+    nodes: &'a mut Vec<Node>,
+    max_nodes: usize,
+    /// The arena had no room for an expansion: prune before the next
+    /// playout.
+    full: bool,
+    /// Pruning can't make room (a tiny `Hash`): search on without growing.
+    frozen: bool,
+    /// Prunes in this search, for the info string.
+    prunes: u32,
     seldepth: usize,
     depth_sum: u64,
     /// Playouts of this search (the root's visits include reused ones).
     playouts: u64,
 }
 
-/// Copy the subtree of `old[root]` into `out` (cleared first) with `root`
-/// at index 0. Breadth-first, so every node's children stay contiguous.
-fn compact(old: &[Node], root: usize, out: &mut Vec<Node>) {
-    out.clear();
-    let mut src = vec![root]; // src[i] = index in `old` of out[i]
-    out.push(old[root].clone());
-    let mut i = 0;
-    while i < out.len() {
-        let o = &old[src[i]];
-        if o.count > 0 {
-            out[i].first = out.len();
-            out.extend_from_slice(&old[o.first..o.first + o.count]);
-            src.extend(o.first..o.first + o.count);
+/// Keep only the subtree of `nodes[root]`, moved to the front of the arena
+/// with `root` at index 0, in place. Children always come after their
+/// parent in the arena, so one forward pass marks the subtree (a bitset)
+/// and a second one slides the kept nodes down in their original order:
+/// a node's new index (its rank among the kept nodes) is never above its
+/// old one, so nothing is overwritten before it is read.
+///
+/// `collapse = Some(t)`: also turn every expanded node (other than the
+/// root) with at most `t` visits back into a leaf, dropping its subtree;
+/// it keeps its own visits and W/L.
+fn compact_in_place(nodes: &mut Vec<Node>, root: usize, collapse: Option<u32>) {
+    let n = nodes.len();
+    let collapsed = |i: usize, node: &Node| i != root && collapse.is_some_and(|t| node.visits <= t);
+    let mut kept = vec![0u64; n.div_ceil(64)];
+    let set = |kept: &mut Vec<u64>, i: usize| kept[i / 64] |= 1 << (i % 64);
+    let is = |kept: &Vec<u64>, i: usize| kept[i / 64] >> (i % 64) & 1 != 0;
+    set(&mut kept, root);
+    for (i, node) in nodes.iter().enumerate().skip(root) {
+        if is(&kept, i) && !collapsed(i, node) {
+            for c in node.children() {
+                set(&mut kept, c);
+            }
         }
-        i += 1;
     }
+    // rank(i) = number of kept nodes before i
+    let mut base = Vec::with_capacity(kept.len());
+    let mut total = 0u32;
+    for word in &kept {
+        base.push(total);
+        total += word.count_ones();
+    }
+    let rank = |i: usize| base[i / 64] + (kept[i / 64] & ((1u64 << (i % 64)) - 1)).count_ones();
+    for i in root..n {
+        if is(&kept, i) {
+            let mut node = nodes[i];
+            if node.count > 0 && collapsed(i, &node) {
+                node.count = 0;
+                node.first = 0;
+                node.flags &= !EXPANDED;
+            } else if node.count > 0 {
+                node.first = rank(node.first as usize);
+            }
+            nodes[rank(i) as usize] = node;
+        }
+    }
+    nodes.truncate(total as usize);
 }
 
 /// Root children got their priors with the tree temperature `t_tree`;
@@ -170,31 +278,38 @@ fn retemper(children: &mut [Node], t_tree: f32, t_root: f32) {
 
 impl Tree<'_> {
     /// Evaluate `game` at `node`: exact result if the game is over,
-    /// otherwise expand with the network. Returns W/D/L for its side to move.
+    /// otherwise expand with the network (through the evaluation table).
+    /// Returns W/D/L for its side to move. If the arena has no room for the
+    /// children, the node stays unexpanded (its value is still backed up)
+    /// and `full` is set, so the search prunes before the next playout.
     fn evaluate(&mut self, node: usize, game: &Game, ply: usize) -> [f32; 3] {
         let pos = game.position();
-        let draw = [0.0, 1.0, 0.0];
-        let terminal = if ply > 0
+        let draw = ply > 0
             && (pos.halfmove_clock() >= 100
                 || pos.insufficient_material()
-                || game.repetitions() >= 1)
-        {
-            Some(draw)
+                || game.repetitions() >= 1);
+        let terminal = if draw {
+            Some(TERMINAL_DRAW)
         } else if pos.legal_moves().is_empty() {
             Some(if pos.in_check() {
-                [0.0, 0.0, 1.0]
+                TERMINAL_LOSS
             } else {
-                draw
+                TERMINAL_DRAW
             })
         } else {
             None
         };
         if let Some(t) = terminal {
-            self.nodes[node].terminal = Some(t);
-            return t;
+            let n = &mut self.nodes[node];
+            n.flags |= t;
+            return n.terminal().unwrap();
         }
 
-        let eval = self.net.evaluate(game);
+        let eval = self.tt.evaluate(self.net, game);
+        if self.nodes.len() + eval.moves.len() > self.max_nodes {
+            self.full = !self.frozen;
+            return eval.wdl;
+        }
         let temp = if node == ROOT {
             self.params.policy_temp_root
         } else {
@@ -205,10 +320,47 @@ impl Tree<'_> {
             self.nodes.push(Node::new(m, prior));
         }
         let n = &mut self.nodes[node];
-        n.first = first;
-        n.count = eval.moves.len();
-        n.expanded = true;
+        n.first = first as u32;
+        n.count = eval.moves.len() as u8;
+        n.flags |= EXPANDED;
         eval.wdl
+    }
+
+    /// Make room in a full arena: collapse the least-visited expanded nodes
+    /// (see the module documentation) until at most half the arena is used.
+    /// Only between playouts (it moves nodes). Returns the nodes freed.
+    fn prune(&mut self) -> usize {
+        self.full = false;
+        let before = self.nodes.len();
+        let target = self.max_nodes / 2;
+        if before > target {
+            // collapsing every expanded node with ≤ t visits frees exactly
+            // the children of those nodes (visits never grow downwards)
+            let mut cand: Vec<(u32, usize)> = self.nodes[1..]
+                .iter()
+                .filter(|n| n.count > 0)
+                .map(|n| (n.visits, n.count as usize))
+                .collect();
+            cand.sort_unstable_by_key(|c| c.0);
+            let excess = before - target;
+            let (mut freed, mut threshold) = (0, None);
+            for (i, &(v, c)) in cand.iter().enumerate() {
+                freed += c;
+                threshold = Some(v);
+                if freed >= excess && cand.get(i + 1).is_none_or(|next| next.0 != v) {
+                    break;
+                }
+            }
+            if threshold.is_some() {
+                compact_in_place(self.nodes, ROOT, threshold);
+                self.prunes += 1;
+            }
+        }
+        // can't fit even the largest expansion: go on without growing
+        if self.nodes.len() + 218 > self.max_nodes {
+            self.frozen = true;
+        }
+        before - self.nodes.len()
     }
 
     /// (FPU, gini) of `node`. FPU: value of an unvisited child, from the
@@ -218,7 +370,7 @@ impl Tree<'_> {
     fn fpu_and_gini(&self, node: usize) -> (f32, f32) {
         let n = &self.nodes[node];
         let (mut visited, mut squares) = (0.0f32, 0.0f32);
-        for c in &self.nodes[n.first..n.first + n.count] {
+        for c in &self.nodes[n.children()] {
             squares += c.prior * c.prior;
             if c.visits > 0 {
                 visited += c.prior;
@@ -244,8 +396,8 @@ impl Tree<'_> {
         let n = &self.nodes[node];
         let (fpu, gini) = self.fpu_and_gini(node);
         let u = self.params.explore_coef(n.visits, gini);
-        let mut best = (n.first, f32::NEG_INFINITY);
-        for c in n.first..n.first + n.count {
+        let mut best = (n.first as usize, f32::NEG_INFINITY);
+        for c in n.children() {
             let child = &self.nodes[c];
             let q = if child.visits == 0 { fpu } else { child.q() };
             let score = q + u * child.prior / (1.0 + child.visits as f32);
@@ -260,13 +412,13 @@ impl Tree<'_> {
         let mut path = vec![ROOT];
         let mut game = root.clone();
         let mut node = ROOT;
-        while self.nodes[node].expanded && self.nodes[node].terminal.is_none() {
+        while self.nodes[node].expanded() && self.nodes[node].terminal().is_none() {
             node = self.select(node);
             game.push(self.nodes[node].mv);
             path.push(node);
         }
         let ply = path.len() - 1;
-        let wdl = match self.nodes[node].terminal {
+        let wdl = match self.nodes[node].terminal() {
             Some(t) => t,
             None => self.evaluate(node, &game, ply),
         };
@@ -279,16 +431,15 @@ impl Tree<'_> {
         for &i in path.iter().rev() {
             let n = &mut self.nodes[i];
             n.visits += 1;
-            for (acc, x) in n.wdl.iter_mut().zip(v) {
-                *acc += x;
-            }
+            n.w += v[0];
+            n.l += v[2];
             v = flip(v);
         }
     }
 
     fn best_child(&self, node: usize) -> Option<usize> {
         let n = &self.nodes[node];
-        (n.first..n.first + n.count).max_by(|&a, &b| {
+        n.children().max_by(|&a, &b| {
             let (a, b) = (&self.nodes[a], &self.nodes[b]);
             a.visits.cmp(&b.visits).then(a.prior.total_cmp(&b.prior))
         })
@@ -313,17 +464,17 @@ impl Tree<'_> {
         self.depth_sum / self.playouts.max(1)
     }
 
+    /// Arena fill in permille (UCI `hashfull`: the tree is what runs out).
+    fn hashfull(&self) -> usize {
+        self.nodes.len() * 1000 / self.max_nodes.max(1)
+    }
+
     fn print_info(&self, start: Instant, show_wdl: bool) {
         let Some(best) = self.best_child(ROOT) else {
             return;
         };
-        let b = &self.nodes[best];
+        let wdl = self.nodes[best].mean_wdl();
         let playouts = self.playouts;
-        let wdl = if b.visits > 0 {
-            b.wdl.map(|x| x / b.visits as f32)
-        } else {
-            [0.0, 1.0, 0.0]
-        };
         let wdl_str = if show_wdl {
             wdl_string(wdl)
         } else {
@@ -332,75 +483,108 @@ impl Tree<'_> {
         let ms = start.elapsed().as_millis();
         let pv: Vec<String> = self.pv().iter().map(|m| m.to_uci()).collect();
         println!(
-            "info depth {} seldepth {} multipv 1 score cp {}{wdl_str} nodes {playouts} nps {} time {ms} pv {}",
+            "info depth {} seldepth {} multipv 1 score cp {}{wdl_str} nodes {playouts} nps {} hashfull {} time {ms} pv {}",
             self.depth(),
             self.seldepth,
             q_to_cp(wdl[0] - wdl[2]),
             playouts as u128 * 1000 / ms.max(1),
+            self.hashfull(),
             pv.join(" ")
         );
     }
 }
 
 impl Mcts {
-    /// The saved tree, re-rooted at `game`, if `game` continues the saved
-    /// game and the search can start from it; `None` means a fresh tree.
-    /// Returns the nodes and how many playouts were kept.
-    fn take_reusable(&mut self, game: &Game, ctx: &SearchContext) -> Option<(Vec<Node>, u32)> {
+    /// Size the arena and the evaluation table for `Hash` = `mb` (only
+    /// reallocates when it changed; a resize drops the saved tree).
+    fn prepare(&mut self, mb: usize) {
+        if self.tt.is_some() && mb == self.hash_mb {
+            return;
+        }
+        let (max_nodes, tt_bytes) = budget(mb);
+        self.nodes = Vec::with_capacity(max_nodes);
+        self.max_nodes = max_nodes;
+        self.saved = None;
+        self.tt = Some(EvalTable::new(tt_bytes));
+        self.hash_mb = mb;
+    }
+
+    /// Re-root the saved tree at `game` if `game` continues the saved game
+    /// and the search can start from it; otherwise clear the arena (fresh
+    /// tree). Returns how many playouts were kept.
+    fn reuse_tree(&mut self, game: &Game, ctx: &SearchContext) -> u32 {
+        let kept = self.find_reusable(game, ctx);
+        match kept {
+            Some(node) => {
+                if node != ROOT {
+                    compact_in_place(&mut self.nodes, node, None);
+                    self.nodes[ROOT].mv = Move::NULL;
+                    let children = self.nodes[ROOT].children();
+                    let p = ctx.params;
+                    retemper(&mut self.nodes[children], p.policy_temp, p.policy_temp_root);
+                }
+                self.nodes[ROOT].visits
+            }
+            None => {
+                self.nodes.clear();
+                0
+            }
+        }
+    }
+
+    /// The node of the saved tree that `game`'s position corresponds to,
+    /// if the tree can be reused from there.
+    fn find_reusable(&mut self, game: &Game, ctx: &SearchContext) -> Option<usize> {
         let saved = self.saved.take()?;
         if saved.params != *ctx.params
             || !ctx.limits.searchmoves.is_empty()
+            || self.nodes.is_empty()
             || saved.game.start_position() != game.start_position()
             || !game.moves().starts_with(saved.game.moves())
         {
             return None;
         }
-        let nodes = saved.nodes;
+        let nodes = &self.nodes;
         let mut node = ROOT;
         for &m in &game.moves()[saved.game.moves().len()..] {
-            let n = &nodes[node];
-            node = (n.first..n.first + n.count).find(|&c| nodes[c].mv == m)?;
+            node = nodes[node].children().find(|&c| nodes[c].mv == m)?;
         }
         // the new root must be an expanded, non-terminal position (a node
         // marked as a draw by repetition is not a draw at the root)
         let n = &nodes[node];
-        if !n.expanded || n.terminal.is_some() || n.count == 0 {
+        if !n.expanded() || n.terminal().is_some() || n.count == 0 {
             return None;
         }
-        if node == ROOT {
-            let kept = n.visits;
-            return Some((nodes, kept)); // same position again
-        }
-        let mut out = std::mem::take(&mut self.spare);
-        compact(&nodes, node, &mut out);
-        self.spare = nodes;
-        let count = out[ROOT].count;
-        out[ROOT].mv = Move::NULL;
-        let p = ctx.params;
-        retemper(&mut out[1..1 + count], p.policy_temp, p.policy_temp_root);
-        let kept = out[ROOT].visits;
-        Some((out, kept))
+        Some(node)
     }
 }
 
 impl NetSearch for Mcts {
     fn new_game(&mut self) {
         self.saved = None;
+        self.nodes.clear();
+        // also called when the network changes: its evaluations are stale
+        if let Some(tt) = &mut self.tt {
+            tt.clear();
+        }
     }
 
     fn search(&mut self, net: &mut PolicyNet, game: &Game, ctx: &SearchContext) -> SearchResult {
-        let (reused, kept) = match self.take_reusable(game, ctx) {
-            Some((nodes, kept)) => (Some(nodes), kept),
-            None => (None, 0),
-        };
-        if kept > 0 {
-            println!("info string tree reuse: {kept} playouts kept");
-        }
-        let (result, _, nodes) = search_tree(net, game, ctx, true, reused);
+        self.prepare(ctx.common.hash_mb);
+        let kept = self.reuse_tree(game, ctx);
+        let max_nodes = self.max_nodes;
+        let tt = self.tt.as_mut().unwrap();
+        let (probes, hits) = (tt.probes, tt.hits);
+        let (result, _) = search_tree(net, tt, &mut self.nodes, max_nodes, game, ctx, true);
+        println!(
+            "info string tree reuse: {kept} playouts kept; eval table: {} of {} lookups hit, {} permille full",
+            tt.hits - hits,
+            tt.probes - probes,
+            tt.hashfull()
+        );
         // searchmoves trims the root: don't reuse such a tree
         if ctx.limits.searchmoves.is_empty() {
             self.saved = Some(Saved {
-                nodes,
                 game: game.clone(),
                 params: *ctx.params,
             });
@@ -409,27 +593,33 @@ impl NetSearch for Mcts {
     }
 }
 
-/// Run a search on a fresh tree; returns the result and the number of
-/// playouts. `print = false` suppresses the info lines (used by `bench`).
+/// Run a search on a fresh tree with its own arena and table (sized by
+/// `Hash`); returns the result and the number of playouts. `print = false`
+/// suppresses the info lines (used by `bench`).
 pub fn run(
     net: &mut PolicyNet,
     game: &Game,
     ctx: &SearchContext,
     print: bool,
 ) -> (SearchResult, u64) {
-    let (result, playouts, _) = search_tree(net, game, ctx, print, None);
-    (result, playouts)
+    let (max_nodes, tt_bytes) = budget(ctx.common.hash_mb);
+    let mut tt = EvalTable::new(tt_bytes);
+    let mut nodes = Vec::with_capacity(max_nodes);
+    search_tree(net, &mut tt, &mut nodes, max_nodes, game, ctx, print)
 }
 
-/// Search from `reused` (a re-rooted tree from the previous move) or a
-/// fresh tree. Returns the result, this search's playouts and the tree.
+/// Search from the tree in `nodes` (a re-rooted tree from the previous
+/// move, or empty for a fresh tree). Returns the result and this search's
+/// playouts; the tree stays in `nodes`.
 fn search_tree(
     net: &mut PolicyNet,
+    tt: &mut EvalTable,
+    nodes: &mut Vec<Node>,
+    max_nodes: usize,
     game: &Game,
     ctx: &SearchContext,
     print: bool,
-    reused: Option<Vec<Node>>,
-) -> (SearchResult, u64, Vec<Node>) {
+) -> (SearchResult, u64) {
     let start = Instant::now();
     let limits = ctx.limits;
     let budget = timeman::budget(
@@ -446,34 +636,38 @@ fn search_tree(
         u64::MAX
     });
 
+    let fresh = nodes.is_empty();
     let mut tree = Tree {
         net,
+        tt,
         params: *ctx.params,
-        nodes: Vec::new(),
+        nodes,
+        max_nodes,
+        full: false,
+        frozen: false,
+        prunes: 0,
         seldepth: 0,
         depth_sum: 0,
         playouts: 0,
     };
-    match reused {
-        Some(nodes) => tree.nodes = nodes,
-        None => {
-            tree.nodes.push(Node::new(Move::NULL, 1.0));
-            tree.playout(game); // expands the root
-        }
+    if fresh {
+        tree.nodes.push(Node::new(Move::NULL, 1.0));
+        tree.playout(game); // expands the root
     }
     if !limits.searchmoves.is_empty() {
         // searchmoves: keep only those root moves (always a fresh tree, so
         // they have no subtrees yet and can be moved around in the arena)
-        let (first, count) = (tree.nodes[ROOT].first, tree.nodes[ROOT].count);
+        let children = tree.nodes[ROOT].children();
+        let first = children.start;
         let mut kept = 0;
-        for c in first..first + count {
+        for c in children {
             if limits.searchmoves.contains(&tree.nodes[c].mv.to_uci()) {
                 tree.nodes.swap(first + kept, c);
                 kept += 1;
             }
         }
         if kept > 0 {
-            tree.nodes[ROOT].count = kept;
+            tree.nodes[ROOT].count = kept as u8;
         }
     }
 
@@ -487,6 +681,9 @@ fn search_tree(
         && budget.is_none_or(|b| start.elapsed() < b.soft)
     {
         tree.playout(game);
+        if tree.full {
+            tree.prune();
+        }
         if print {
             let ms = start.elapsed().as_millis();
             if tree.depth() > shown_depth
@@ -501,6 +698,18 @@ fn search_tree(
             }
         }
     }
+    if print && tree.prunes > 0 {
+        println!(
+            "info string tree full (Hash {} MB): pruned {} times{}",
+            ctx.common.hash_mb,
+            tree.prunes,
+            if tree.frozen {
+                ", then searched on without growing"
+            } else {
+                ""
+            }
+        );
+    }
 
     let playouts = tree.playouts;
     let Some(best) = tree.best_child(ROOT) else {
@@ -511,7 +720,7 @@ fn search_tree(
             best: Move::NULL,
             ponder: None,
         };
-        return (none, playouts, tree.nodes);
+        return (none, playouts);
     };
     if print && tree.playouts != shown_playouts {
         tree.print_info(start, ctx.show_wdl);
@@ -521,7 +730,7 @@ fn search_tree(
         best: tree.nodes[best].mv,
         ponder,
     };
-    (result, playouts, tree.nodes)
+    (result, playouts)
 }
 
 #[cfg(test)]
@@ -615,17 +824,23 @@ mod tests {
         }
         let (w, l) = ((1.0 + q) / 2.0, (1.0 - q) / 2.0);
         nodes[1].visits = 4;
-        nodes[1].wdl = [4.0 * w, 0.0, 4.0 * l];
+        (nodes[1].w, nodes[1].l) = (4.0 * w, 4.0 * l);
         // the root stores results for the side that moved into it
         nodes[0].visits = 5;
-        nodes[0].wdl = [5.0 * l, 0.0, 5.0 * w];
+        (nodes[0].w, nodes[0].l) = (5.0 * l, 5.0 * w);
         nodes[0].first = 1;
         nodes[0].count = 3;
-        nodes[0].expanded = true;
+        nodes[0].flags = EXPANDED;
         Tree {
             net,
+            // a small table and arena per test tree (leaked: tests only)
+            tt: Box::leak(Box::new(EvalTable::new(1 << 16))),
             params,
-            nodes,
+            nodes: Box::leak(Box::new(nodes)),
+            max_nodes: 1000,
+            full: false,
+            frozen: false,
+            prunes: 0,
             seldepth: 0,
             depth_sum: 0,
             playouts: 0,
@@ -709,46 +924,38 @@ mod tests {
     // ---------------------------------------------------------- tree reuse
 
     /// Every expanded, non-terminal node was visited once when it was
-    /// expanded and once more for every visit of one of its children.
+    /// expanded and once more for every visit of one of its children;
+    /// children come after their parent.
     fn check_tree(nodes: &[Node]) {
         for (i, n) in nodes.iter().enumerate() {
-            assert!(
-                n.first + n.count <= nodes.len(),
-                "node {i} children out of range"
-            );
-            if n.expanded && n.terminal.is_none() {
-                let below: u32 = nodes[n.first..n.first + n.count]
-                    .iter()
-                    .map(|c| c.visits)
-                    .sum();
-                assert_eq!(n.visits, 1 + below, "node {i}");
+            let c = n.children();
+            assert!(c.end <= nodes.len(), "node {i} children out of range");
+            assert!(n.count == 0 || c.start > i, "node {i} children before it");
+            if n.expanded() && n.terminal().is_none() {
+                // equal, or more after a collapsed node was expanded again
+                let below: u32 = nodes[c].iter().map(|c| c.visits).sum();
+                assert!(n.visits > below, "node {i}: {} vs {below}", n.visits);
             }
         }
     }
 
-    /// Search `game` with `m` for `playouts` new playouts.
-    fn search_with(
-        m: &mut Mcts,
-        net: &mut PolicyNet,
-        game: &Game,
-        playouts: u64,
-        params: &SearchParams,
-    ) -> Move {
-        let limits = SearchLimits {
-            nodes: Some(playouts),
-            ..Default::default()
-        };
-        let common = CommonOptions::default();
-        let stop = AtomicBool::new(false);
-        let ctx = SearchContext {
-            limits: &limits,
-            common: &common,
-            stop: &stop,
-            show_wdl: false,
-            verbose_move_stats: false,
-            params,
-        };
-        m.search(net, game, &ctx).best
+    /// Number of nodes in the subtree of `nodes[root]`.
+    fn subtree_size(nodes: &[Node], root: usize) -> usize {
+        1 + nodes[root]
+            .children()
+            .map(|c| subtree_size(nodes, c))
+            .sum::<usize>()
+    }
+
+    /// The two subtrees hold the same nodes in the same shape.
+    fn same_tree(a: &[Node], ra: usize, b: &[Node], rb: usize) {
+        let (x, y) = (&a[ra], &b[rb]);
+        assert_eq!((x.visits, x.count, x.flags), (y.visits, y.count, y.flags));
+        assert_eq!((x.w, x.l, x.prior), (y.w, y.l, y.prior));
+        for (ca, cb) in x.children().zip(y.children()) {
+            assert!(a[ca].mv == b[cb].mv);
+            same_tree(a, ca, b, cb);
+        }
     }
 
     fn ctx_for<'a>(
@@ -767,6 +974,56 @@ mod tests {
         }
     }
 
+    /// Search `game` with `m` for `playouts` new playouts.
+    fn search_with(
+        m: &mut Mcts,
+        net: &mut PolicyNet,
+        game: &Game,
+        playouts: u64,
+        params: &SearchParams,
+    ) -> Move {
+        let limits = SearchLimits {
+            nodes: Some(playouts),
+            ..Default::default()
+        };
+        let (common, stop) = (CommonOptions::default(), AtomicBool::new(false));
+        m.search(net, game, &ctx_for(&limits, &common, &stop, params))
+            .best
+    }
+
+    #[test]
+    fn node_is_24_bytes_and_hash_is_the_whole_budget() {
+        assert_eq!(std::mem::size_of::<Node>(), 24);
+        for mb in [1, 16, 256] {
+            let (nodes, tt) = budget(mb);
+            assert!(nodes * 24 + tt <= mb << 20);
+            assert!(nodes * 24 + tt + 24 > mb << 20);
+        }
+    }
+
+    #[test]
+    fn compaction_in_place_matches_a_copy() {
+        peazero_core::init();
+        let mut net = PolicyNet::embedded();
+        let params = SearchParams::default();
+        let mut m = Mcts::default();
+        search_with(&mut m, &mut net, &Game::default(), 600, &params);
+        let original = m.nodes.clone();
+        check_tree(&original);
+        // every node with a subtree, as the new root
+        let roots: Vec<usize> = (1..original.len())
+            .filter(|&i| original[i].count > 0)
+            .collect();
+        assert!(roots.len() > 20);
+        for r in roots {
+            let mut nodes = original.clone();
+            compact_in_place(&mut nodes, r, None);
+            assert_eq!(nodes.len(), subtree_size(&original, r));
+            check_tree(&nodes);
+            same_tree(&original, r, &nodes, ROOT);
+        }
+    }
+
     #[test]
     fn reuse_keeps_the_subtree_of_the_moves_played() {
         peazero_core::init();
@@ -775,45 +1032,27 @@ mod tests {
         let mut m = Mcts::default();
         let mut game = Game::default();
         let best = search_with(&mut m, &mut net, &game, 400, &params);
-        let saved = m.saved.as_ref().unwrap();
-        check_tree(&saved.nodes);
+        let old = m.nodes.clone();
         // the expected reply: the most visited grandchild under our move
-        let nodes = &saved.nodes;
-        let ours = (nodes[ROOT].first..nodes[ROOT].first + nodes[ROOT].count)
-            .find(|&c| nodes[c].mv == best)
-            .unwrap();
-        let o = &nodes[ours];
-        let reply = (o.first..o.first + o.count)
-            .max_by_key(|&c| nodes[c].visits)
-            .unwrap();
-        let (reply_mv, reply_visits) = (nodes[reply].mv, nodes[reply].visits);
-        let reply_children: Vec<Move> = (nodes[reply].first
-            ..nodes[reply].first + nodes[reply].count)
-            .map(|c| nodes[c].mv)
-            .collect();
-        assert!(reply_visits > 1, "the reply should have a subtree");
+        let ours = old[ROOT].children().find(|&c| old[c].mv == best).unwrap();
+        let reply = old[ours].children().max_by_key(|&c| old[c].visits).unwrap();
+        assert!(old[reply].visits > 1, "the reply should have a subtree");
 
         game.push(best);
-        game.push(reply_mv);
+        game.push(old[reply].mv);
         let limits = SearchLimits::default();
         let (common, stop) = (CommonOptions::default(), AtomicBool::new(false));
-        let ctx = ctx_for(&limits, &common, &stop, &params);
-        let (nodes, kept) = m.take_reusable(&game, &ctx).expect("reusable");
-        assert_eq!(kept, reply_visits);
-        assert_eq!(nodes[ROOT].visits, reply_visits);
-        check_tree(&nodes);
-        // same children, in the same order, priors re-tempered to the root
-        // temperature and still summing to 1
-        let root = &nodes[ROOT];
-        let kids = &nodes[root.first..root.first + root.count];
-        assert_eq!(
-            kids.iter().map(|c| c.mv).collect::<Vec<_>>(),
-            reply_children
-        );
-        assert!((kids.iter().map(|c| c.prior).sum::<f32>() - 1.0).abs() < 1e-4);
-        // only the subtree was copied: smaller than the old arena, which
-        // is kept as the spare buffer for the next compaction
-        assert!(nodes.len() < m.spare.len());
+        let kept = m.reuse_tree(&game, &ctx_for(&limits, &common, &stop, &params));
+        assert_eq!(kept, old[reply].visits);
+        assert_eq!(m.nodes.len(), subtree_size(&old, reply));
+        check_tree(&m.nodes);
+        // same children in the same order, priors re-tempered to the root
+        // temperature (still summing to 1)
+        let root = m.nodes[ROOT];
+        let moves = |n: &[Node], i: usize| n[i].children().map(|c| n[c].mv).collect::<Vec<_>>();
+        assert!(moves(&m.nodes, ROOT) == moves(&old, reply));
+        let sum: f32 = m.nodes[root.children()].iter().map(|c| c.prior).sum();
+        assert!((sum - 1.0).abs() < 1e-4);
     }
 
     #[test]
@@ -837,16 +1076,16 @@ mod tests {
         let limits = SearchLimits::default();
         let (common, stop) = (CommonOptions::default(), AtomicBool::new(false));
         let ctx = ctx_for(&limits, &common, &stop, &params);
-        let start = Game::default();
+        let mut g = Game::default();
+        g.push_uci("e2e4");
 
         // a different game (not a continuation)
         let mut m = Mcts::default();
-        let mut g = start.clone();
-        g.push_uci("e2e4");
         search_with(&mut m, &mut net, &g, 100, &params);
-        let mut other = start.clone();
+        let mut other = Game::default();
         other.push_uci("d2d4");
-        assert!(m.take_reusable(&other, &ctx).is_none());
+        assert_eq!(m.reuse_tree(&other, &ctx), 0);
+        assert!(m.nodes.is_empty());
 
         // changed parameters
         search_with(&mut m, &mut net, &g, 100, &params);
@@ -854,19 +1093,21 @@ mod tests {
             cpuct: params.cpuct + 0.5,
             ..params
         };
-        let ctx2 = ctx_for(&limits, &common, &stop, &changed);
-        assert!(m.take_reusable(&g, &ctx2).is_none());
+        assert_eq!(
+            m.reuse_tree(&g, &ctx_for(&limits, &common, &stop, &changed)),
+            0
+        );
 
         // ucinewgame
         search_with(&mut m, &mut net, &g, 100, &params);
         m.new_game();
-        assert!(m.take_reusable(&g, &ctx).is_none());
+        assert_eq!(m.reuse_tree(&g, &ctx), 0);
 
-        // same position again: the whole tree, nothing copied
+        // same position again: the whole tree
         search_with(&mut m, &mut net, &g, 100, &params);
-        let (nodes, kept) = m.take_reusable(&g, &ctx).unwrap();
-        assert_eq!(kept, 100);
-        check_tree(&nodes);
+        let n = m.nodes.len();
+        assert_eq!(m.reuse_tree(&g, &ctx), 100);
+        assert_eq!(m.nodes.len(), n);
     }
 
     #[test]
@@ -880,11 +1121,10 @@ mod tests {
         for _ in 0..16 {
             let mv = search_with(&mut m, &mut net, &game, 150, &params);
             assert!(game.position().legal_moves().contains(&mv));
-            let s = m.saved.as_ref().unwrap();
-            check_tree(&s.nodes);
+            check_tree(&m.nodes);
             // the root holds the kept visits plus exactly 150 new ones
-            assert!(s.nodes[ROOT].visits >= 150);
-            if s.nodes[ROOT].visits > 150 {
+            assert!(m.nodes[ROOT].visits >= 150);
+            if m.nodes[ROOT].visits > 150 {
                 reused += 1;
             }
             game.push(mv);
@@ -892,5 +1132,70 @@ mod tests {
         // the engine plays both sides here, so every search after the
         // first starts from the previous one's subtree
         assert!(reused >= 10, "reused {reused} times");
+        assert!(m.nodes.capacity() <= m.max_nodes + 1);
+    }
+
+    #[test]
+    fn pruning_collapses_the_least_visited_nodes_only() {
+        peazero_core::init();
+        let mut net = PolicyNet::embedded();
+        let params = SearchParams::default();
+        let mut m = Mcts::default();
+        search_with(&mut m, &mut net, &Game::default(), 1500, &params);
+        let original = m.nodes.clone();
+        for t in [1, 3, 10] {
+            let mut nodes = original.clone();
+            compact_in_place(&mut nodes, ROOT, Some(t));
+            check_tree(&nodes);
+            assert!(nodes.len() < original.len());
+            // freed = the children of every expanded node with ≤ t visits
+            let freed: usize = original[1..]
+                .iter()
+                .filter(|n| n.count > 0 && n.visits <= t)
+                .map(|n| n.count as usize)
+                .sum();
+            assert_eq!(original.len() - nodes.len(), freed);
+            // statistics are kept; nodes above the threshold keep children
+            assert_eq!(nodes[ROOT].visits, original[ROOT].visits);
+            assert_eq!(nodes[ROOT].count, original[ROOT].count);
+            for n in &nodes[1..] {
+                if n.visits > t {
+                    assert!(n.count > 0 || !n.expanded());
+                } else {
+                    assert_eq!(n.count, 0);
+                }
+            }
+            let sum = |v: &[Node]| v.iter().map(|n| n.visits as u64).sum::<u64>();
+            let kept_children: u64 = sum(&nodes[nodes[ROOT].children()]);
+            assert_eq!(kept_children, sum(&original[original[ROOT].children()]));
+        }
+    }
+
+    #[test]
+    fn full_tree_prunes_and_keeps_searching() {
+        peazero_core::init();
+        let mut net = PolicyNet::embedded();
+        let params = SearchParams::default();
+        let mut m = Mcts::default();
+        // Hash 1: room for ~1,000 playouts; ask for 6,000
+        let limits = SearchLimits {
+            nodes: Some(6000),
+            ..Default::default()
+        };
+        let common = CommonOptions {
+            hash_mb: 1,
+            ..Default::default()
+        };
+        let stop = AtomicBool::new(false);
+        let game = Game::default();
+        let best = m
+            .search(&mut net, &game, &ctx_for(&limits, &common, &stop, &params))
+            .best;
+        assert!(game.position().legal_moves().contains(&best));
+        let (max_nodes, _) = budget(1);
+        assert!(m.nodes.len() <= max_nodes);
+        // every requested playout was done
+        assert_eq!(m.nodes[ROOT].visits, 6000);
+        check_tree(&m.nodes);
     }
 }

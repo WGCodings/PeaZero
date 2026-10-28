@@ -45,6 +45,20 @@ meant to be its own SPRT.
 **Tree reuse**
 - The subtree of the moves played since the last search becomes the new root, with its visits and values (§3.1).
 
+**Transposition table (network evaluations)**
+- A position seen before (any move order) costs a table probe instead of a network call (§3.3).
+
+**Memory (`Hash` is the whole budget)**
+- 75% for the tree (24-byte nodes in one arena, allocated once), 25% for the evaluation table (80-byte entries). Peak memory is `Hash` plus about 14 MB for the program and network.
+- When the tree is full, the search prunes and keeps going until its time is up:
+  - The least-visited expanded nodes are collapsed back into leaves until the tree fits in half the arena. A collapsed node keeps its own visits and W/L; only its children are dropped.
+  - Most of the arena is unvisited children (each expansion allocates a slot per legal move), so this frees a lot, while the well-visited part of the tree that decides the move is untouched.
+  - A collapsed node that becomes interesting again is simply expanded again, usually from the evaluation table.
+  - Only if pruning can't make room for one expansion (a tiny `Hash`) does the search continue without growing the tree.
+  - `info string tree full (Hash N MB): pruned K times` reports it. `hashfull` in the `info` lines is the tree's fill.
+- Example: a 60k-playout search with `Hash` 16 pruned 6 times, peaked at 30 MB, and played the same move as with `Hash` 256 (122 MB).
+- `Hash` 16 holds about 16k playouts and `Hash` 64 about 64k; a move at 8+0.08 uses 1–3k.
+
 **Limits**
 - `go nodes`, `go depth`, `go movetime`, clock plus increment, `movestogo`, `infinite`, `searchmoves`, and `stop`.
 - 400 playouts when no limit is given.
@@ -60,7 +74,7 @@ meant to be its own SPRT.
 - To add a parameter: add one line to the `tunables!` table.
 
 **Not present yet**
-- A network evaluation cache or transposition table.
+- Shared statistics between transpositions (a full transposition graph).
 - Batching, virtual loss or multithreading.
 - Propagation of proven wins, losses and draws, so no `mate N` scores.
 - Smart pruning, early stopping or extending past `soft`.
@@ -126,7 +140,10 @@ meant to be its own SPRT.
 1. After each `go`, the tree is kept, together with the game it was searched for and the parameters used.
 2. On the next `go`, if the new game is the saved game plus some moves (normally our move and the opponent's reply), those moves are followed down the tree from the old root.
 3. If the node reached is expanded and not terminal, its subtree becomes the new root. Its visits and W/D/L sums carry over, so the search starts with that work already done.
-4. **Compaction:** the subtree is copied breadth-first into a second buffer, so each node's children stay contiguous and the root is index 0. The old arena becomes the spare buffer for the next move. Memory stays bounded by one tree, nothing has to be freed node by node, and the copy is a linear pass of microseconds.
+4. **Compaction, in place:** the kept subtree is slid to the front of the same arena, with the new root at index 0.
+   - Children always come after their parent in the arena, so one forward pass over a bitset marks the subtree.
+   - A second forward pass moves each kept node to its rank among the kept nodes and remaps its child index. A node only ever moves to a lower index, so nothing is overwritten before it is read.
+   - No second buffer, nothing freed node by node, and both passes are linear (microseconds).
 5. **Root temperature:** the new root's children got their priors with `PolicyTemp`, but the root uses `PolicyTempRoot`. Because p ∝ exp(logit / T), the conversion is exact without storing logits: p_root ∝ p_tree^(T_tree / T_root), then renormalised.
 
 **Starts fresh when:**
@@ -144,7 +161,7 @@ meant to be its own SPRT.
 - `info string tree reuse: N playouts kept` shows how much was carried over.
 - `bench` always searches from a fresh tree, so its node count doesn't change.
 
-**Why a tree and not a graph.** A transposition graph shares a position reached by different move orders, and lets a whole table survive between moves. At about 1,000 playouts per move, transpositions inside one search are rare. The tree costs no hashing per playout and no locking, and compaction keeps memory exact. Sharing work between transpositions is planned for later as the network evaluation cache (§3.3), which gets most of the benefit without changing the tree.
+**Why a tree and not a graph.** A transposition graph shares a position reached by different move orders, and lets a whole table survive between moves. Transpositions are common (§3.3: 5–40% of evaluations at 1,000 playouts), but the expensive part, the network call, is already shared through the transposition table without changing the tree. What a graph would add is sharing visits and values between the copies of a position. That needs a different node layout, a backup rule for positions with several parents, repetition and 50-move counters in the key, and garbage collection instead of compaction.
 
 **Expected:** +20 to +50 Elo at short time controls. Test at the time control: fixed-node tests would overstate it, because reused playouts are free there.
 
@@ -171,25 +188,56 @@ stop when elapsed ≥ soft · clamp(m, m_min, m_max)  (never past hard)
 
 **Expected:** +15 to +40 Elo combined. Test at the real time control, never at fixed nodes. Effort: small to medium.
 
-### 3.3 Network evaluation cache
+### 3.3 Transposition table for network evaluations (done)
 
-A hash map from the Zobrist key (plus the key of the history planes the network sees) to the policy and WDL output.
-- **Where it pays:**
-  - transpositions inside the tree, which are rare at 1k nodes but common in endgames;
-  - repeated positions;
-  - a tree that was lost, because tree reuse missed or a move was unexpected.
-- **Size:** around 200k entries. A fixed-size table that just overwrites is enough. The `Hash` UCI option sizes it.
-- **Caution about the key:** the network's input includes history planes, so a cache keyed by the current position alone returns slightly wrong evaluations for transpositions reached by different move orders. Either accept that or hash the last few positions in too. SPRT it.
-- **Expected:** +5 to +15 Elo at short time controls, more at long ones. Effort: small.
+**Measured first** (per search, share of network evaluations whose exact network input had already been evaluated in that search):
 
-A full DAG search (shared position nodes, statistics on the edges) is the long-term version. It's a big rewrite, and at our node counts it isn't worth it before the items above.
+| Bench position | 1,000 playouts | 10,000 playouts |
+|---|---|---|
+| Start position | 22% | 34% |
+| Kiwipete | 16% | 29% |
+| QGD | 23% | 40% |
+| Italian middlegame | 6% | 13% |
+| Middlegame (pos 5) | 3% | 7% |
+| Rook endgame | 6% | 25% |
+| K+P vs K+P | 38% | 71% |
+
+**Why one key is enough.** The network sees only the current position, its repetition count and the 50-move counter (21 planes, no move history). So the key is (Zobrist hash, repetition count, 50-move counter), and every move order reaching that position gets the same entry.
+
+**Compact entries (80 bytes).** Measured on 85k searched positions (mean 27 legal moves, max 62), the share of prior mass outside the best K moves:
+
+| Moves kept | Tree, T 1.62 (mean / p99) | Root, T 2.12 (mean / p99) |
+|---|---|---|
+| top 8 | 15% / 39% | 23% / 48% |
+| top 16 | 4.3% / 17% | 8.1% / 25% |
+| top 24 | 1.1% / 7.3% | 2.5% / 13% |
+| top 32 | 0.2% / 2.8% | 0.6% / 5.7% |
+
+The tuned temperatures make the policy flat enough that dropping moves loses real exploration mass, and storing the top 32 with their move indices costs as much as storing all 64 at one byte each. So each entry keeps every legal move:
+- 64-bit key, W and L as u16, the move count, and 64 one-byte logits.
+- Each logit is its distance below the best logit, in steps of 1/16, clamped at about 16: at most 1/32 off, about 2% on a prior. A move 16 below the best has a prior under 0.01% after the temperature.
+- The search always uses the quantised values, on a miss too. So it decides the same way whether or not a position was in the table, and the table size can't change the search, only its speed. (Bench moved once, from 2825 to 2827, when this was introduced.)
+
+**How it works** (`engine/src/search/tt.rs`):
+- A fixed array of entries, a quarter of `Hash` (16 MB → 4 MB ≈ 52k positions).
+- A position with more than 64 legal moves uses the network's values directly and isn't stored (none in 85k searched positions).
+- Always-replace; the slot index is the key scaled to the table size.
+- A hit regenerates the legal moves and pairs them with the stored logits. A different move count means a key collision and is treated as a miss.
+- Temperatures are applied after the lookup, so the table stays valid when the parameters change.
+- The table survives between moves, which helps when tree reuse misses. It's cleared on `ucinewgame` and when the network changes, and reallocated (with the tree) when `Hash` changes.
+
+**Output:** after each move, `info string tree reuse: N playouts kept; eval table: H of P lookups hit, F permille full`.
+
+**Speed:** bench nps went from about 5,300–5,700 to 6,100–6,200. In a UCI test, 22–27% of the lookups hit in the opening and 58% in a K+P endgame.
+
+**Expected:** +5 to +20 Elo at 8+0.08, more at longer time controls and in endgames. Test at the time control: at fixed nodes it changes nothing, by design.
 
 ### 3.4 Cheap per-playout speed-ups (profile first)
 
 At 264 µs per evaluation, inference probably dominates, so measure before working on these:
 - `Tree::evaluate` calls `pos.legal_moves()` for the terminal check, then `legal_actions()` generates the moves again inside `PolicyNet::evaluate`. Generate them once and pass them in.
 - Every playout clones the whole `Game` (with its history) and allocates `path`. Reuse one scratch game and path buffer, or make and unmake moves.
-- `Node` is about 64 bytes. Moving `terminal`, `expanded` and `count` into a compact form, and storing priors as `f16`, matters for long time controls, where memory grows by about 35 nodes per playout.
+- `Node` is already compact (24 bytes: move, child count, flags, prior, first-child index, visits, W and L sums).
 - Run `perf` or `cargo flamegraph` on `bench` first. If inference is above 90% of the time, skip all of this.
 
 ## 4. Phase 3: correctness in decisive positions
@@ -272,7 +320,7 @@ At 264 µs per evaluation, inference probably dominates, so measure before worki
 | 3 | Tree reuse **(done)** | SPRT 8+0.08 | +20–50 | medium |
 | 4 | Early stop + use `hard` / extension multiplier | SPRT 8+0.08, then SPSA TM constants | +15–40 | small–medium |
 | 5 | Certainty propagation + mate scores | SPRT 8+0.08 | +5–20 | medium |
-| 6 | Network evaluation cache | SPRT 8+0.08 and 40+0.4 | +5–15 | small |
+| 6 | Transposition table for evaluations **(done)** | SPRT 8+0.08 and 40+0.4 | +5–20 | small |
 | 7 | Final-move LCB | SPRT | 0–15 | trivial |
 | 8 | Batch benchmark → batched search if ≥ 1.2× | benchmark, then SPRT | −10–+40 | high |
 | 9 | Gumbel root search (experiment) | SPRT | ±30 | medium |
