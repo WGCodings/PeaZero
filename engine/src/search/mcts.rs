@@ -6,21 +6,30 @@
 //! stalemate and draws (repetition, 50-move rule, insufficient material)
 //! get their exact value. The move played is the most visited one.
 //!
-//! Nothing else on purpose: no tree reuse between moves, no virtual loss or
-//! batching, no noise or temperature, unvisited moves start at Q = 0.
+//! Tunable (UCI options, see params.rs):
+//! * exploration U = cpuct(N) · gini_scale · N^exponent · P / (1 + n), with
+//!   optional logarithmic growth of cpuct and gini scaling;
+//! * first-play urgency: an unvisited child is scored as a weighted parent
+//!   Q minus a reduction that grows with the policy mass already visited,
+//!   with separate settings at the root;
+//! * policy softmax temperature, separate at the root.
+//!
+//! The original search (cpuct 1.5, unvisited children at Q = 0,
+//! temperature 1) is still reachable through the options.
+//!
+//! Not (yet): tree reuse between moves, virtual loss or batching, NN cache,
+//! proven-result propagation, smart pruning.
 
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use peazero_core::{Game, Move};
 
-use super::{NetSearch, SearchContext};
+use super::{NetSearch, SearchContext, SearchParams};
 use crate::engine::SearchResult;
 use crate::policy::{q_to_cp, wdl_string, PolicyNet};
 use crate::timeman;
 
-/// Exploration constant of PUCT.
-const C_PUCT: f32 = 1.5;
 /// Playouts when `go` has no time, node or depth limit.
 const DEFAULT_PLAYOUTS: u64 = 400;
 /// `go depth N` stops at this many playouts even if the average depth
@@ -74,10 +83,24 @@ fn flip([w, d, l]: [f32; 3]) -> [f32; 3] {
     [l, d, w]
 }
 
+/// Priors from raw logits: softmax(logit / temp) over the legal moves.
+fn priors(moves: &[(Move, f32)], temp: f32) -> Vec<(Move, f32)> {
+    let inv_t = 1.0 / temp.max(1e-3);
+    let max = moves.iter().map(|m| m.1).fold(f32::NEG_INFINITY, f32::max);
+    let exps: Vec<f32> = moves.iter().map(|m| ((m.1 - max) * inv_t).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    moves
+        .iter()
+        .zip(exps)
+        .map(|(m, e)| (m.0, e / sum))
+        .collect()
+}
+
 pub struct Mcts;
 
 struct Tree<'a> {
     net: &'a mut PolicyNet,
+    params: SearchParams,
     nodes: Vec<Node>,
     seldepth: usize,
     depth_sum: u64,
@@ -110,15 +133,14 @@ impl Tree<'_> {
         }
 
         let eval = self.net.evaluate(game);
-        let max = eval
-            .moves
-            .iter()
-            .map(|m| m.1)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let sum: f32 = eval.moves.iter().map(|m| (m.1 - max).exp()).sum();
+        let temp = if node == ROOT {
+            self.params.policy_temp_root
+        } else {
+            self.params.policy_temp
+        };
         let first = self.nodes.len();
-        for &(m, logit) in &eval.moves {
-            self.nodes.push(Node::new(m, (logit - max).exp() / sum));
+        for (m, prior) in priors(&eval.moves, temp) {
+            self.nodes.push(Node::new(m, prior));
         }
         let n = &mut self.nodes[node];
         n.first = first;
@@ -127,18 +149,49 @@ impl Tree<'_> {
         eval.wdl
     }
 
+    /// (FPU, gini) of `node`. FPU: value of an unvisited child, from the
+    /// view of the side to move at `node`: the parent's own Q minus the FPU
+    /// reduction times √(policy mass of the children already visited).
+    /// gini = 1 − Σ prior² of the children.
+    fn fpu_and_gini(&self, node: usize) -> (f32, f32) {
+        let n = &self.nodes[node];
+        let (mut visited, mut squares) = (0.0f32, 0.0f32);
+        for c in &self.nodes[n.first..n.first + n.count] {
+            squares += c.prior * c.prior;
+            if c.visits > 0 {
+                visited += c.prior;
+            }
+        }
+        let p = &self.params;
+        let (weight, reduction) = if node == ROOT {
+            (p.fpu_parent_weight_root, p.fpu_reduction_root)
+        } else {
+            (p.fpu_parent_weight, p.fpu_reduction)
+        };
+        // `n.q()` is from the view of the side that moved into `node`
+        let fpu = -weight * n.q() - reduction * visited.sqrt();
+        (fpu, 1.0 - squares)
+    }
+
+    #[cfg(test)]
+    fn fpu(&self, node: usize) -> f32 {
+        self.fpu_and_gini(node).0
+    }
+
     fn select(&self, node: usize) -> usize {
         let n = &self.nodes[node];
-        let sqrt_n = (n.visits.max(1) as f32).sqrt();
-        (n.first..n.first + n.count)
-            .max_by(|&a, &b| {
-                let score = |c: usize| {
-                    let c = &self.nodes[c];
-                    c.q() + C_PUCT * c.prior * sqrt_n / (1.0 + c.visits as f32)
-                };
-                score(a).total_cmp(&score(b))
-            })
-            .unwrap()
+        let (fpu, gini) = self.fpu_and_gini(node);
+        let u = self.params.explore_coef(n.visits, gini);
+        let mut best = (n.first, f32::NEG_INFINITY);
+        for c in n.first..n.first + n.count {
+            let child = &self.nodes[c];
+            let q = if child.visits == 0 { fpu } else { child.q() };
+            let score = q + u * child.prior / (1.0 + child.visits as f32);
+            if score > best.1 {
+                best = (c, score);
+            }
+        }
+        best.0
     }
 
     fn playout(&mut self, root: &Game) {
@@ -256,6 +309,7 @@ pub fn run(
 
     let mut tree = Tree {
         net,
+        params: *ctx.params,
         nodes: vec![Node::new(Move::NULL, 1.0)],
         seldepth: 0,
         depth_sum: 0,
@@ -346,6 +400,7 @@ mod tests {
             stop: &stop,
             show_wdl: true,
             verbose_move_stats: false,
+            params: &crate::search::SearchParams::default(),
         };
         let r = Mcts.search(&mut net, &game, &ctx);
         (r.best, game)
@@ -366,6 +421,7 @@ mod tests {
             stop: &stop,
             show_wdl: false,
             verbose_move_stats: false,
+            params: &crate::search::SearchParams::default(),
         };
         super::run(&mut net, &game, &ctx, false).1
     }
@@ -402,5 +458,101 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(m, top);
+    }
+
+    /// A root with three children (priors 0.5 / 0.3 / 0.2); only the first
+    /// is visited (4 times, mean W-L `q` for the side to move at the root).
+    fn small_tree(net: &mut PolicyNet, q: f32, params: SearchParams) -> Tree<'_> {
+        let mut nodes = vec![Node::new(Move::NULL, 1.0)];
+        for p in [0.5, 0.3, 0.2] {
+            nodes.push(Node::new(Move::NULL, p));
+        }
+        let (w, l) = ((1.0 + q) / 2.0, (1.0 - q) / 2.0);
+        nodes[1].visits = 4;
+        nodes[1].wdl = [4.0 * w, 0.0, 4.0 * l];
+        // the root stores results for the side that moved into it
+        nodes[0].visits = 5;
+        nodes[0].wdl = [5.0 * l, 0.0, 5.0 * w];
+        nodes[0].first = 1;
+        nodes[0].count = 3;
+        nodes[0].expanded = true;
+        Tree {
+            net,
+            params,
+            nodes,
+            seldepth: 0,
+            depth_sum: 0,
+        }
+    }
+
+    #[test]
+    fn fpu_follows_the_parent_value() {
+        peazero_core::init();
+        let mut net = PolicyNet::embedded();
+        // weight 0, reduction 0: unvisited moves are a draw, whatever the
+        // parent's value (the original search)
+        let d = SearchParams {
+            fpu_parent_weight_root: 0.0,
+            fpu_reduction_root: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(small_tree(&mut net, -0.8, d).fpu(ROOT), 0.0);
+        assert_eq!(small_tree(&mut net, 0.8, d).fpu(ROOT), 0.0);
+        // defaults (weight 1, reduction 1 at the root): the parent's Q
+        // minus √(visited prior mass)
+        let p = SearchParams::default();
+        let r = 0.5f32.sqrt();
+        let lost = small_tree(&mut net, -0.8, p).fpu(ROOT);
+        assert!((lost - (-0.8 - r)).abs() < 1e-5, "{lost}");
+        let won = small_tree(&mut net, 0.8, p).fpu(ROOT);
+        assert!((won - (0.8 - r)).abs() < 1e-5, "{won}");
+        // half weight, no reduction
+        let h = SearchParams {
+            fpu_parent_weight_root: 0.5,
+            fpu_reduction_root: 0.0,
+            ..Default::default()
+        };
+        assert!((small_tree(&mut net, 0.3, h).fpu(ROOT) - 0.15).abs() < 1e-5);
+    }
+
+    #[test]
+    fn fpu_changes_which_move_is_explored() {
+        peazero_core::init();
+        let mut net = PolicyNet::embedded();
+        // FPU = draw (the original search): in a lost position every
+        // unvisited move looks better than the visited one
+        let d = SearchParams {
+            fpu_parent_weight_root: 0.0,
+            fpu_reduction_root: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(small_tree(&mut net, -0.8, d).select(ROOT), 2);
+        // parent-Q FPU with a huge reduction: stay on the visited move
+        let p = SearchParams {
+            fpu_reduction_root: 3.0,
+            ..Default::default()
+        };
+        assert_eq!(small_tree(&mut net, -0.8, p).select(ROOT), 1);
+        assert_eq!(small_tree(&mut net, 0.8, p).select(ROOT), 1);
+    }
+
+    #[test]
+    fn policy_temperature_flattens_priors() {
+        let m = Move::NULL;
+        let moves = [(m, 2.0), (m, 0.0), (m, -1.0)];
+        let p1 = priors(&moves, 1.0);
+        let p2 = priors(&moves, 2.0);
+        for p in [&p1, &p2] {
+            assert!((p.iter().map(|x| x.1).sum::<f32>() - 1.0).abs() < 1e-5);
+        }
+        assert!((p1[0].1 - 2f32.exp() / (2f32.exp() + 1.0 + (-1f32).exp())).abs() < 1e-5);
+        assert!(p2[0].1 < p1[0].1 && p2[2].1 > p1[2].1);
+    }
+
+    #[test]
+    fn default_params_find_mate_at_small_budget() {
+        // mate in one at a small budget
+        let (m, g) = run("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1", 100);
+        assert_eq!(m, g.position().parse_uci_move("a1a8").unwrap());
     }
 }

@@ -50,6 +50,7 @@ pub fn run(net: &mut PolicyNet) -> u64 {
         stop: &stop,
         show_wdl: false,
         verbose_move_stats: false,
+        params: &crate::search::SearchParams::default(),
     };
 
     let start = Instant::now();

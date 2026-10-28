@@ -17,9 +17,11 @@ use peazero_core::Game;
 
 use crate::engine::{CommonOptions, SearchLimits, SearchResult};
 use crate::policy::PolicyNet;
+pub use params::SearchParams;
 
 pub mod alphabeta;
 pub mod mcts;
+pub mod params;
 pub mod searchless;
 
 /// Everything a search needs besides the network and the position.
@@ -29,6 +31,8 @@ pub struct SearchContext<'a> {
     pub stop: &'a AtomicBool,
     pub show_wdl: bool,
     pub verbose_move_stats: bool,
+    /// Tunable search parameters (UCI options, see params.rs).
+    pub params: &'a SearchParams,
 }
 
 pub trait NetSearch: Send {

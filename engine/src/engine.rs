@@ -101,6 +101,12 @@ pub trait Engine: Send {
         Vec::new()
     }
 
+    /// Tunable parameters with their current values in OpenBench's SPSA
+    /// input format (UCI command `spsa`).
+    fn spsa_lines(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Handle an engine-specific option. Return false if unknown.
     fn set_option(&mut self, _name: &str, _value: &str) -> bool {
         false

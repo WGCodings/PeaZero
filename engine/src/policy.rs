@@ -11,7 +11,7 @@ use peazero_core::{Game, Move};
 use peazero_nn::wdl_probs;
 
 use crate::engine::{CommonOptions, Engine, SearchLimits, SearchResult};
-use crate::search::{NetSearch, SearchContext, SearchMode};
+use crate::search::{params, NetSearch, SearchContext, SearchMode, SearchParams};
 
 /// The network compiled into the binary (see build.rs / `EVALFILE`).
 pub static EMBEDDED_NET: &[u8] = include_bytes!(env!("PEAZERO_EVALFILE"));
@@ -92,7 +92,7 @@ impl PolicyNet {
 }
 
 /// Map an expected score `q = W - L` in [-1, 1] to centipawns
-/// (same shape as Lc0's default conversion).
+/// (tangent curve: q 0.5 ≈ 111 cp, q 0.9 ≈ 671 cp, ±0.999 ≈ ±10800 cp).
 pub fn q_to_cp(q: f32) -> i32 {
     let q = q.clamp(-0.999, 0.999) as f64;
     (111.714_640_912 * (1.562_068_842_1 * q).tan()).round() as i32
@@ -129,6 +129,7 @@ pub struct PolicyEngine {
     verbose_move_stats: bool,
     mode: SearchMode,
     search: Box<dyn NetSearch>,
+    params: SearchParams,
 }
 
 impl PolicyEngine {
@@ -142,6 +143,7 @@ impl PolicyEngine {
             verbose_move_stats: false,
             mode: Self::DEFAULT_MODE,
             search: Self::DEFAULT_MODE.create(),
+            params: SearchParams::default(),
         }
     }
 }
@@ -152,12 +154,18 @@ impl Engine for PolicyEngine {
     }
 
     fn uci_options(&self) -> Vec<String> {
-        vec![
+        let mut options = vec![
             format!("option name EvalFile type string default {}", self.net_name),
             "option name UCI_ShowWDL type check default true".to_string(),
             "option name VerboseMoveStats type check default false".to_string(),
             SearchMode::uci_option(Self::DEFAULT_MODE),
-        ]
+        ];
+        options.extend(params::uci_options());
+        options
+    }
+
+    fn spsa_lines(&self) -> Vec<String> {
+        params::spsa_lines(&self.params)
     }
 
     fn set_option(&mut self, name: &str, value: &str) -> bool {
@@ -205,7 +213,7 @@ impl Engine for PolicyEngine {
                 }
                 true
             }
-            _ => false,
+            _ => self.params.set(name, value),
         }
     }
 
@@ -222,6 +230,7 @@ impl Engine for PolicyEngine {
             stop,
             show_wdl: self.show_wdl,
             verbose_move_stats: self.verbose_move_stats,
+            params: &self.params,
         };
         self.search.search(&mut self.net, game, &ctx)
     }
@@ -307,5 +316,22 @@ mod tests {
         assert!(q_to_cp(0.5) > 0 && q_to_cp(-0.5) < 0);
         assert!(q_to_cp(0.9) > q_to_cp(0.5));
         assert!(q_to_cp(1.0).abs() < 100_000);
+    }
+
+    #[test]
+    fn search_params_are_uci_options() {
+        let mut engine = PolicyEngine::new();
+        let opts = engine.uci_options();
+        assert!(
+            opts.contains(&"option name CPuct type spin default 215 min 1 max 1000".to_string())
+        );
+        assert!(opts
+            .iter()
+            .any(|o| o.starts_with("option name PolicyTempRoot type spin")));
+        assert!(engine.set_option("CPuct", "300"));
+        assert!(engine.set_option("fpureduction", "0"));
+        assert_eq!(engine.params.cpuct, 3.0);
+        assert_eq!(engine.params.fpu_reduction, 0.0);
+        assert!(!engine.set_option("NoSuchOption", "1"));
     }
 }

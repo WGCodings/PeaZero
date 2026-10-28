@@ -35,7 +35,7 @@
 //! this way (logit −4 vs +7..+18 for every other move). The policy target
 //! still uses the network's own logits.
 //!
-//! Temperature (lc0-style; `temperature > 0`): the move played is sampled
+//! Temperature (`temperature > 0`): the move played is sampled
 //! from the policy target `π'` as `π'(a)^(1/T)` among the root actions whose
 //! search value is within `temp_value_cutoff` (W − L) of the best visited
 //! action, instead of the Sequential Halving winner. `T` decays linearly
@@ -702,7 +702,7 @@ fn explore_logits(logits: &[f32], eps: f32) -> Option<Vec<f32>> {
     )
 }
 
-/// lc0-style move sampling: `target(a)^(1/temp)` over the visited root
+/// Move sampling: `target(a)^(1/temp)` over the visited root
 /// actions whose Q is within `cutoff` of the best visited action's Q.
 fn sample_with_temperature(
     root: &Node,

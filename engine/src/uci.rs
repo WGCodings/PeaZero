@@ -103,6 +103,12 @@ impl UciLoop {
                 self.stop_search();
                 crate::bench::run(&mut crate::policy::PolicyNet::embedded());
             }
+            // OpenBench SPSA input: the tunable parameters, current values
+            "spsa" => {
+                for l in self.engine.lock().unwrap().spsa_lines() {
+                    println!("{l}");
+                }
+            }
             "perft" => {
                 self.stop_search();
                 let depth = tokens.get(1).and_then(|d| d.parse().ok()).unwrap_or(5);
