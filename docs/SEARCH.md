@@ -42,6 +42,9 @@ meant to be its own SPRT.
   - `wdl` (UCI_ShowWDL);
   - nodes, nps and pv.
 
+**Tree reuse**
+- The subtree of the moves played since the last search becomes the new root, with its visits and values (§3.1).
+
 **Limits**
 - `go nodes`, `go depth`, `go movetime`, clock plus increment, `movestogo`, `infinite`, `searchmoves`, and `stop`.
 - 400 playouts when no limit is given.
@@ -57,7 +60,6 @@ meant to be its own SPRT.
 - To add a parameter: add one line to the `tunables!` table.
 
 **Not present yet**
-- Tree reuse between moves.
 - A network evaluation cache or transposition table.
 - Batching, virtual loss or multithreading.
 - Propagation of proven wins, losses and draws, so no `mate N` scores.
@@ -118,18 +120,33 @@ meant to be its own SPRT.
 
 ## 3. Phase 2: get more out of each second
 
-### 3.1 Tree reuse
+### 3.1 Tree reuse (done)
 
-- **Change:** keep the tree after `go`. On the next `position ... moves`:
-  1. Find the two plies played (ours and the opponent's).
-  2. Make that grandchild the new root.
-  3. Compact the arena: copy that subtree to a fresh `Vec` with new indices.
-- **Fallback:** if the moves don't match (new game, `ucinewgame`, a position that isn't a continuation), start fresh.
-- **Gain:** the subtree of the reply that was actually played usually holds 20–50% of the previous search, and the expected reply holds the most. That is close to a free 1.3–1.5× in nodes.
-- **Caveats:**
-  - Priors inside the tree were computed with `PolicyTemp`. When a node becomes the root, recompute its children's priors with `PolicyTempRoot`.
-  - Repetition draws depend on game history, which changes. The simplest safe rule is to clear terminal flags for draws by repetition when reusing.
-- **Expected:** +20 to +50 Elo at short time controls. Effort: medium (about 150 lines, plus tests).
+**How it works** (`Mcts::take_reusable` in `mcts.rs`):
+1. After each `go`, the tree is kept, together with the game it was searched for and the parameters used.
+2. On the next `go`, if the new game is the saved game plus some moves (normally our move and the opponent's reply), those moves are followed down the tree from the old root.
+3. If the node reached is expanded and not terminal, its subtree becomes the new root. Its visits and W/D/L sums carry over, so the search starts with that work already done.
+4. **Compaction:** the subtree is copied breadth-first into a second buffer, so each node's children stay contiguous and the root is index 0. The old arena becomes the spare buffer for the next move. Memory stays bounded by one tree, nothing has to be freed node by node, and the copy is a linear pass of microseconds.
+5. **Root temperature:** the new root's children got their priors with `PolicyTemp`, but the root uses `PolicyTempRoot`. Because p ∝ exp(logit / T), the conversion is exact without storing logits: p_root ∝ p_tree^(T_tree / T_root), then renormalised.
+
+**Starts fresh when:**
+- there is no saved tree (first move, `ucinewgame`, a new `EvalFile`);
+- the position isn't a continuation of the saved game;
+- the parameters changed (`setoption` between moves);
+- `go searchmoves` is used, which trims the root;
+- the reached node was never expanded, or is terminal. A node marked as a draw by repetition is not a draw at the root, where a move must be found.
+
+**Why repetition flags stay valid:** every node in the kept subtree has exactly the same game history as before, because the new root was reached along the path that was actually played. So its draw-by-repetition flags are still correct.
+
+**Limits and output:**
+- `go nodes N` counts this search's playouts, not the kept ones, as do `nodes` and `nps` in the `info` lines.
+- `go depth` uses the average depth of this search's playouts.
+- `info string tree reuse: N playouts kept` shows how much was carried over.
+- `bench` always searches from a fresh tree, so its node count doesn't change.
+
+**Why a tree and not a graph.** A transposition graph shares a position reached by different move orders, and lets a whole table survive between moves. At about 1,000 playouts per move, transpositions inside one search are rare. The tree costs no hashing per playout and no locking, and compaction keeps memory exact. Sharing work between transpositions is planned for later as the network evaluation cache (§3.3), which gets most of the benefit without changing the tree.
+
+**Expected:** +20 to +50 Elo at short time controls. Test at the time control: fixed-node tests would overstate it, because reused playouts are free there.
 
 ### 3.2 Time management: use `hard`, stop early when the answer is settled
 
@@ -252,7 +269,7 @@ At 264 µs per evaluation, inference probably dominates, so measure before worki
 |---|---|---|---|---|
 | 1 | Tunable FPU, exploration term and policy temperatures as UCI options **(done; bench 5572)** | SPRT vs original | done (gain) | small |
 | 2 | SPSA from the defaults (§2.4) | SPRT tuned vs #1 | +10–30 | games only |
-| 3 | Tree reuse | SPRT 8+0.08 | +20–50 | medium |
+| 3 | Tree reuse **(done)** | SPRT 8+0.08 | +20–50 | medium |
 | 4 | Early stop + use `hard` / extension multiplier | SPRT 8+0.08, then SPSA TM constants | +15–40 | small–medium |
 | 5 | Certainty propagation + mate scores | SPRT 8+0.08 | +5–20 | medium |
 | 6 | Network evaluation cache | SPRT 8+0.08 and 40+0.4 | +5–15 | small |

@@ -160,6 +160,13 @@ pub fn spsa_lines(params: &SearchParams) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// Default of a parameter in search units, from the table (so the
+    /// tests don't change when SPSA results become the new defaults).
+    fn default_of(name: &str) -> f32 {
+        let t = TUNABLES.iter().find(|t| t.0 == name).unwrap();
+        t.1 as f32 / t.4 as f32
+    }
+
     fn with(values: &[(&str, &str)]) -> SearchParams {
         let mut p = SearchParams::default();
         for (k, v) in values {
@@ -171,18 +178,17 @@ mod tests {
     #[test]
     fn defaults() {
         let p = SearchParams::default();
-        assert_eq!(p.cpuct, 2.15);
-        assert_eq!(p.policy_temp, 1.61);
-        assert_eq!((p.fpu_parent_weight, p.fpu_reduction), (1.0, 0.44));
-        assert_eq!((p.fpu_parent_weight_root, p.fpu_reduction_root), (1.0, 1.0));
+        assert_eq!(p.cpuct, default_of("CPuct"));
+        assert_eq!(p.policy_temp, default_of("PolicyTemp"));
+        assert_eq!(p.fpu_reduction_root, default_of("FpuReductionRoot"));
         // cpuct(N) · √N, independent of the policy's shape (gini off)
         for (n, gini) in [(1u32, 0.0f32), (400, 0.3), (10_000, 0.9)] {
             let want = p.cpuct_at(n) * (n as f32).sqrt();
             assert!((p.explore_coef(n, gini) - want).abs() < 1e-3 * want);
         }
         // the log term is ~0 at small N and grows with N
-        assert!((p.cpuct_at(0) - 2.15).abs() < 1e-6);
-        assert!(p.cpuct_at(1000) > p.cpuct_at(10) && p.cpuct_at(100_000) > 5.0);
+        assert!((p.cpuct_at(0) - p.cpuct).abs() < 1e-6);
+        assert!(p.cpuct_factor == 0.0 || p.cpuct_at(100_000) > p.cpuct_at(10));
     }
 
     #[test]
@@ -205,6 +211,7 @@ mod tests {
     fn gini_scaling_and_exponent() {
         // gini scaling: a sharp policy (low gini) explores more, capped at max
         let g = with(&[
+            ("CPuct", "215"),
             ("CPuctFactor", "0"),
             ("CPuctGiniBase", "68"),
             ("CPuctGiniFactor", "163"),
@@ -213,7 +220,11 @@ mod tests {
         assert!(g.explore_coef(100, 0.1) > g.explore_coef(100, 0.8));
         assert!((g.explore_coef(100, 0.0) - 2.15 * 2.1 * 10.0).abs() < 1e-3);
         // exponent: N^0.84 instead of √N
-        let e = with(&[("CPuctFactor", "0"), ("CPuctExponent", "84")]);
+        let e = with(&[
+            ("CPuct", "215"),
+            ("CPuctFactor", "0"),
+            ("CPuctExponent", "84"),
+        ]);
         assert!((e.explore_coef(1000, 0.5) - 2.15 * 1000f32.powf(0.84)).abs() < 1e-2);
     }
 
@@ -227,7 +238,7 @@ mod tests {
         assert!(p.set("FpuReduction", "100000"));
         assert_eq!(p.fpu_reduction, 4.0);
         assert!(p.set("PolicyTempRoot", "junk")); // known name, bad value: unchanged
-        assert_eq!(p.policy_temp_root, 1.61);
+        assert_eq!(p.policy_temp_root, default_of("PolicyTempRoot"));
         assert!(!p.set("Hash", "16"));
     }
 
@@ -240,6 +251,8 @@ mod tests {
         assert_eq!(uci_options().len(), TUNABLES.len());
         let lines = spsa_lines(&SearchParams::default());
         assert_eq!(lines.len(), TUNABLES.len());
+        let p = with(&[("CPuct", "215"), ("CPuctGiniFactor", "0")]);
+        let lines = spsa_lines(&p);
         assert_eq!(lines[0], "CPuct, int, 215, 1, 1000, 15.1, 0.002");
         assert!(lines.contains(&"CPuctGiniFactor, int, 0, 0, 1000, 5, 0.002".to_string()));
     }

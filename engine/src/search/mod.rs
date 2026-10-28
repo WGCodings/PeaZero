@@ -75,7 +75,7 @@ impl SearchMode {
         match self {
             SearchMode::Searchless => Box::new(searchless::Searchless),
             SearchMode::AlphaBeta => Box::new(alphabeta::AlphaBeta),
-            SearchMode::Mcts => Box::new(mcts::Mcts),
+            SearchMode::Mcts => Box::new(mcts::Mcts::default()),
         }
     }
 
