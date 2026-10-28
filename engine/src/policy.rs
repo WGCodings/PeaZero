@@ -322,9 +322,12 @@ mod tests {
     fn search_params_are_uci_options() {
         let mut engine = PolicyEngine::new();
         let opts = engine.uci_options();
-        assert!(
-            opts.contains(&"option name CPuct type spin default 215 min 1 max 1000".to_string())
-        );
+        let cpuct = crate::search::params::TUNABLES[0];
+        assert_eq!(cpuct.0, "CPuct");
+        assert!(opts.contains(&format!(
+            "option name CPuct type spin default {} min {} max {}",
+            cpuct.1, cpuct.2, cpuct.3
+        )));
         assert!(opts
             .iter()
             .any(|o| o.starts_with("option name PolicyTempRoot type spin")));
