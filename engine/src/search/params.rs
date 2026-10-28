@@ -89,7 +89,7 @@ macro_rules! tunables {
 
 tunables! {
     /// PUCT exploration constant (at small visit counts if CPuctFactor > 0).
-    "CPuct" => cpuct: default 215, min 1, max 1000, scale 100, step 1;
+    "CPuct" => cpuct: default 139, min 1, max 1000, scale 100, step 1;
     /// Power of the parent's visits in the exploration term (0.5 = √N).
     "CPuctExponent" => cpuct_exponent: default 50, min 10, max 120, scale 100, step 2;
     /// Logarithmic growth of cpuct with the parent's visits (0 = constant).
@@ -104,14 +104,14 @@ tunables! {
     /// children start from a draw) ...
     "FpuParentWeight" => fpu_parent_weight: default 100, min 0, max 200, scale 100, step 5;
     /// ... minus this times √(prior mass of the visited children).
-    "FpuReduction" => fpu_reduction: default 44, min 0, max 400, scale 100, step 2;
+    "FpuReduction" => fpu_reduction: default 43, min 0, max 400, scale 100, step 2;
     /// The same at the root.
     "FpuParentWeightRoot" => fpu_parent_weight_root: default 100, min 0, max 200, scale 100, step 5;
-    "FpuReductionRoot" => fpu_reduction_root: default 100, min 0, max 600, scale 100, step 3;
+    "FpuReductionRoot" => fpu_reduction_root: default 87, min 0, max 600, scale 100, step 3;
     /// Softmax temperature of the policy priors inside the tree.
-    "PolicyTemp" => policy_temp: default 161, min 25, max 800, scale 100, step 3;
+    "PolicyTemp" => policy_temp: default 162, min 25, max 800, scale 100, step 3;
     /// Softmax temperature of the policy priors at the root.
-    "PolicyTempRoot" => policy_temp_root: default 161, min 25, max 2000, scale 100, step 3;
+    "PolicyTempRoot" => policy_temp_root: default 212, min 25, max 2000, scale 100, step 3;
 }
 
 impl SearchParams {
