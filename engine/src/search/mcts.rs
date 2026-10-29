@@ -60,6 +60,9 @@ const DEFAULT_PLAYOUTS: u64 = 400;
 const DEPTH_PLAYOUT_CAP: u64 = 100_000;
 /// At least one info line this often.
 const INFO_MS: u128 = 1000;
+/// With a single legal move, search until it has this many visits (for a
+/// real score in the info line), then play it.
+const SINGLE_MOVE_VISITS: u32 = 8;
 /// Share of `Hash` for the tree; the rest is the evaluation table.
 const TREE_SHARE_PERCENT: usize = 75;
 
@@ -474,15 +477,42 @@ impl Tree<'_> {
         }
     }
 
-    /// Factor on the target time: a clear best move (a large share of the
-    /// visits) gives less time, visits spread over several moves more.
-    fn time_factor(&self) -> f32 {
-        self.params.time_factor(self.best_share())
+    /// |Q(best root move) − Q(last node of its PV)|, both from the root
+    /// mover's view: how much the evaluation changes along the main line.
+    fn pv_diff(&self) -> f32 {
+        let Some(best) = self.best_child(ROOT) else {
+            return 0.0;
+        };
+        let q_best = self.nodes[best].q();
+        let (mut node, mut depth, mut q_end) = (best, 1, q_best);
+        while let Some(c) = self.best_child(node) {
+            if self.nodes[c].visits == 0 {
+                break;
+            }
+            node = c;
+            depth += 1;
+            // a node's Q is for the side that moved into it
+            q_end = if depth % 2 == 1 {
+                self.nodes[c].q()
+            } else {
+                -self.nodes[c].q()
+            };
+        }
+        (q_best - q_end).abs()
+    }
+
+    /// Factor on the target time (visit component, PV component, clamped
+    /// product): a clear best move (a large share of the visits) gives less
+    /// time, visits spread over several moves more; an evaluation that
+    /// changes along the PV gives more.
+    fn time_factor(&self) -> (f32, f32, f32) {
+        self.params.time_factor(self.best_share(), self.pv_diff())
     }
 
     /// Whether to stop now, `elapsed` into the move: never past `hard`;
-    /// `go movetime` uses exactly its time; with a single legal move there
-    /// is nothing to think about; otherwise at `soft` × the time factor.
+    /// `go movetime` uses exactly its time; a single legal move is played
+    /// as soon as it has a few visits (for a real score in the info line);
+    /// otherwise at `soft` × the time factor.
     fn time_up(&self, budget: &timeman::TimeBudget, elapsed: std::time::Duration) -> bool {
         if elapsed >= budget.hard {
             return true;
@@ -490,10 +520,11 @@ impl Tree<'_> {
         if budget.fixed {
             return elapsed >= budget.soft;
         }
-        if self.nodes[ROOT].count == 1 {
-            return true;
+        let root = &self.nodes[ROOT];
+        if root.count == 1 {
+            return self.nodes[root.first as usize].visits >= SINGLE_MOVE_VISITS;
         }
-        elapsed.as_secs_f32() >= budget.soft.as_secs_f32() * self.time_factor()
+        elapsed.as_secs_f32() >= budget.soft.as_secs_f32() * self.time_factor().2
     }
 
     /// Arena fill in permille (UCI `hashfull`: the tree is what runs out).
@@ -706,7 +737,6 @@ fn search_tree(
 
     let target_depth = limits.depth.map(u64::from);
     let (mut shown_depth, mut shown_seldepth, mut last_info) = (0, 0, 0u128);
-    let mut shown_playouts = 0;
     while tree.playouts < max_playouts
         && tree.nodes[ROOT].count > 0
         && target_depth.is_none_or(|d| tree.depth() < d)
@@ -725,7 +755,6 @@ fn search_tree(
             {
                 shown_depth = tree.depth();
                 shown_seldepth = tree.seldepth;
-                shown_playouts = tree.playouts;
                 last_info = ms;
                 tree.print_info(start, ctx.show_wdl);
             }
@@ -733,12 +762,13 @@ fn search_tree(
     }
     if let (true, Some(b)) = (print, budget) {
         if !b.fixed {
+            let (visits, pv, factor) = tree.time_factor();
             println!(
-                "info string time: {} ms used, target {} ms x factor {:.2} (best move {:.0}% of visits), hard {} ms",
+                "info string time: {} ms used, target {} ms x factor {factor:.2} (visits {visits:.2}: best move {:.0}% of visits; pv {pv:.2}: pv diff {:.3}), hard {} ms",
                 start.elapsed().as_millis(),
                 b.soft.as_millis(),
-                tree.time_factor(),
                 100.0 * tree.best_share(),
+                tree.pv_diff(),
                 b.hard.as_millis()
             );
         }
@@ -767,7 +797,9 @@ fn search_tree(
         };
         return (none, playouts);
     };
-    if print && tree.playouts != shown_playouts {
+    // always a final info line (GUIs take the score from it), also when
+    // no new playout was needed (a reused tree)
+    if print {
         tree.print_info(start, ctx.show_wdl);
     }
     let ponder = tree.pv().get(1).copied();
@@ -1247,16 +1279,66 @@ mod tests {
     // ------------------------------------------------------- time management
 
     #[test]
-    fn time_factor_follows_the_best_moves_share() {
+    fn time_factor_follows_the_best_moves_share_and_the_pv() {
         let p = SearchParams::default();
+        let f = |share, diff| p.time_factor(share, diff).2;
         // clear best move → less time; spread visits → more time
-        assert!(p.time_factor(0.9) < p.time_factor(0.5));
-        assert!(p.time_factor(0.5) < p.time_factor(0.2));
-        assert!(p.time_factor(0.9) < 1.0 && p.time_factor(0.2) > 1.0);
+        assert!(f(0.9, 0.0) < f(0.5, 0.0) && f(0.5, 0.0) < f(0.2, 0.0));
+        assert!(f(0.9, 0.0) < 1.0 && f(0.2, 0.0) > 1.0);
+        // a stable PV leaves it alone; an unstable one adds time
+        assert_eq!(p.time_factor(0.5, 0.0).1, 1.0);
+        assert!(f(0.5, 0.2) > f(0.5, 0.0) && f(0.5, 0.5) > f(0.5, 0.2));
+        let (v, pv, both) = p.time_factor(0.6, 0.1);
+        assert!((both - v * pv).abs() < 1e-6);
         for share in [0.0, 0.5, 1.0] {
-            let f = p.time_factor(share);
-            assert!(f >= p.tm_min_mult && f <= p.tm_max_mult);
+            for diff in [0.0, 1.0, 2.0] {
+                let x = f(share, diff);
+                assert!(x >= p.tm_min_mult && x <= p.tm_max_mult);
+            }
         }
+    }
+
+    #[test]
+    fn pv_diff_compares_the_root_move_with_the_pv_end() {
+        peazero_core::init();
+        let mut net = PolicyNet::embedded();
+        let params = SearchParams::default();
+        let mut m = Mcts::default();
+        search_with(&mut m, &mut net, &Game::default(), 500, &params);
+        let max_nodes = m.max_nodes;
+        let tree = Tree {
+            net: &mut net,
+            tt: Box::leak(Box::new(EvalTable::new(1 << 16))),
+            params,
+            nodes: &mut m.nodes,
+            max_nodes,
+            full: false,
+            frozen: false,
+            prunes: 0,
+            seldepth: 0,
+            depth_sum: 0,
+            playouts: 0,
+        };
+        // recompute by hand along the PV
+        let best = tree.best_child(ROOT).unwrap();
+        let (mut node, mut depth) = (best, 1);
+        let mut q = tree.nodes[best].q();
+        while let Some(c) = tree.best_child(node) {
+            if tree.nodes[c].visits == 0 {
+                break;
+            }
+            node = c;
+            depth += 1;
+            q = if depth % 2 == 1 {
+                tree.nodes[c].q()
+            } else {
+                -tree.nodes[c].q()
+            };
+        }
+        assert!(depth > 3);
+        let d = tree.pv_diff();
+        assert!((d - (tree.nodes[best].q() - q).abs()).abs() < 1e-6);
+        assert!((0.0..=2.0).contains(&d));
     }
 
     fn timed_search(fen: &str, limits: SearchLimits) -> std::time::Duration {
@@ -1295,6 +1377,7 @@ mod tests {
 
     #[test]
     fn single_legal_move_is_played_at_once() {
+        // (it searches until the move has SINGLE_MOVE_VISITS visits, ~2 ms)
         // only Kxg2 is legal
         let limits = SearchLimits {
             wtime: Some(60_000),

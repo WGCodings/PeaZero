@@ -119,14 +119,19 @@ tunables! {
     "TmIncPercent" => tm_inc_share: default 75, min 0, max 100, scale 100, step 5;
     /// ... and the hard limit as a multiple of the target time.
     "TmHardMult" => tm_hard_mult: default 300, min 100, max 800, scale 100, step 15;
-    /// Target-time factor from the best move's share of the root visits:
-    /// factor = (TmVisitsBase − share) · TmVisitsMult, clamped to
-    /// [TmMinMult, TmMaxMult]. A clear best move gives less time, visits
-    /// spread over several moves more.
+    /// Target-time factor = visit component × PV component, clamped to
+    /// [TmMinMult, TmMaxMult] (and never past the hard limit).
+    /// Visit component: (TmVisitsBase − share of the best move's visits)
+    /// · TmVisitsMult: a clear best move gives less time, visits spread
+    /// over several moves more.
     "TmVisitsBase" => tm_visits_base: default 140, min 100, max 300, scale 100, step 5;
     "TmVisitsMult" => tm_visits_mult: default 139, min 0, max 400, scale 100, step 8;
-    "TmMinMult" => tm_min_mult: default 30, min 5, max 100, scale 100, step 3;
-    "TmMaxMult" => tm_max_mult: default 300, min 100, max 800, scale 100, step 15;
+    /// PV component: 1 + (|Q(best move) − Q(end of its PV)| − TmPvDiffC)
+    /// · TmPvDiffM: an evaluation that changes along the PV gives more time.
+    "TmPvDiffC" => tm_pv_diff_c: default 0, min -50, max 100, scale 100, step 3;
+    "TmPvDiffM" => tm_pv_diff_m: default 121, min 0, max 400, scale 100, step 8;
+    "TmMinMult" => tm_min_mult: default 10, min 1, max 100, scale 100, step 2;
+    "TmMaxMult" => tm_max_mult: default 500, min 100, max 1000, scale 100, step 25;
 }
 
 impl SearchParams {
@@ -139,11 +144,14 @@ impl SearchParams {
         }
     }
 
-    /// Target-time factor for a best move holding `share` of the root's
-    /// visits (0..1).
-    pub fn time_factor(&self, share: f32) -> f32 {
-        ((self.tm_visits_base - share) * self.tm_visits_mult)
-            .clamp(self.tm_min_mult, self.tm_max_mult)
+    /// Target-time factor: (visit component, PV component, clamped
+    /// product). `share`: the best move's share of the root's visits
+    /// (0..1); `pv_diff`: |Q(best move) − Q(end of its PV)| (0..2).
+    pub fn time_factor(&self, share: f32, pv_diff: f32) -> (f32, f32, f32) {
+        let visits = (self.tm_visits_base - share) * self.tm_visits_mult;
+        let pv = 1.0 + (pv_diff - self.tm_pv_diff_c) * self.tm_pv_diff_m;
+        let factor = (visits * pv).clamp(self.tm_min_mult, self.tm_max_mult);
+        (visits, pv, factor)
     }
 
     /// cpuct for a node with `visits` visits (without the gini scaling).
