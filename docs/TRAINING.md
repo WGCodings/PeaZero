@@ -208,11 +208,13 @@ python train.py --run ..\runs\fifth --net 96x8 --teacher ..\runs\fourth\teacher_
 
 Trains a network on positions from viriformat files — PeaZero's own (`runs/<name>/<name>.vf`) or another engine's NNUE data (e.g. Pea's) — streamed at random through a shuffle buffer (`peazero_rs.VfStream`, Rust: `crates/selfplay/src/vf_reader.rs`; checked against the reference `viriformat` crate's writer, castling/en passant/promotions included). Every `--holdout-every`-th game (200) is held out for evaluation.
 
+**Several files** are read side by side, one stream per file (each with its own `--buffer` shuffle buffer), and every batch mixes them by `--weights` (one per file, in the order of `--data`; default proportional to the file sizes). So the order of the files doesn't matter. Before, files were read one after another, and the end of training saw mostly the last file. The held-out losses are printed and logged per file too (`test_files` in `log.jsonl`), so you can see whether one source drifts.
+
 * **Distillation** (`--teacher <checkpoint.pt>`): the teacher network labels each position on the fly (policy over the legal moves, W/D/L value; `--result-weight` blends in the game result) and the student copies it. No search, no new games. Use: a fast 64×6 from the slower 96×8, starting from `fourth`'s weights:
   ```powershell
   python scripts\train_vf.py --data ..\runs\fifth\fifth.vf ..\runs\fourth\fourth.vf --teacher ..\runs\fifth\checkpoint.pt --init ..\runs\fourth\teacher_gen3000.pt --out ..\runs\distill64 --positions 200e6
   ```
-* **Data labels** (no `--teacher`): value = `--score-weight` (0.5) × W/D/L of the stored score + the rest game result; the score → W/D/L mapping is fitted on the data itself (per 25 cp bin, the frequency of each result; saved as `wdl_table.npy`), so any engine's centipawn scale works. Policy = the move played, smoothed by `--policy-smoothing` (0.1) and weighted `--policy-weight` (0.5), since one move is a weaker target than a search distribution. Use: pre-train a network on Pea's 5k-node data:
+* **Data labels** (no `--teacher`): value = `--score-weight` (0.5) × W/D/L of the stored score + the rest game result; the score → W/D/L mapping is fitted on the data itself, **per file** (per 25 cp bin, the frequency of each result; saved as `wdl_table_<i>.npy`), so each engine's centipawn scale is mapped correctly. Policy = the move played, smoothed by `--policy-smoothing` (0.1) and weighted `--policy-weight` (0.5), since one move is a weaker target than a search distribution. Use: pre-train a network on Pea's 5k-node data:
   ```powershell
   python scripts\train_vf.py --data D:\pea_data\*.vf --net 96x8 --out ..\runs\pea96 --positions 500e6
   ```

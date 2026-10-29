@@ -6,6 +6,12 @@ Positions come from any viriformat files (PeaZero's runs/<name>/<name>.vf,
 or another engine's NNUE data such as Pea's), streamed at random through a
 shuffle buffer. Every --holdout-every-th game is held out for evaluation.
 
+Several files are read side by side, one stream per file, and every batch
+mixes them by weight (--weights, default: proportional to the file sizes),
+so the order of the files doesn't matter. In data-label mode each file gets
+its own score -> W/D/L table (engines report scores on different scales).
+The held-out losses are also reported per file.
+
 Two modes:
 
   Distillation (--teacher <checkpoint.pt>): the teacher network labels every
@@ -75,13 +81,55 @@ class Prefetcher:
     def _run(self):
         while True:
             b = self.stream.batch(self.batch)
-            t = {k: torch.from_numpy(v) for k, v in b.items()}
+            t = {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in b.items()}
             if self.pin:
                 t = {k: v.pin_memory() for k, v in t.items()}
             self.q.put(t)
 
     def get(self, dev):
         return {k: v.to(dev, non_blocking=True) for k, v in self.q.get().items()}
+
+
+class Mix:
+    """One VfStream per file; every batch takes positions from each file in
+    proportion to its weight (fractional shares carried over, so the long-run
+    mix is exact). Adds `source` (the file index) and, with score tables
+    (data labels), `score_wdl` (W/D/L of the stored score, per file's table)."""
+
+    def __init__(self, files, weights, args, holdout, seed, buffer):
+        self.files = files
+        self.streams = [pz.VfStream([f], buffer=buffer, seed=seed + 7919 * i, holdout_every=args.holdout_every,
+                                    holdout=holdout, skip_plies=args.skip_plies) for i, f in enumerate(files)]
+        w = np.asarray(weights, dtype=np.float64)
+        self.share = w / w.sum()
+        self.carry = np.zeros(len(files))
+        self.tables = None
+
+    @property
+    def epochs(self):
+        return min(s.epochs for s in self.streams)
+
+    def counts(self, n):
+        want = self.share * n + self.carry
+        k = np.floor(want).astype(np.int64)
+        while k.sum() < n:  # hand out the remainder by largest fraction
+            k[np.argmax(want - k)] += 1
+        self.carry = want - k
+        return k
+
+    def batch(self, n):
+        parts = []
+        for i, (s, k) in enumerate(zip(self.streams, self.counts(n))):
+            if k == 0:
+                continue
+            b = s.batch(int(k))
+            b["source"] = np.full(int(k), i, dtype=np.int64)
+            if self.tables is not None:
+                table, bin_cp, max_cp = self.tables[i]
+                idx = np.clip(np.round(b["score"] / bin_cp).astype(np.int64) + max_cp // bin_cp, 0, len(table) - 1)
+                b["score_wdl"] = table[idx].astype(np.float32)
+            parts.append(b)
+        return {key: np.concatenate([p[key] for p in parts]) for key in parts[0]}
 
 
 def fit_wdl_table(stream, positions, bin_cp=25, max_cp=2000):
@@ -104,16 +152,8 @@ def fit_wdl_table(stream, positions, bin_cp=25, max_cp=2000):
 class Targets:
     """Policy (over the legal moves) and W/D/L value targets for a batch."""
 
-    def __init__(self, args, dev, teacher=None, wdl=None):
+    def __init__(self, args, dev, teacher=None):
         self.args, self.dev, self.teacher = args, dev, teacher
-        if wdl is not None:
-            table, self.bin_cp, self.max_cp = wdl
-            self.table = torch.tensor(table, dtype=torch.float32, device=dev)
-
-    def score_wdl(self, score):
-        idx = torch.clamp(torch.round(score / self.bin_cp).long() + self.max_cp // self.bin_cp, 0,
-                          self.table.shape[0] - 1)
-        return self.table[idx]
 
     @torch.no_grad()
     def __call__(self, t, amp):
@@ -134,7 +174,7 @@ class Targets:
             onehot = onehot / onehot.sum(-1, keepdim=True).clamp(min=1)
             uniform = mask / mask.sum(-1, keepdim=True).clamp(min=1)
             policy = (1 - a.policy_smoothing) * onehot + a.policy_smoothing * uniform
-            value = a.score_weight * self.score_wdl(t["score"]) + (1 - a.score_weight) * result
+            value = a.score_weight * t["score_wdl"] + (1 - a.score_weight) * result
         return policy, value
 
 
@@ -154,17 +194,51 @@ def losses(net, t, policy, value, amp):
 
 @torch.no_grad()
 def evaluate(net, batches, targets, amp):
+    """Held-out losses of `net` on fixed batches per file: the mix (the
+    files weighted like training) and each file on its own."""
     net.eval()
-    out = np.zeros(4)
-    for t in batches:
-        policy, value = targets(t, amp)
-        out += np.array([float(x) for x in losses(net, t, policy, value, amp)])
-    return dict(zip(["policy", "value", "agree", "value_vs_result"], out / len(batches)))
+    keys = ["policy", "value", "agree", "value_vs_result"]
+    per_file = []
+    for fb in batches:
+        out = np.zeros(4)
+        for t in fb:
+            policy, value = targets(t, amp)
+            out += np.array([float(x) for x in losses(net, t, policy, value, amp)])
+        per_file.append(out / len(fb))
+    share = batches.share
+    mix = sum(w * o for w, o in zip(share, per_file))
+    res = dict(zip(keys, mix))
+    res["files"] = [dict(zip(keys, o)) for o in per_file]
+    return res
+
+
+class TestBatches(list):
+    """Fixed held-out batches, a list per file, plus the files' shares."""
+
+    def __init__(self, mix, n_batches, batch, dev):
+        super().__init__()
+        self.share = mix.share
+        per = max(1, n_batches // len(mix.streams))
+        for i, s in enumerate(mix.streams):
+            fb = []
+            for _ in range(per):
+                b = s.batch(batch)
+                b["source"] = np.full(batch, i, dtype=np.int64)
+                if mix.tables is not None:
+                    table, bin_cp, max_cp = mix.tables[i]
+                    idx = np.clip(np.round(b["score"] / bin_cp).astype(np.int64) + max_cp // bin_cp, 0,
+                                  len(table) - 1)
+                    b["score_wdl"] = table[idx].astype(np.float32)
+                fb.append(to_dev(b, dev))
+            self.append(fb)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", nargs="+", required=True, help="viriformat files or globs")
+    ap.add_argument("--weights", nargs="+", type=float,
+                    help="mixing weight per file, in the order of --data (a glob's matches sorted); "
+                         "default: proportional to the file sizes")
     ap.add_argument("--out", required=True, help="output folder (checkpoint.pt, net.pzn, log.jsonl)")
     ap.add_argument("--teacher", help="checkpoint.pt of the teacher network (distillation mode)")
     ap.add_argument("--init", help="checkpoint.pt to start the student from (its size and weights)")
@@ -174,11 +248,11 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3, help="peak learning rate (cosine decay to 1%%)")
     ap.add_argument("--warmup", type=int, default=1000, help="warm-up steps")
     ap.add_argument("--weight-decay", type=float, default=1e-4)
-    ap.add_argument("--buffer", type=int, default=1_000_000, help="shuffle buffer (positions)")
+    ap.add_argument("--buffer", type=int, default=1_000_000, help="shuffle buffer per file (positions)")
     ap.add_argument("--skip-plies", type=int, default=0, help="skip the first N plies of every game record")
     ap.add_argument("--holdout-every", type=int, default=200, help="every N-th game is held out")
     ap.add_argument("--eval-every", type=int, default=2000, help="steps between held-out evaluations")
-    ap.add_argument("--eval-batches", type=int, default=20)
+    ap.add_argument("--eval-batches", type=int, default=20, help="held-out batches in all (split over the files)")
     # distillation
     ap.add_argument("--teacher-temp", type=float, default=1.0, help="teacher policy softmax temperature")
     ap.add_argument("--result-weight", type=float, default=0.0,
@@ -191,13 +265,14 @@ def main():
     ap.add_argument("--policy-weight", type=float, default=None,
                     help="scale of the policy loss (default 1 for distillation, 0.5 for data labels)")
     ap.add_argument("--fit-positions", type=int, default=2_000_000,
-                    help="data labels: positions used to fit the score -> W/D/L table")
+                    help="data labels: positions used to fit each file's score -> W/D/L table")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-amp", action="store_true")
     args = ap.parse_args()
 
-    files = sorted({f for pat in args.data for f in (glob.glob(pat) or [pat])})
+    # in the order given (a glob's matches sorted), each file once
+    files = list(dict.fromkeys(f for pat in args.data for f in (sorted(glob.glob(pat)) or [pat])))
     dev = torch.device(args.device)
     amp = not args.no_amp and dev.type == "cuda"
     if dev.type == "cuda":
@@ -208,13 +283,16 @@ def main():
     if args.policy_weight is None:
         args.policy_weight = 1.0 if distill else 0.5
 
-    train = pz.VfStream(files, buffer=args.buffer, seed=args.seed, holdout_every=args.holdout_every,
-                        holdout=False, skip_plies=args.skip_plies)
-    test = pz.VfStream(files, buffer=min(args.buffer, 200_000), seed=args.seed + 1,
-                       holdout_every=args.holdout_every, holdout=True, skip_plies=args.skip_plies)
-    sizes = sum(os.path.getsize(f) for f in files)
-    print(f"data: {len(files)} file(s), {sizes / 1e9:.2f} GB (~{sizes / 4e6:.0f}M positions at ~4 bytes each); "
-          f"every {args.holdout_every}th game held out")
+    sizes = [os.path.getsize(f) for f in files]
+    weights = args.weights or sizes
+    if len(weights) != len(files):
+        sys.exit(f"--weights: {len(weights)} weights for {len(files)} files")
+    train = Mix(files, weights, args, holdout=False, seed=args.seed, buffer=args.buffer)
+    test = Mix(files, weights, args, holdout=True, seed=args.seed + 1, buffer=min(args.buffer, 200_000))
+    print(f"data: {len(files)} file(s), {sum(sizes) / 1e9:.2f} GB (~{sum(sizes) / 4e6:.0f}M positions at ~4 bytes "
+          f"each); every {args.holdout_every}th game held out")
+    for f, sz, sh in zip(files, sizes, train.share):
+        print(f"  {sh * 100:5.1f}% of each batch  {sz / 1e9:6.2f} GB  {f}")
 
     teacher, wdl = None, None
     if distill:
@@ -224,15 +302,21 @@ def main():
         print(f"distillation: teacher {args.teacher} ({tc['channels']}x{tc['repr_blocks']}, "
               f"gen {tck.get('generation')}), temperature {args.teacher_temp}, result weight {args.result_weight}")
     else:
-        t0 = time.time()
-        wdl = fit_wdl_table(train, args.fit_positions)
-        table, bin_cp, max_cp = wdl
-        mid = max_cp // bin_cp
-        print(f"score -> W/D/L fitted on {args.fit_positions:,} positions ({time.time() - t0:.0f}s): "
-              + ", ".join(f"{cp:+d}cp W{table[mid + cp // bin_cp][0]:.2f} D{table[mid + cp // bin_cp][1]:.2f}"
-                          for cp in (-300, -100, 0, 100, 300)))
-        np.save(os.path.join(args.out, "wdl_table.npy"), table)
-    targets = Targets(args, dev, teacher, wdl)
+        # one table per file: engines report scores on different scales
+        tables = []
+        for i, (f, s) in enumerate(zip(files, train.streams)):
+            t0 = time.time()
+            wdl = fit_wdl_table(s, args.fit_positions)
+            table, bin_cp, max_cp = wdl
+            mid = max_cp // bin_cp
+            print(f"score -> W/D/L for {os.path.basename(f)} ({args.fit_positions:,} positions, "
+                  f"{time.time() - t0:.0f}s): "
+                  + ", ".join(f"{cp:+d}cp W{table[mid + cp // bin_cp][0]:.2f} D{table[mid + cp // bin_cp][1]:.2f}"
+                              for cp in (-300, -100, 0, 100, 300)))
+            np.save(os.path.join(args.out, f"wdl_table_{i}.npy"), table)
+            tables.append(wdl)
+        train.tables = test.tables = tables
+    targets = Targets(args, dev, teacher)
 
     if args.init:
         net, ick = load_net(args.init, dev)
@@ -246,7 +330,7 @@ def main():
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay, fused=dev.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
 
-    test_batches = [to_dev(test.batch(args.batch), dev) for _ in range(args.eval_batches)]
+    test_batches = TestBatches(test, args.eval_batches, args.batch, dev)
     if distill:
         ref = evaluate(teacher, test_batches, targets, amp)
         print(f"teacher on held-out games: value vs result {ref['value_vs_result']:.4f}")
@@ -287,7 +371,8 @@ def main():
             el = time.time() - t0
             rec = {"step": step, "positions": seen, "lr": lr, "epochs": train.epochs, "seconds": round(el),
                    "train_policy": sums[0] / max(1, args.eval_every // 50), "train_value": sums[1] / max(1, args.eval_every // 50),
-                   **{f"test_{k}": v for k, v in ev.items()}}
+                   **{f"test_{k}": v for k, v in ev.items() if k != "files"},
+                   "test_files": {os.path.basename(f): r for f, r in zip(files, ev["files"])}}
             sums[:] = 0
             mark = ""
             if best is None or score < best:
@@ -300,6 +385,10 @@ def main():
             print(f"step {step:7d} | {seen / 1e6:7.1f}M pos ({seen / el:6.0f}/s) | held-out policy {ev['policy']:.4f} "
                   f"value {ev['value']:.4f} agree {ev['agree']:.3f} vs result {ev['value_vs_result']:.4f} | "
                   f"lr {lr:.1e} | waiting for data {wait / el * 100:.0f}%{mark}", flush=True)
+            if len(files) > 1:
+                print("            per file: " + "  ".join(
+                    f"{os.path.basename(f)} p {r['policy']:.3f} v {r['value']:.3f}" for f, r in zip(files, ev["files"])),
+                    flush=True)
     print(f"done: best checkpoint and net.pzn in {args.out}")
 
 
