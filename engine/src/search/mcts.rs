@@ -4,7 +4,8 @@
 //! the network once (policy softmax → priors of its children, W/D/L →
 //! value) and backs the W/D/L up, flipping sides each ply. Checkmate,
 //! stalemate and draws (repetition, 50-move rule, insufficient material)
-//! get their exact value. The move played is the most visited one.
+//! get their exact value. The move played is chosen by a lower confidence
+//! bound on Q among the well-visited root moves (`Tree::root_choice`).
 //!
 //! Tunable (UCI options, see params.rs):
 //! * exploration U = cpuct(N) · gini_scale · N^exponent · P / (1 + n), with
@@ -448,15 +449,44 @@ impl Tree<'_> {
         })
     }
 
+    /// The move to play: among the root moves with at least
+    /// `BestMoveMinShare` of the most visited move's visits, the highest
+    /// lower confidence bound Q − `BestMoveLcbC` / √visits (ties: more
+    /// visits). A move with fewer visits is chosen only if its Q is
+    /// clearly better.
+    fn root_choice(&self) -> Option<usize> {
+        let most = self.best_child(ROOT)?;
+        let max_visits = self.nodes[most].visits;
+        if max_visits == 0 {
+            return Some(most);
+        }
+        let p = &self.params;
+        let min_visits = ((max_visits as f32 * p.best_move_min_share).ceil() as u32).max(1);
+        let lcb = |c: usize| {
+            let n = &self.nodes[c];
+            n.q() - p.best_move_lcb_c / (n.visits as f32).sqrt()
+        };
+        self.nodes[ROOT]
+            .children()
+            .filter(|&c| self.nodes[c].visits >= min_visits)
+            .max_by(|&a, &b| {
+                lcb(a)
+                    .total_cmp(&lcb(b))
+                    .then(self.nodes[a].visits.cmp(&self.nodes[b].visits))
+            })
+    }
+
+    /// The principal variation: the chosen root move, then the most
+    /// visited move at each step.
     fn pv(&self) -> Vec<Move> {
         let mut pv = Vec::new();
-        let mut node = ROOT;
-        while let Some(c) = self.best_child(node) {
+        let mut next = self.root_choice();
+        while let Some(c) = next {
             if self.nodes[c].visits == 0 {
                 break;
             }
             pv.push(self.nodes[c].mv);
-            node = c;
+            next = self.best_child(c);
         }
         pv
     }
@@ -480,7 +510,7 @@ impl Tree<'_> {
     /// |Q(best root move) − Q(last node of its PV)|, both from the root
     /// mover's view: how much the evaluation changes along the main line.
     fn pv_diff(&self) -> f32 {
-        let Some(best) = self.best_child(ROOT) else {
+        let Some(best) = self.root_choice() else {
             return 0.0;
         };
         let q_best = self.nodes[best].q();
@@ -533,7 +563,7 @@ impl Tree<'_> {
     }
 
     fn print_info(&self, start: Instant, show_wdl: bool) {
-        let Some(best) = self.best_child(ROOT) else {
+        let Some(best) = self.root_choice() else {
             return;
         };
         let wdl = self.nodes[best].mean_wdl();
@@ -787,7 +817,7 @@ fn search_tree(
     }
 
     let playouts = tree.playouts;
-    let Some(best) = tree.best_child(ROOT) else {
+    let Some(best) = tree.root_choice() else {
         if print {
             println!("info depth 0 score cp 0");
         }
@@ -800,6 +830,13 @@ fn search_tree(
     // always a final info line (GUIs take the score from it), also when
     // no new playout was needed (a reused tree)
     if print {
+        if let Some(most) = tree.best_child(ROOT).filter(|&m| m != best) {
+            let (b, m) = (&tree.nodes[best], &tree.nodes[most]);
+            println!(
+                "info string move choice: {} (Q {:+.3}, {} visits) over the most visited {} (Q {:+.3}, {} visits)",
+                b.mv, b.q(), b.visits, m.mv, m.q(), m.visits
+            );
+        }
         tree.print_info(start, ctx.show_wdl);
     }
     let ponder = tree.pv().get(1).copied();
@@ -1320,7 +1357,7 @@ mod tests {
             playouts: 0,
         };
         // recompute by hand along the PV
-        let best = tree.best_child(ROOT).unwrap();
+        let best = tree.root_choice().unwrap();
         let (mut node, mut depth) = (best, 1);
         let mut q = tree.nodes[best].q();
         while let Some(c) = tree.best_child(node) {
@@ -1385,5 +1422,62 @@ mod tests {
         };
         let used = timed_search("7k/8/8/8/8/8/6r1/7K w - - 0 1", limits);
         assert!(used < std::time::Duration::from_millis(100), "{used:?}");
+    }
+
+    // ---------------------------------------------------- final move choice
+
+    /// A root with children (visits, Q for the side to move at the root).
+    fn choice_tree<'a>(
+        net: &'a mut PolicyNet,
+        children: &[(u32, f32)],
+        params: SearchParams,
+    ) -> Tree<'a> {
+        let t = small_tree(net, 0.0, params);
+        let mut nodes = vec![Node::new(Move::NULL, 1.0)];
+        for &(v, q) in children {
+            let mut c = Node::new(Move::NULL, 1.0 / children.len() as f32);
+            c.visits = v;
+            (c.w, c.l) = (v as f32 * (1.0 + q) / 2.0, v as f32 * (1.0 - q) / 2.0);
+            nodes.push(c);
+        }
+        nodes[0].visits = 1 + children.iter().map(|c| c.0).sum::<u32>();
+        nodes[0].first = 1;
+        nodes[0].count = children.len() as u8;
+        nodes[0].flags = EXPANDED;
+        *t.nodes = nodes;
+        t
+    }
+
+    #[test]
+    fn root_choice_prefers_a_clearly_better_q_when_visits_are_close() {
+        peazero_core::init();
+        let mut net = PolicyNet::embedded();
+        let p = SearchParams::default();
+        // 400 visits at Q 0.00 vs 300 visits at Q +0.10: the second wins
+        assert_eq!(
+            choice_tree(&mut net, &[(400, 0.0), (300, 0.10)], p).root_choice(),
+            Some(2)
+        );
+        // ... but not with only a slightly better Q
+        assert_eq!(
+            choice_tree(&mut net, &[(400, 0.0), (300, 0.002)], p).root_choice(),
+            Some(1)
+        );
+        // a move below the visit share never wins, however good its Q
+        assert_eq!(
+            choice_tree(&mut net, &[(400, 0.0), (50, 0.9)], p).root_choice(),
+            Some(1)
+        );
+        // BestMoveMinShare 100: always the most visited move
+        let mut most = p;
+        assert!(most.set("BestMoveMinShare", "100"));
+        assert_eq!(
+            choice_tree(&mut net, &[(400, 0.0), (300, 0.5)], most).root_choice(),
+            Some(1)
+        );
+        // the PV starts with the chosen move
+        let t = choice_tree(&mut net, &[(400, 0.0), (300, 0.10)], p);
+        assert_eq!(t.root_choice(), Some(2));
+        assert_eq!(t.pv().len(), 1);
     }
 }
