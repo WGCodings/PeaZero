@@ -119,6 +119,10 @@ tunables! {
     /// always the most visited move.
     "BestMoveLcbC" => best_move_lcb_c: default 60, min 0, max 400, scale 100, step 5;
     "BestMoveMinShare" => best_move_min_share: default 30, min 0, max 100, scale 100, step 5;
+    /// Threads > 1: losses added to a node per thread currently searching
+    /// through it, so the other threads spread out (removed when the
+    /// playout backs up its result).
+    "VirtualLoss" => virtual_loss: default 100, min 0, max 500, scale 100, step 10;
     /// Time management (timeman.rs, mcts.rs): moves to go when the GUI
     /// sends none ...
     "TmMovesToGo" => tm_moves_to_go: default 30, min 10, max 80, scale 1, step 2;
