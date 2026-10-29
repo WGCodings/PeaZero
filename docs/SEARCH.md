@@ -34,7 +34,7 @@ meant to be its own SPRT.
 - Repetition: the first repetition counts as a draw, including positions from the game history.
 
 **Move choice and output**
-- Final move: most visits; ties are broken by prior.
+- Final move (§4.2): among the root moves with at least `BestMoveMinShare` of the most visits, the highest Q − `BestMoveLcbC`/√visits. The PV, ponder move and score follow the chosen move.
 - PV, and a ponder move from the PV.
 - `info` lines show:
   - depth (the average playout depth) and seldepth;
@@ -278,14 +278,25 @@ At 264 µs per evaluation, inference probably dominates, so measure before worki
 
 **Expected:** +5 to +20 Elo, mostly by converting won positions and avoiding blunders into mates. Effort: medium.
 
-### 4.2 Final move choice
+### 4.2 Final move choice (done)
 
-- **Problem:** "most visits" is right in most positions. But at 1k nodes, a move that became good late can lose on visits while having a clearly better Q.
-- **Options:**
-  - most visits, with ties broken by Q;
-  - maximise `Q − c / √N`, a lower confidence bound, so a move with few visits only wins if its Q is clearly higher. `c` becomes a tunable.
-- **Test:** cheap to try; SPRT it after the early stop, because the two interact.
-- **Expected:** 0 to +15 Elo.
+**Rule** (`Tree::root_choice` in `mcts.rs`):
+```
+candidates = root moves with visits ≥ BestMoveMinShare · visits of the most visited move
+play       = the candidate with the highest  Q − BestMoveLcbC / √visits   (ties: more visits)
+```
+- Q − c/√visits is a lower confidence bound: a move with fewer visits is chosen only if its Q is clearly better.
+- Defaults: c = 0.60 (roughly one standard error of a playout's value) and a minimum share of 30%. The share keeps rarely searched moves with a lucky Q out.
+- Examples: 300 visits at Q +0.10 beats 400 visits at Q 0.00, but 300 visits at Q +0.002 doesn't.
+- `BestMoveMinShare 100` means always the most visited move (the old behaviour).
+- The PV and ponder move start with the chosen move, and the score in the `info` line is that move's.
+- The time manager's PV term uses the chosen move; its visit share still uses the most visited move, since it measures how concentrated the search is.
+
+**Output:** when the choice differs from the most visited move, `info string move choice: X (Q, visits) over the most visited Y (Q, visits)`.
+
+**One 8+0.08 self-play game (166 plies):** the choice differed on 18 moves (11%), mostly in the opening, between moves within 0.005–0.02 in Q.
+
+**Tunable:** `BestMoveLcbC`, `BestMoveMinShare`.
 
 ### 4.3 Syzygy tablebases
 
@@ -337,7 +348,7 @@ At 264 µs per evaluation, inference probably dominates, so measure before worki
 | 4 | Time management: visit-share factor + `hard` **(done, gained)**; PV stability **(done)**; then early stop | SPRT 8+0.08, then SPSA TM constants | +15–40 | small–medium |
 | 5 | Certainty propagation + mate scores | SPRT 8+0.08 | +5–20 | medium |
 | 6 | Transposition table for evaluations **(done)** | SPRT 8+0.08 and 40+0.4 | +5–20 | small |
-| 7 | Final-move LCB | SPRT | 0–15 | trivial |
+| 7 | Final-move LCB **(done)** | SPRT | 0–15 | trivial |
 | 8 | Batch benchmark → batched search if ≥ 1.2× | benchmark, then SPRT | −10–+40 | high |
 | 9 | Gumbel root search (experiment) | SPRT | ±30 | medium |
 

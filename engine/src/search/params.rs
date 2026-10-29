@@ -112,6 +112,13 @@ tunables! {
     "PolicyTemp" => policy_temp: default 162, min 25, max 800, scale 100, step 3;
     /// Softmax temperature of the policy priors at the root.
     "PolicyTempRoot" => policy_temp_root: default 212, min 25, max 2000, scale 100, step 3;
+    /// Final move choice: among the root moves with at least
+    /// BestMoveMinShare of the most visited move's visits, the one with the
+    /// highest Q − BestMoveLcbC / √visits (a lower confidence bound: a move
+    /// with fewer visits needs a clearly better Q). BestMoveMinShare 100 =
+    /// always the most visited move.
+    "BestMoveLcbC" => best_move_lcb_c: default 60, min 0, max 400, scale 100, step 5;
+    "BestMoveMinShare" => best_move_min_share: default 30, min 0, max 100, scale 100, step 5;
     /// Time management (timeman.rs, mcts.rs): moves to go when the GUI
     /// sends none ...
     "TmMovesToGo" => tm_moves_to_go: default 30, min 10, max 80, scale 1, step 2;
