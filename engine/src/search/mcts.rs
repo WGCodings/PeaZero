@@ -464,6 +464,38 @@ impl Tree<'_> {
         self.depth_sum / self.playouts.max(1)
     }
 
+    /// The most visited root move's share of the root moves' visits.
+    fn best_share(&self) -> f32 {
+        let root = &self.nodes[ROOT];
+        let total: u32 = self.nodes[root.children()].iter().map(|c| c.visits).sum();
+        match self.best_child(ROOT) {
+            Some(b) if total > 0 => self.nodes[b].visits as f32 / total as f32,
+            _ => 0.0,
+        }
+    }
+
+    /// Factor on the target time: a clear best move (a large share of the
+    /// visits) gives less time, visits spread over several moves more.
+    fn time_factor(&self) -> f32 {
+        self.params.time_factor(self.best_share())
+    }
+
+    /// Whether to stop now, `elapsed` into the move: never past `hard`;
+    /// `go movetime` uses exactly its time; with a single legal move there
+    /// is nothing to think about; otherwise at `soft` × the time factor.
+    fn time_up(&self, budget: &timeman::TimeBudget, elapsed: std::time::Duration) -> bool {
+        if elapsed >= budget.hard {
+            return true;
+        }
+        if budget.fixed {
+            return elapsed >= budget.soft;
+        }
+        if self.nodes[ROOT].count == 1 {
+            return true;
+        }
+        elapsed.as_secs_f32() >= budget.soft.as_secs_f32() * self.time_factor()
+    }
+
     /// Arena fill in permille (UCI `hashfull`: the tree is what runs out).
     fn hashfull(&self) -> usize {
         self.nodes.len() * 1000 / self.max_nodes.max(1)
@@ -622,10 +654,11 @@ fn search_tree(
 ) -> (SearchResult, u64) {
     let start = Instant::now();
     let limits = ctx.limits;
-    let budget = timeman::budget(
+    let budget = timeman::budget_with(
         limits,
         game.position().side_to_move(),
         ctx.common.move_overhead_ms,
+        &ctx.params.time_config(),
     );
     // node limits count this search's playouts, not the reused ones
     let max_playouts = limits.nodes.unwrap_or(if limits.depth.is_some() {
@@ -678,7 +711,7 @@ fn search_tree(
         && tree.nodes[ROOT].count > 0
         && target_depth.is_none_or(|d| tree.depth() < d)
         && !ctx.stop.load(Ordering::Relaxed)
-        && budget.is_none_or(|b| start.elapsed() < b.soft)
+        && budget.is_none_or(|b| !tree.time_up(&b, start.elapsed()))
     {
         tree.playout(game);
         if tree.full {
@@ -696,6 +729,18 @@ fn search_tree(
                 last_info = ms;
                 tree.print_info(start, ctx.show_wdl);
             }
+        }
+    }
+    if let (true, Some(b)) = (print, budget) {
+        if !b.fixed {
+            println!(
+                "info string time: {} ms used, target {} ms x factor {:.2} (best move {:.0}% of visits), hard {} ms",
+                start.elapsed().as_millis(),
+                b.soft.as_millis(),
+                tree.time_factor(),
+                100.0 * tree.best_share(),
+                b.hard.as_millis()
+            );
         }
     }
     if print && tree.prunes > 0 {
@@ -1197,5 +1242,65 @@ mod tests {
         // every requested playout was done
         assert_eq!(m.nodes[ROOT].visits, 6000);
         check_tree(&m.nodes);
+    }
+
+    // ------------------------------------------------------- time management
+
+    #[test]
+    fn time_factor_follows_the_best_moves_share() {
+        let p = SearchParams::default();
+        // clear best move → less time; spread visits → more time
+        assert!(p.time_factor(0.9) < p.time_factor(0.5));
+        assert!(p.time_factor(0.5) < p.time_factor(0.2));
+        assert!(p.time_factor(0.9) < 1.0 && p.time_factor(0.2) > 1.0);
+        for share in [0.0, 0.5, 1.0] {
+            let f = p.time_factor(share);
+            assert!(f >= p.tm_min_mult && f <= p.tm_max_mult);
+        }
+    }
+
+    fn timed_search(fen: &str, limits: SearchLimits) -> std::time::Duration {
+        peazero_core::init();
+        let mut net = PolicyNet::embedded();
+        let params = SearchParams::default();
+        let (common, stop) = (CommonOptions::default(), AtomicBool::new(false));
+        let game = Game::from_fen(fen).unwrap();
+        let t = Instant::now();
+        let r = Mcts::default().search(&mut net, &game, &ctx_for(&limits, &common, &stop, &params));
+        assert!(!r.best.is_null());
+        t.elapsed()
+    }
+
+    #[test]
+    fn timed_search_stays_within_the_hard_limit() {
+        let limits = SearchLimits {
+            wtime: Some(3000),
+            winc: Some(30),
+            ..Default::default()
+        };
+        let b = timeman::budget_with(
+            &limits,
+            peazero_core::Color::White,
+            CommonOptions::default().move_overhead_ms,
+            &SearchParams::default().time_config(),
+        )
+        .unwrap();
+        let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1";
+        let used = timed_search(fen, limits);
+        assert!(
+            used < b.hard + std::time::Duration::from_millis(50),
+            "{used:?} vs {b:?}"
+        );
+    }
+
+    #[test]
+    fn single_legal_move_is_played_at_once() {
+        // only Kxg2 is legal
+        let limits = SearchLimits {
+            wtime: Some(60_000),
+            ..Default::default()
+        };
+        let used = timed_search("7k/8/8/8/8/8/6r1/7K w - - 0 1", limits);
+        assert!(used < std::time::Duration::from_millis(100), "{used:?}");
     }
 }

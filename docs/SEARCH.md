@@ -62,7 +62,7 @@ meant to be its own SPRT.
 **Limits**
 - `go nodes`, `go depth`, `go movetime`, clock plus increment, `movestogo`, `infinite`, `searchmoves`, and `stop`.
 - 400 playouts when no limit is given.
-- Time manager: soft = time/movestogo (30 by default) + ¾·inc, capped at time/2. The search stops at the soft limit; the hard limit is computed but not used yet.
+- Time manager (§3.2): target = time/movestogo (`TmMovesToGo`, 30) + `TmIncPercent` of the increment, at most half the remaining time. The search stops at target × a factor from how settled it is (more time when the best move holds a small share of the visits, less when it holds most), never past the hard limit (`TmHardMult` × target, at most ¾ of the remaining time). A single legal move is played at once; `go movetime` uses exactly its time.
 
 **Network and modes**
 - Int8 SIMD inference (FastNet) on x86-64, tract on other CPUs. Batch 1, single-threaded.
@@ -165,28 +165,41 @@ meant to be its own SPRT.
 
 **Expected:** +20 to +50 Elo at short time controls. Test at the time control: fixed-node tests would overstate it, because reused playouts are free there.
 
-### 3.2 Time management: use `hard`, stop early when the answer is settled
+### 3.2 Time management (basic version done)
 
-Today the search always stops at exactly `soft`; `hard` (3× soft) is computed and never used.
-
-**a) Early stop (saves time).** Estimate the playouts left before `soft` from the current nodes per second.
-- If the second-best root move can't catch the best even if it gets every remaining playout, stop now: `visits_best − visits_second > remaining · factor`, with a factor of about 1.3.
-- Optionally, during the search, skip root moves that can no longer catch the leader.
-- The time saved stays on the clock for later moves.
-
-**b) Extend in unclear positions.** Measure at the soft limit:
+**Budget per move** (`engine/src/timeman.rs`):
 ```
-bm_frac  = visits(best) / visits(root)
-m        = (a − bm_frac) · b                       // spread visits → more time
-m       *= 1 + c · |Q(best) − Q(end of best PV)|   // unstable PV → more time
-stop when elapsed ≥ soft · clamp(m, m_min, m_max)  (never past hard)
+target = remaining / TmMovesToGo + TmIncPercent · increment     (≤ remaining / 2)
+hard   = TmHardMult · target                                    (≤ 3/4 · remaining)
 ```
-- Reasonable starting values: a 1.4, b 1.4, c 1.2, m_min 0.1, m_max 5.
-- A simpler form also works: keep going past `soft` up to `hard` while the most-visited move is not also the move with the best Q, or while its Q dropped noticeably during the last part of the search.
+The GUI's `movestogo` replaces `TmMovesToGo` when it is sent. `go movetime` uses exactly its time.
 
-**c) Tuning.** The time manager constants go into the same `tunables!` table and the same SPSA.
+**When to stop** (`Tree::time_up` in `mcts.rs`), checked after every playout:
+```
+share  = visits of the most visited root move / visits of all root moves
+factor = clamp((TmVisitsBase − share) · TmVisitsMult, TmMinMult, TmMaxMult)
+stop when elapsed ≥ target · factor, and always at hard
+```
+- A clear best move (a large share) means less time; visits spread over several moves mean more.
+- Defaults: base 1.40 and multiplier 1.39, so a share of 70% gives 0.97 × target, 47% gives 1.29 × and 20% gives 1.67 ×. The clamp is 0.30–3.00, and `hard` (3 × target) caps it anyway.
+- With tree reuse, the share includes the kept visits, so a move that was already clear after the previous search is played quickly.
+- A single legal move is played after one playout.
 
-**Expected:** +15 to +40 Elo combined. Test at the real time control, never at fixed nodes. Effort: small to medium.
+**Output:** `info string time: X ms used, target T ms x factor F (best move P% of visits), hard H ms` after each timed move.
+
+**One 8+0.08 self-play game (120 plies):** the factor ranged from 0.57 to 1.75 (mean 1.16), and the lowest clock was 0.7 s with the increment keeping it stable. Engine start-up (about 0.3 s, mostly reading the network) happens before `readyok`, so it isn't on the clock.
+
+**Tunable** (`spsa`): `TmMovesToGo`, `TmIncPercent`, `TmHardMult`, `TmVisitsBase`, `TmVisitsMult`, `TmMinMult`, `TmMaxMult`. Tune at the time control you test at.
+
+**Next steps** (each its own SPRT):
+1. **PV stability:** more time when the best move's Q dropped during the search, or when the best move by visits isn't the best by Q:
+   ```
+   factor *= 1 + c · |Q(best) − Q(end of best PV)|
+   ```
+2. **Early stop:** stop before the target when the second-best move can't catch the best even with every remaining playout (`visits_best − visits_second > remaining · factor`, with a factor of about 1.3). The time saved stays on the clock.
+3. **Best-move changes:** more time after the most visited move changed late in the search.
+
+**Expected:** +15 to +40 Elo with all parts. Test at the real time control, never at fixed nodes.
 
 ### 3.3 Transposition table for network evaluations (done)
 
@@ -318,7 +331,7 @@ At 264 µs per evaluation, inference probably dominates, so measure before worki
 | 1 | Tunable FPU, exploration term and policy temperatures as UCI options **(done; bench 5572)** | SPRT vs original | done (gain) | small |
 | 2 | SPSA from the defaults (§2.4) | SPRT tuned vs #1 | +10–30 | games only |
 | 3 | Tree reuse **(done)** | SPRT 8+0.08 | +20–50 | medium |
-| 4 | Early stop + use `hard` / extension multiplier | SPRT 8+0.08, then SPSA TM constants | +15–40 | small–medium |
+| 4 | Time management: visit-share factor + `hard` **(basic version done)**; then PV stability, early stop | SPRT 8+0.08, then SPSA TM constants | +15–40 | small–medium |
 | 5 | Certainty propagation + mate scores | SPRT 8+0.08 | +5–20 | medium |
 | 6 | Transposition table for evaluations **(done)** | SPRT 8+0.08 and 40+0.4 | +5–20 | small |
 | 7 | Final-move LCB | SPRT | 0–15 | trivial |
