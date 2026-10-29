@@ -50,8 +50,10 @@
 //! leaf before evaluating it; another thread reaching the same leaf takes
 //! its virtual losses back and starts a new playout (a collision). Every
 //! playout holds a shared lock on the arena; pruning takes it exclusively,
-//! so nodes never move under a running playout. With one thread nothing
-//! of this changes the search (no virtual loss, same results).
+//! so nodes never move under a running playout. Helpers search with a
+//! jittered cpuct (`CPuctJitter`: × 0.75–1.25 by default, new each
+//! search), so the threads explore a little differently. With one thread
+//! nothing of this changes the search (no virtual loss, same results).
 //!
 //! Not (yet): proven-result propagation, smart pruning.
 
@@ -63,6 +65,7 @@ use std::sync::atomic::{
 use std::sync::RwLock;
 use std::time::Instant;
 
+use peazero_core::rng::Rng;
 use peazero_core::{Game, Move};
 
 use super::tt::EvalTable;
@@ -443,6 +446,8 @@ fn retemper(children: &[Node], t_tree: f32, t_root: f32) {
 struct View<'a> {
     a: &'a Arena,
     params: SearchParams,
+    /// Factor on the exploration term (a helper thread's cpuct jitter).
+    cpuct_scale: f32,
 }
 
 impl View<'_> {
@@ -480,7 +485,7 @@ impl View<'_> {
     fn select(&self, node: usize) -> usize {
         let n = &self.a[node];
         let (fpu, gini) = self.fpu_and_gini(node);
-        let u = self.params.explore_coef(n.visits(), gini);
+        let u = self.params.explore_coef(n.visits(), gini) * self.cpuct_scale;
         let children = n.children();
         let mut best = (children.start, f32::NEG_INFINITY);
         for c in children {
@@ -642,9 +647,14 @@ enum Playout {
 
 impl Shared<'_> {
     fn view<'g>(&self, a: &'g Arena) -> View<'g> {
+        self.view_scaled(a, 1.0)
+    }
+
+    fn view_scaled<'g>(&self, a: &'g Arena, cpuct_scale: f32) -> View<'g> {
         View {
             a,
             params: self.params,
+            cpuct_scale,
         }
     }
 
@@ -654,11 +664,18 @@ impl Shared<'_> {
         self.depth_sum.load(Relaxed) / self.playouts.load(Relaxed).max(1)
     }
 
-    /// One playout: select down to a leaf, evaluate it, back up.
-    fn playout(&self, net: &mut PolicyNet, root: &Game, path: &mut Vec<usize>) -> Playout {
+    /// One playout: select down to a leaf (exploration × `cpuct_scale`),
+    /// evaluate it, back up.
+    fn playout(
+        &self,
+        net: &mut PolicyNet,
+        root: &Game,
+        path: &mut Vec<usize>,
+        cpuct_scale: f32,
+    ) -> Playout {
         let guard = self.arena.read().unwrap();
         let a: &Arena = &guard;
-        let view = self.view(a);
+        let view = self.view_scaled(a, cpuct_scale);
         let vl = self.virtual_loss;
         path.clear();
         path.push(ROOT);
@@ -824,11 +841,12 @@ impl Shared<'_> {
         }
     }
 
-    /// A helper thread: playouts until the main thread says stop.
-    fn helper(&self, net: &mut PolicyNet, root: &Game) {
+    /// A helper thread: playouts (exploration × `cpuct_scale`) until the
+    /// main thread says stop.
+    fn helper(&self, net: &mut PolicyNet, root: &Game, cpuct_scale: f32) {
         let mut path = Vec::new();
         while !self.stop.load(Relaxed) && self.playouts.load(Relaxed) < self.max_playouts {
-            match self.playout(net, root, &mut path) {
+            match self.playout(net, root, &mut path, cpuct_scale) {
                 Playout::Full => self.prune(),
                 Playout::Collision => std::thread::yield_now(),
                 Playout::Done => {}
@@ -957,6 +975,8 @@ pub struct Mcts {
     hash_mb: usize,
     /// Network instances of the helper threads.
     helper_nets: Vec<PolicyNet>,
+    /// Searches so far (seeds the helpers' cpuct jitter).
+    searches: u64,
 }
 
 /// The game and parameters the saved tree was searched with.
@@ -984,6 +1004,7 @@ impl NetSearch for Mcts {
         self.helpers(net, threads);
         let tt = self.tt.as_ref().unwrap();
         let (probes, hits) = (tt.probes(), tt.hits());
+        self.searches += 1;
         let (result, _) = search_tree(
             net,
             &mut self.helper_nets,
@@ -992,6 +1013,7 @@ impl NetSearch for Mcts {
             game,
             ctx,
             true,
+            self.searches,
         );
         println!(
             "info string tree reuse: {kept} playouts kept; eval table: {} of {} lookups hit, {} permille full",
@@ -1023,13 +1045,27 @@ pub fn run(
     let tt = EvalTable::new(tt_bytes);
     let mut arena = Arena::new(max_nodes);
     let mut helpers: Vec<PolicyNet> = (1..ctx.common.threads.max(1)).map(|_| net.fork()).collect();
-    search_tree(net, &mut helpers, &tt, &mut arena, game, ctx, print)
+    search_tree(net, &mut helpers, &tt, &mut arena, game, ctx, print, 0)
+}
+
+/// Each helper's cpuct factor, uniform in [1 − jitter, 1 + jitter]
+/// (deterministic for a given `seed`).
+fn jitter_scales(helpers: usize, jitter: f32, seed: u64) -> Vec<f32> {
+    let mut rng = Rng::new(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5eed);
+    (0..helpers)
+        .map(|_| {
+            let u = (rng.next_u64() >> 40) as f32 / (1u64 << 24) as f32; // [0, 1)
+            1.0 + jitter * (2.0 * u - 1.0)
+        })
+        .collect()
 }
 
 /// Search from the tree in `arena` (a re-rooted tree from the previous
 /// move, or empty for a fresh tree) with the calling thread plus one
-/// helper thread per network in `helpers`. Returns the result and this
-/// search's playouts; the tree stays in `arena`.
+/// helper thread per network in `helpers` (`seed`: their cpuct jitter).
+/// Returns the result and this search's playouts; the tree stays in
+/// `arena`.
+#[allow(clippy::too_many_arguments)]
 fn search_tree(
     net: &mut PolicyNet,
     helpers: &mut [PolicyNet],
@@ -1038,6 +1074,7 @@ fn search_tree(
     game: &Game,
     ctx: &SearchContext,
     print: bool,
+    seed: u64,
 ) -> (SearchResult, u64) {
     let start = Instant::now();
     let limits = ctx.limits;
@@ -1080,8 +1117,9 @@ fn search_tree(
     };
     let mut path = Vec::new();
     if fresh {
-        shared.playout(net, game, &mut path); // expands the root
+        shared.playout(net, game, &mut path, 1.0); // expands the root
     }
+    let scales = jitter_scales(helpers.len(), ctx.params.cpuct_jitter, seed);
     if !limits.searchmoves.is_empty() {
         // searchmoves: keep only those root moves (always a fresh tree, so
         // they have no subtrees yet and can be moved around in the arena;
@@ -1105,9 +1143,9 @@ fn search_tree(
 
     let target_depth = limits.depth.map(u64::from);
     std::thread::scope(|s| {
-        for h in helpers.iter_mut() {
+        for (h, &scale) in helpers.iter_mut().zip(&scales) {
             let shared = &shared;
-            s.spawn(move || shared.helper(h, game));
+            s.spawn(move || shared.helper(h, game, scale));
         }
         let (mut shown_depth, mut shown_seldepth, mut last_info) = (0, 0, 0u128);
         loop {
@@ -1123,7 +1161,7 @@ fn search_tree(
             if !go_on {
                 break;
             }
-            match shared.playout(net, game, &mut path) {
+            match shared.playout(net, game, &mut path, 1.0) {
                 Playout::Full => shared.prune(),
                 Playout::Collision => std::thread::yield_now(),
                 Playout::Done => {}
@@ -1169,10 +1207,12 @@ fn search_tree(
             );
         }
         if !helpers.is_empty() {
+            let s: Vec<String> = scales.iter().map(|x| format!("{x:.2}")).collect();
             println!(
-                "info string threads: {}, collisions {}",
+                "info string threads: {}, collisions {}, helper cpuct x {}",
                 helpers.len() + 1,
-                shared.collisions.load(Relaxed)
+                shared.collisions.load(Relaxed),
+                s.join(" ")
             );
         }
     }
@@ -1217,6 +1257,7 @@ fn search_tree(
     let view = View {
         a: arena,
         params: *ctx.params,
+        cpuct_scale: 1.0,
     };
     let ponder = view.pv().get(1).copied();
     let result = SearchResult {
@@ -1313,6 +1354,7 @@ mod tests {
         View {
             a: Box::leak(Box::new(Arena::from_data(nodes, 1000))),
             params,
+            cpuct_scale: 1.0,
         }
     }
 
@@ -1484,6 +1526,7 @@ mod tests {
         View {
             a: &m.arena,
             params: SearchParams::default(),
+            cpuct_scale: 1.0,
         }
     }
 
@@ -2008,5 +2051,26 @@ mod tests {
         });
         assert!(t.elapsed() < std::time::Duration::from_millis(1500));
         check_tree(&m.arena.snapshot());
+    }
+
+    #[test]
+    fn helper_jitter_stays_in_range_and_varies() {
+        let s = jitter_scales(7, 0.25, 3);
+        assert_eq!(s.len(), 7);
+        assert!(s.iter().all(|&x| (0.75..1.25).contains(&x)), "{s:?}");
+        assert!(s.windows(2).any(|w| w[0] != w[1]));
+        assert_eq!(s, jitter_scales(7, 0.25, 3)); // reproducible per seed
+        assert_ne!(s, jitter_scales(7, 0.25, 4)); // new each search
+        assert!(jitter_scales(3, 0.0, 9).iter().all(|&x| x == 1.0));
+        // a larger factor explores more: with a big FPU reduction scale 1
+        // stays on the visited move, a much larger one tries a new move
+        let p = SearchParams {
+            fpu_reduction_root: 3.0,
+            ..Default::default()
+        };
+        let mut t = small_tree(-0.2, p);
+        assert_eq!(t.select(ROOT), 1);
+        t.cpuct_scale = 10.0;
+        assert_ne!(t.select(ROOT), 1);
     }
 }
