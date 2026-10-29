@@ -331,13 +331,16 @@ Speed has to come from elsewhere:
 - **Pruning.** Every playout holds a shared lock on the arena. When the tree is full, a thread takes the lock exclusively for the prune, so nodes never move under a running playout.
 - **Evaluation table.** Lockless: each entry is ten 64-bit atomic words, with the key word XORed with the data, so a half-written entry reads as a miss (tt.rs).
 - **Limits.** `go nodes` counts the playouts of all threads; time, depth and `stop` are checked by the main thread, which then stops the helpers.
-- **One thread:** no virtual loss and no collisions possible; bench is unchanged (2827).
+- **cpuct jitter for helpers:** each helper multiplies the exploration term by a factor drawn uniformly from [1 − `CPuctJitter`, 1 + `CPuctJitter`] (default 0.25, so 0.75–1.25), new each search, so the threads explore slightly differently. The main thread uses the plain cpuct. `CPuctJitter 0` turns it off.
+- **One thread:** no virtual loss, no collisions possible and no jitter; bench is unchanged (2827).
 
 **Measured on a 2-core machine** (20,000 playouts each): 1.76–1.84× the speed with 2 threads, with the same best moves. Collisions: 1, 9 and 554 per 20,000 playouts (the last in Kiwipete, where many lines meet). An 8+0.08 game with 2 threads: ~11k nps, no move past the hard limit, an `info` line every move.
 
-**Output:** `info string threads: N, collisions C` after each move.
+**Result:** 2 threads gained about +180 Elo against 1 thread (doubling the speed is large at our node counts).
 
-**Not done yet:** a jittered cpuct for helpers (would spread the threads further); buffering root statistics per thread (only matters at high thread counts).
+**Output:** `info string threads: N, collisions C, helper cpuct x F…` after each move.
+
+**Not done yet:** buffering root statistics per thread (only matters at high thread counts).
 
 **Testing:** only shows with `Threads` > 1, for example an SMP test with 2 or 4 threads against the same build with 1 thread. Tune `VirtualLoss` there, not in single-thread tests.
 
