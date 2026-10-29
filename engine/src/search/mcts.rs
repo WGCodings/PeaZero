@@ -38,8 +38,19 @@
 //! a position reached again by another move order costs a table probe
 //! instead of a network call. Each tree node still collects its own visits.
 //!
-//! Not (yet): virtual loss or batching, proven-result propagation, smart
-//! pruning.
+//! Proven results (MCTS-solver): checkmate and the draw rules are proven at
+//! distance 0. After every playout that ends in a proven node, proofs move
+//! up: a node is a proven win (for its side to move) if any move leads to a
+//! position lost for the opponent (distance 1 + the shortest such line), a
+//! proven loss if every move leads to a position won for the opponent
+//! (1 + the longest), a proven draw if every move is proven and the best is
+//! a draw. A playout stops at a proven node and backs up its exact value;
+//! moves proven to lose are not selected while there is an alternative;
+//! when the root is proven the search stops and plays the shortest win, the
+//! longest loss or a drawing move. The info line then shows `mate N`,
+//! `mate -N` or `cp 0`.
+//!
+//! Not (yet): virtual loss or batching, smart pruning.
 
 use std::ops::Range;
 use std::sync::atomic::Ordering;
@@ -68,10 +79,24 @@ const TREE_SHARE_PERCENT: usize = 75;
 
 const ROOT: usize = 0;
 
-/// `Node::flags` bits.
+/// `Node::flags` bits. WIN / LOSS / DRAW: proven result for the side to
+/// move at the node (game over there, or proven through its children).
 const EXPANDED: u8 = 1;
-const TERMINAL_DRAW: u8 = 2;
-const TERMINAL_LOSS: u8 = 4;
+const WIN: u8 = 2;
+const LOSS: u8 = 4;
+const DRAW: u8 = 8;
+const PROVEN: u8 = WIN | LOSS | DRAW;
+
+/// f32 → bfloat16 (the top 16 bits, rounded to nearest even): ~0.4 %
+/// precision, the full f32 range. Priors are stored like this.
+fn to_bf16(x: f32) -> u16 {
+    let b = x.to_bits();
+    ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
+}
+
+fn from_bf16(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
 
 /// One tree node: 24 bytes.
 #[derive(Clone, Copy)]
@@ -80,9 +105,13 @@ struct Node {
     mv: Move,
     /// Number of children (at most 218 legal moves).
     count: u8,
-    /// `EXPANDED`, `TERMINAL_DRAW`, `TERMINAL_LOSS`.
+    /// `EXPANDED`, `WIN`, `LOSS`, `DRAW`.
     flags: u8,
-    prior: f32,
+    /// Policy prior as bfloat16 (see `prior()`).
+    prior16: u16,
+    /// Proven nodes: plies to the end of the game with best play (the
+    /// fastest win, the slowest loss); 0 if the game is over here.
+    dist: u16,
     /// Children are `first..first + count` in the arena; they always come
     /// after their parent.
     first: u32,
@@ -101,7 +130,8 @@ impl Node {
             mv,
             count: 0,
             flags: 0,
-            prior,
+            prior16: to_bf16(prior),
+            dist: 0,
             first: 0,
             visits: 0,
             w: 0.0,
@@ -117,11 +147,25 @@ impl Node {
         self.flags & EXPANDED != 0
     }
 
-    /// Exact W/D/L for the side to move here, if the game is over.
-    fn terminal(&self) -> Option<[f32; 3]> {
-        if self.flags & TERMINAL_LOSS != 0 {
+    fn prior(&self) -> f32 {
+        from_bf16(self.prior16)
+    }
+
+    fn set_prior(&mut self, p: f32) {
+        self.prior16 = to_bf16(p);
+    }
+
+    fn proven(&self) -> bool {
+        self.flags & PROVEN != 0
+    }
+
+    /// Exact W/D/L for the side to move here, if proven.
+    fn proven_wdl(&self) -> Option<[f32; 3]> {
+        if self.flags & WIN != 0 {
+            Some([1.0, 0.0, 0.0])
+        } else if self.flags & LOSS != 0 {
             Some([0.0, 0.0, 1.0])
-        } else if self.flags & TERMINAL_DRAW != 0 {
+        } else if self.flags & DRAW != 0 {
             Some([0.0, 1.0, 0.0])
         } else {
             None
@@ -267,14 +311,11 @@ fn retemper(children: &mut [Node], t_tree: f32, t_root: f32) {
         return;
     }
     let k = t_tree / t_root.max(1e-3);
-    let mut sum = 0.0;
-    for c in children.iter_mut() {
-        c.prior = c.prior.powf(k);
-        sum += c.prior;
-    }
+    let powered: Vec<f32> = children.iter().map(|c| c.prior().powf(k)).collect();
+    let sum: f32 = powered.iter().sum();
     if sum > 0.0 {
-        for c in children.iter_mut() {
-            c.prior /= sum;
+        for (c, p) in children.iter_mut().zip(powered) {
+            c.set_prior(p / sum);
         }
     }
 }
@@ -292,20 +333,18 @@ impl Tree<'_> {
                 || pos.insufficient_material()
                 || game.repetitions() >= 1);
         let terminal = if draw {
-            Some(TERMINAL_DRAW)
+            Some(DRAW)
         } else if pos.legal_moves().is_empty() {
-            Some(if pos.in_check() {
-                TERMINAL_LOSS
-            } else {
-                TERMINAL_DRAW
-            })
+            Some(if pos.in_check() { LOSS } else { DRAW })
         } else {
             None
         };
         if let Some(t) = terminal {
+            // game over: proven at distance 0
             let n = &mut self.nodes[node];
             n.flags |= t;
-            return n.terminal().unwrap();
+            n.dist = 0;
+            return n.proven_wdl().unwrap();
         }
 
         let eval = self.tt.evaluate(self.net, game);
@@ -374,9 +413,10 @@ impl Tree<'_> {
         let n = &self.nodes[node];
         let (mut visited, mut squares) = (0.0f32, 0.0f32);
         for c in &self.nodes[n.children()] {
-            squares += c.prior * c.prior;
+            let p = c.prior();
+            squares += p * p;
             if c.visits > 0 {
-                visited += c.prior;
+                visited += p;
             }
         }
         let p = &self.params;
@@ -402,8 +442,20 @@ impl Tree<'_> {
         let mut best = (n.first as usize, f32::NEG_INFINITY);
         for c in n.children() {
             let child = &self.nodes[c];
-            let q = if child.visits == 0 { fpu } else { child.q() };
-            let score = q + u * child.prior / (1.0 + child.visits as f32);
+            // proven: the exact value; a move proven to lose is never
+            // chosen (an unproven node always has a move that isn't)
+            let q = if child.flags & WIN != 0 {
+                continue;
+            } else if child.flags & LOSS != 0 {
+                1.0
+            } else if child.flags & DRAW != 0 {
+                0.0
+            } else if child.visits == 0 {
+                fpu
+            } else {
+                child.q()
+            };
+            let score = q + u * child.prior() / (1.0 + child.visits as f32);
             if score > best.1 {
                 best = (c, score);
             }
@@ -415,13 +467,13 @@ impl Tree<'_> {
         let mut path = vec![ROOT];
         let mut game = root.clone();
         let mut node = ROOT;
-        while self.nodes[node].expanded() && self.nodes[node].terminal().is_none() {
+        while self.nodes[node].expanded() && !self.nodes[node].proven() {
             node = self.select(node);
             game.push(self.nodes[node].mv);
             path.push(node);
         }
         let ply = path.len() - 1;
-        let wdl = match self.nodes[node].terminal() {
+        let wdl = match self.nodes[node].proven_wdl() {
             Some(t) => t,
             None => self.evaluate(node, &game, ply),
         };
@@ -438,14 +490,72 @@ impl Tree<'_> {
             n.l += v[2];
             v = flip(v);
         }
+
+        // a proven leaf may prove its ancestors
+        if self.nodes[node].proven() {
+            for &i in path.iter().rev().skip(1) {
+                if self.nodes[i].proven() || !self.try_prove(i) {
+                    break;
+                }
+            }
+        }
     }
 
+    /// Prove `node` from its children if possible (see the module
+    /// documentation). Returns whether it is now proven.
+    fn try_prove(&mut self, node: usize) -> bool {
+        let n = &self.nodes[node];
+        if n.count == 0 {
+            return false;
+        }
+        let mut win: Option<u16> = None; // shortest line to a lost child
+        let (mut all_proven, mut any_draw, mut longest_loss) = (true, false, 0u16);
+        for c in &self.nodes[n.children()] {
+            if c.flags & LOSS != 0 {
+                win = Some(win.map_or(c.dist, |d| d.min(c.dist)));
+            } else if c.flags & WIN != 0 {
+                longest_loss = longest_loss.max(c.dist);
+            } else if c.flags & DRAW != 0 {
+                any_draw = true;
+            } else {
+                all_proven = false;
+            }
+        }
+        let (flag, dist) = match win {
+            Some(d) => (WIN, d.saturating_add(1)),
+            None if !all_proven => return false,
+            None if any_draw => (DRAW, 0),
+            None => (LOSS, longest_loss.saturating_add(1)),
+        };
+        let n = &mut self.nodes[node];
+        n.flags |= flag;
+        n.dist = dist;
+        true
+    }
+
+    /// The move to play (and to follow in the PV) at `node`: the shortest
+    /// proven win; else the most visited move that isn't proven to lose
+    /// (ties: the higher prior); if every move loses, the longest loss.
     fn best_child(&self, node: usize) -> Option<usize> {
         let n = &self.nodes[node];
-        n.children().max_by(|&a, &b| {
-            let (a, b) = (&self.nodes[a], &self.nodes[b]);
-            a.visits.cmp(&b.visits).then(a.prior.total_cmp(&b.prior))
-        })
+        let nodes = &self.nodes;
+        let shortest_win = n
+            .children()
+            .filter(|&c| nodes[c].flags & LOSS != 0)
+            .min_by_key(|&c| nodes[c].dist);
+        if shortest_win.is_some() {
+            return shortest_win;
+        }
+        let not_losing = n
+            .children()
+            .filter(|&c| nodes[c].flags & WIN == 0)
+            .max_by(|&a, &b| {
+                let (a, b) = (&nodes[a], &nodes[b]);
+                a.visits
+                    .cmp(&b.visits)
+                    .then(a.prior().total_cmp(&b.prior()))
+            });
+        not_losing.or_else(|| n.children().max_by_key(|&c| nodes[c].dist))
     }
 
     fn pv(&self) -> Vec<Move> {
@@ -532,11 +642,29 @@ impl Tree<'_> {
         self.nodes.len() * 1000 / self.max_nodes.max(1)
     }
 
+    /// UCI score of the root (`cp X`, `mate N`, `mate -N`) and its W/D/L
+    /// for the side to move, from the move `best`.
+    fn score(&self, best: usize) -> (String, [f32; 3]) {
+        let b = &self.nodes[best];
+        // plies from the root to the end: our move + the rest
+        let moves = (b.dist as i32 + 2) / 2;
+        if b.flags & LOSS != 0 {
+            (format!("mate {moves}"), [1.0, 0.0, 0.0])
+        } else if b.flags & WIN != 0 {
+            (format!("mate -{moves}"), [0.0, 0.0, 1.0])
+        } else if b.flags & DRAW != 0 {
+            ("cp 0".to_string(), [0.0, 1.0, 0.0])
+        } else {
+            let wdl = b.mean_wdl();
+            (format!("cp {}", q_to_cp(wdl[0] - wdl[2])), wdl)
+        }
+    }
+
     fn print_info(&self, start: Instant, show_wdl: bool) {
         let Some(best) = self.best_child(ROOT) else {
             return;
         };
-        let wdl = self.nodes[best].mean_wdl();
+        let (score, wdl) = self.score(best);
         let playouts = self.playouts;
         let wdl_str = if show_wdl {
             wdl_string(wdl)
@@ -546,10 +674,9 @@ impl Tree<'_> {
         let ms = start.elapsed().as_millis();
         let pv: Vec<String> = self.pv().iter().map(|m| m.to_uci()).collect();
         println!(
-            "info depth {} seldepth {} multipv 1 score cp {}{wdl_str} nodes {playouts} nps {} hashfull {} time {ms} pv {}",
+            "info depth {} seldepth {} multipv 1 score {score}{wdl_str} nodes {playouts} nps {} hashfull {} time {ms} pv {}",
             self.depth(),
             self.seldepth,
-            q_to_cp(wdl[0] - wdl[2]),
             playouts as u128 * 1000 / ms.max(1),
             self.hashfull(),
             pv.join(" ")
@@ -615,7 +742,7 @@ impl Mcts {
         // the new root must be an expanded, non-terminal position (a node
         // marked as a draw by repetition is not a draw at the root)
         let n = &nodes[node];
-        if !n.expanded() || n.terminal().is_some() || n.count == 0 {
+        if !n.expanded() || n.count == 0 {
             return None;
         }
         Some(node)
@@ -739,6 +866,7 @@ fn search_tree(
     let (mut shown_depth, mut shown_seldepth, mut last_info) = (0, 0, 0u128);
     while tree.playouts < max_playouts
         && tree.nodes[ROOT].count > 0
+        && !tree.nodes[ROOT].proven()
         && target_depth.is_none_or(|d| tree.depth() < d)
         && !ctx.stop.load(Ordering::Relaxed)
         && budget.is_none_or(|b| !tree.time_up(&b, start.elapsed()))
@@ -1008,7 +1136,7 @@ mod tests {
             let c = n.children();
             assert!(c.end <= nodes.len(), "node {i} children out of range");
             assert!(n.count == 0 || c.start > i, "node {i} children before it");
-            if n.expanded() && n.terminal().is_none() {
+            if n.expanded() {
                 // equal, or more after a collapsed node was expanded again
                 let below: u32 = nodes[c].iter().map(|c| c.visits).sum();
                 assert!(n.visits > below, "node {i}: {} vs {below}", n.visits);
@@ -1028,7 +1156,7 @@ mod tests {
     fn same_tree(a: &[Node], ra: usize, b: &[Node], rb: usize) {
         let (x, y) = (&a[ra], &b[rb]);
         assert_eq!((x.visits, x.count, x.flags), (y.visits, y.count, y.flags));
-        assert_eq!((x.w, x.l, x.prior), (y.w, y.l, y.prior));
+        assert_eq!((x.w, x.l, x.prior16, x.dist), (y.w, y.l, y.prior16, y.dist));
         for (ca, cb) in x.children().zip(y.children()) {
             assert!(a[ca].mv == b[cb].mv);
             same_tree(a, ca, b, cb);
@@ -1128,8 +1256,8 @@ mod tests {
         let root = m.nodes[ROOT];
         let moves = |n: &[Node], i: usize| n[i].children().map(|c| n[c].mv).collect::<Vec<_>>();
         assert!(moves(&m.nodes, ROOT) == moves(&old, reply));
-        let sum: f32 = m.nodes[root.children()].iter().map(|c| c.prior).sum();
-        assert!((sum - 1.0).abs() < 1e-4);
+        let sum: f32 = m.nodes[root.children()].iter().map(|c| c.prior()).sum();
+        assert!((sum - 1.0).abs() < 0.01); // bf16 priors
     }
 
     #[test]
@@ -1141,7 +1269,12 @@ mod tests {
         let mut nodes: Vec<Node> = tree.iter().map(|&(m, p)| Node::new(m, p)).collect();
         retemper(&mut nodes, 1.6, 2.1);
         for (n, r) in nodes.iter().zip(&root) {
-            assert!((n.prior - r.1).abs() < 1e-5, "{} vs {}", n.prior, r.1);
+            assert!(
+                (n.prior() - r.1).abs() < 0.005 * r.1,
+                "{} vs {}",
+                n.prior(),
+                r.1
+            );
         }
     }
 
@@ -1385,5 +1518,114 @@ mod tests {
         };
         let used = timed_search("7k/8/8/8/8/8/6r1/7K w - - 0 1", limits);
         assert!(used < std::time::Duration::from_millis(100), "{used:?}");
+    }
+
+    // ---------------------------------------------------------- solver
+
+    #[test]
+    fn bf16_prior_keeps_three_digits() {
+        for x in [1.0f32, 0.5, 0.123_456, 1e-3, 3.3e-6, 0.999] {
+            let y = from_bf16(to_bf16(x));
+            assert!((y - x).abs() <= 0.004 * x, "{x} -> {y}");
+        }
+        assert_eq!(from_bf16(to_bf16(0.0)), 0.0);
+    }
+
+    /// Search `fen` for up to `playouts`; returns the engine (with its
+    /// tree) and the move.
+    fn solve(fen: &str, playouts: u64) -> (Mcts, Move, Game) {
+        peazero_core::init();
+        let mut net = PolicyNet::embedded();
+        let mut m = Mcts::default();
+        let game = Game::from_fen(fen).unwrap();
+        let mv = search_with(&mut m, &mut net, &game, playouts, &SearchParams::default());
+        (m, mv, game)
+    }
+
+    fn root_score(m: &mut Mcts) -> String {
+        let mut net = PolicyNet::embedded();
+        let max_nodes = m.max_nodes;
+        let tree = Tree {
+            net: &mut net,
+            tt: Box::leak(Box::new(EvalTable::new(1 << 16))),
+            params: SearchParams::default(),
+            nodes: &mut m.nodes,
+            max_nodes,
+            full: false,
+            frozen: false,
+            prunes: 0,
+            seldepth: 0,
+            depth_sum: 0,
+            playouts: 0,
+        };
+        let best = tree.best_child(ROOT).unwrap();
+        tree.score(best).0
+    }
+
+    #[test]
+    fn mate_in_one_is_proven_and_stops_the_search() {
+        let (mut m, mv, g) = solve("6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1", 20_000);
+        assert_eq!(mv, g.position().parse_uci_move("a1a8").unwrap());
+        let root = m.nodes[ROOT];
+        assert!(root.flags & WIN != 0 && root.dist == 1);
+        assert!(root.visits < 20_000, "stopped once proven: {}", root.visits);
+        assert_eq!(root_score(&mut m), "mate 1");
+    }
+
+    #[test]
+    fn mate_in_two_is_found_and_reported() {
+        // 1. Kf7! Kh7 (forced) 2. Rh1#; a network may first prove a longer
+        // forced mate (1. Rb8+ Kh7 2. Ra8 Kh6 3. Rh8#): any proven mate is
+        // fine, the search stops at the first one
+        let (mut m, mv, g) = solve("7k/8/5K2/8/8/8/8/1R6 w - - 0 1", 50_000);
+        let root = m.nodes[ROOT];
+        assert!(root.flags & WIN != 0, "not proven");
+        assert!(root.dist % 2 == 1 && root.dist <= 5, "dist {}", root.dist);
+        assert_eq!(root_score(&mut m), format!("mate {}", root.dist.div_ceil(2)));
+        // the move played is a mating move: after it, every reply loses
+        let child = m.nodes[ROOT]
+            .children()
+            .find(|&c| m.nodes[c].mv == mv)
+            .unwrap();
+        assert!(m.nodes[child].flags & LOSS != 0);
+        assert_eq!(m.nodes[child].dist + 1, root.dist);
+        assert!(g.position().legal_moves().contains(&mv));
+    }
+
+    #[test]
+    fn getting_mated_is_a_negative_mate_score() {
+        // Black's only move Kh7 runs into Rh1#
+        let (mut m, mv, g) = solve("7k/5K2/8/8/8/8/8/R7 b - - 0 1", 20_000);
+        assert_eq!(mv, g.position().parse_uci_move("h8h7").unwrap());
+        let root = m.nodes[ROOT];
+        assert!(root.flags & LOSS != 0 && root.dist == 2);
+        assert_eq!(root_score(&mut m), "mate -1");
+    }
+
+    #[test]
+    fn forced_draw_is_proven_with_a_zero_score() {
+        // Kxg2 is the only move and leaves king against king
+        let (mut m, _, _) = solve("7k/8/8/8/8/8/6q1/7K w - - 0 1", 20_000);
+        let root = m.nodes[ROOT];
+        assert!(root.flags & DRAW != 0);
+        assert!(root.visits < 20_000);
+        assert_eq!(root_score(&mut m), "cp 0");
+    }
+
+    #[test]
+    fn moves_into_a_proven_mate_are_avoided() {
+        // White mates with Ra8 unless Black's rook guards the back rank:
+        // after Black's search no move that allows Ra8# is played
+        let fen = "6k1/r4ppp/8/8/8/8/8/R5K1 b - - 0 1";
+        let (m, mv, g) = solve(fen, 4000);
+        let mut after = g.clone();
+        after.push(mv);
+        let mates = after.position().legal_moves().iter().any(|&w| {
+            let mut x = after.clone();
+            x.push(w);
+            x.position().in_check() && x.position().legal_moves().is_empty()
+        });
+        assert!(!mates, "played {mv:?}, which allows mate");
+        check_tree(&m.nodes);
     }
 }

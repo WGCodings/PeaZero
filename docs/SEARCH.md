@@ -28,17 +28,18 @@ meant to be its own SPRT.
 - One network evaluation per new leaf: policy plus W/D/L.
 - W/D/L is backed up per node and flipped each ply. Q = W − L.
 
-**Exact terminal values**
+**Exact terminal values and proven results**
 - Checkmate and stalemate.
 - 50-move rule and insufficient material.
 - Repetition: the first repetition counts as a draw, including positions from the game history.
+- Proven wins, losses and draws are propagated up the tree, with the distance to mate (§4.1). The search stops when the root is proven.
 
 **Move choice and output**
 - Final move: most visits; ties are broken by prior.
 - PV, and a ponder move from the PV.
 - `info` lines show:
   - depth (the average playout depth) and seldepth;
-  - score in cp, from W−L through a tangent curve: about 10,800 cp at the ±0.999 cap, which is the "very large value" shown near a mate;
+  - score: `mate N` / `mate -N` for a proven win or loss, `cp 0` with `wdl 0 1000 0` for a proven draw (§4.1); otherwise cp from W−L through a tangent curve (about 10,800 cp at the ±0.999 cap for clearly won but unproven positions);
   - `wdl` (UCI_ShowWDL);
   - nodes, nps and pv.
 
@@ -76,7 +77,6 @@ meant to be its own SPRT.
 **Not present yet**
 - Shared statistics between transpositions (a full transposition graph).
 - Batching, virtual loss or multithreading.
-- Propagation of proven wins, losses and draws, so no `mate N` scores.
 - Smart pruning, early stopping or extending past `soft`.
 
 ## 1. Node budget
@@ -258,25 +258,29 @@ At 264 µs per evaluation, inference probably dominates, so measure before worki
 
 ## 4. Phase 3: correctness in decisive positions
 
-### 4.1 Certainty propagation (MCTS-solver)
+### 4.1 Certainty propagation (MCTS-solver) (done)
 
-**Current behaviour.**
-- Terminal nodes get exact values, but nothing propagates them, so the `info` score near a mate is about 10,800 cp instead of `mate N`.
-- A mate in one at the root still has to win on visits against moves the policy likes.
-- A move that walks into a forced mate keeps being searched, because its average Q is only "quite bad".
+**Proofs** (`Tree::try_prove` in `mcts.rs`), all from the view of the side to move at the node:
+- Checkmate (a loss) and the draw rules (repetition, 50 moves, insufficient material, stalemate) are proven at distance 0.
+- After a playout that ends in a proven node, its ancestors are checked bottom-up until one can't be proven:
+  - a **win** if any move leads to a position lost for the opponent; distance 1 + the shortest such line;
+  - a **loss** if every move leads to a position won for the opponent; distance 1 + the longest, so the engine resists as long as possible;
+  - a **draw** if every move is proven and the best of them is a draw.
+- The distance (plies to the end with best play) is stored per node. The node stays 24 bytes because the prior is now stored as bfloat16 (the top half of an f32, about 0.4% precision).
 
-**Rules:**
-- A node is a proven **win** (for the side to move) if **any** child is a proven loss for the opponent.
-- It is a proven **loss** if **all** children are proven wins for the opponent.
-- It is a proven **draw** if no child wins and the best child is a proven draw.
+**Use in the search:**
+- A playout stops at a proven node and backs up its exact value (1, ½ or 0).
+- Selection uses the exact value of a proven child, and never picks a move proven to lose while there's an alternative.
+- Move choice (`best_child`): the shortest proven win; otherwise the most visited move that isn't proven to lose; if every move loses, the longest loss.
+- When the root is proven, the search stops at once. A reused tree whose new root is already proven plays instantly.
+- The search stops at the first proven win; it doesn't keep looking for a shorter mate. Proven distances are exact, so each move still gets closer to mate.
+- Pruning may collapse a proven node; it stays proven (its flags and distance are kept), only its children go.
 
-**Use of proven results:**
-- Back up the exact value instead of the average.
-- Never select a child that is proven lost when another option exists.
-- Stop the search immediately when the root is proven: play the mating move, and report `score mate N` with the distance.
-- Prefer the shortest win and the longest loss, which needs plies-to-mate stored on proven nodes.
+**Output:** `score mate N` (we mate in N moves), `score mate -N` (we get mated), `score cp 0` with `wdl 0 1000 0` (proven draw).
 
-**Expected:** +5 to +20 Elo, mostly by converting won positions and avoiding blunders into mates. Effort: medium.
+**Examples:** Scholar's mate shows `mate 1` after 2 playouts; Rb8+ Kh7 Ra8 Kh6 Rh8# was proven as `mate 3` after 6 playouts; a forced king-against-king trade shows `cp 0`. Mates beyond what the search can fully see (K+Q vs K from the middle) still show as a high cp score until the line is proven.
+
+**Bench:** 2834 (bfloat16 priors and the solver change the search slightly).
 
 ### 4.2 Final move choice
 
@@ -335,7 +339,7 @@ At 264 µs per evaluation, inference probably dominates, so measure before worki
 | 2 | SPSA from the defaults (§2.4) | SPRT tuned vs #1 | +10–30 | games only |
 | 3 | Tree reuse **(done)** | SPRT 8+0.08 | +20–50 | medium |
 | 4 | Time management: visit-share factor + `hard` **(done, gained)**; PV stability **(done)**; then early stop | SPRT 8+0.08, then SPSA TM constants | +15–40 | small–medium |
-| 5 | Certainty propagation + mate scores | SPRT 8+0.08 | +5–20 | medium |
+| 5 | Certainty propagation + mate scores **(done)** | SPRT 8+0.08 | +5–20 | medium |
 | 6 | Transposition table for evaluations **(done)** | SPRT 8+0.08 and 40+0.4 | +5–20 | small |
 | 7 | Final-move LCB | SPRT | 0–15 | trivial |
 | 8 | Batch benchmark → batched search if ≥ 1.2× | benchmark, then SPRT | −10–+40 | high |
