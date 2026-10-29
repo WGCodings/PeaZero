@@ -28,6 +28,13 @@
 //! Fixed-size array, one entry per slot, always replace. The table
 //! survives between moves (it helps when tree reuse misses) and is cleared
 //! on `ucinewgame` and when the network changes.
+//!
+//! Shared by all search threads without locks: an entry is ten 64-bit
+//! atomic words, and the key word is stored XOR the nine data words. A
+//! reader that sees a half-written entry (another thread storing at the
+//! same time) gets a key that doesn't match and treats it as a miss.
+
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 use peazero_core::encoding::legal_actions;
 use peazero_core::{Game, Move};
@@ -51,15 +58,11 @@ struct Entry {
     logits: [u8; MAX_MOVES],
 }
 
-const _: () = assert!(std::mem::size_of::<Entry>() == 80);
+/// An entry as stored: word 0 = key ^ (XOR of words 1..10); word 1 = W,
+/// L, count; words 2..10 = the 64 logit bytes.
+type Slot = [AtomicU64; 10];
 
-const EMPTY: Entry = Entry {
-    key: 0,
-    w: 0,
-    l: 0,
-    count: 0,
-    logits: [0; MAX_MOVES],
-};
+const _: () = assert!(std::mem::size_of::<Slot>() == 80);
 
 impl Entry {
     fn pack(key: u64, eval: &Evaluation) -> Entry {
@@ -81,6 +84,30 @@ impl Entry {
         e
     }
 
+    /// The nine data words.
+    fn words(&self) -> [u64; 9] {
+        let mut d = [0u64; 9];
+        d[0] = self.w as u64 | (self.l as u64) << 16 | (self.count as u64) << 32;
+        for (i, chunk) in self.logits.chunks_exact(8).enumerate() {
+            d[1 + i] = u64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        d
+    }
+
+    fn from_words(key: u64, d: &[u64; 9]) -> Entry {
+        let mut logits = [0u8; MAX_MOVES];
+        for (i, chunk) in logits.chunks_exact_mut(8).enumerate() {
+            chunk.copy_from_slice(&d[1 + i].to_le_bytes());
+        }
+        Entry {
+            key,
+            w: d[0] as u16,
+            l: (d[0] >> 16) as u16,
+            count: (d[0] >> 32) as u8,
+            logits,
+        }
+    }
+
     /// The evaluation, with the moves in `legal` (move-generation order).
     fn unpack(&self, legal: impl Iterator<Item = Move>) -> Evaluation {
         let w = self.w as f32 / 65535.0;
@@ -97,11 +124,15 @@ impl Entry {
 }
 
 pub struct EvalTable {
-    entries: Vec<Entry>,
-    /// Occupied slots (for `hashfull`).
-    used: usize,
-    pub probes: u64,
-    pub hits: u64,
+    entries: Vec<Slot>,
+    /// Occupied slots (for `hashfull`; approximate with several threads).
+    used: AtomicUsize,
+    probes: AtomicU64,
+    hits: AtomicU64,
+}
+
+fn xor_all(d: &[u64; 9]) -> u64 {
+    d.iter().fold(0, |a, &w| a ^ w)
 }
 
 fn mix(mut x: u64) -> u64 {
@@ -114,18 +145,58 @@ fn mix(mut x: u64) -> u64 {
 impl EvalTable {
     /// A table of about `bytes` bytes.
     pub fn new(bytes: usize) -> EvalTable {
-        let n = (bytes / std::mem::size_of::<Entry>()).max(1);
+        let n = (bytes / std::mem::size_of::<Slot>()).max(1);
         EvalTable {
-            entries: vec![EMPTY; n],
-            used: 0,
-            probes: 0,
-            hits: 0,
+            entries: (0..n).map(|_| Default::default()).collect(),
+            used: AtomicUsize::new(0),
+            probes: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
         }
     }
 
     pub fn clear(&mut self) {
-        self.entries.fill(EMPTY);
-        self.used = 0;
+        for slot in &mut self.entries {
+            for w in slot.iter_mut() {
+                *w.get_mut() = 0;
+            }
+        }
+        *self.used.get_mut() = 0;
+    }
+
+    /// Lookups so far.
+    pub fn probes(&self) -> u64 {
+        self.probes.load(Relaxed)
+    }
+
+    /// Lookups that found the position.
+    pub fn hits(&self) -> u64 {
+        self.hits.load(Relaxed)
+    }
+
+    /// The entry in slot `i` if its key is `key` (and it wasn't torn).
+    fn load(&self, i: usize, key: u64) -> Option<Entry> {
+        let slot = &self.entries[i];
+        let k = slot[0].load(Relaxed);
+        if k == 0 {
+            return None;
+        }
+        let mut d = [0u64; 9];
+        for (dst, w) in d.iter_mut().zip(&slot[1..]) {
+            *dst = w.load(Relaxed);
+        }
+        (k ^ xor_all(&d) == key).then(|| Entry::from_words(key, &d))
+    }
+
+    fn store(&self, i: usize, e: &Entry) {
+        let slot = &self.entries[i];
+        let d = e.words();
+        if slot[0].load(Relaxed) == 0 {
+            self.used.fetch_add(1, Relaxed);
+        }
+        for (w, &v) in slot[1..].iter().zip(&d) {
+            w.store(v, Relaxed);
+        }
+        slot[0].store(e.key ^ xor_all(&d), Relaxed);
     }
 
     #[cfg(test)]
@@ -135,7 +206,7 @@ impl EvalTable {
 
     /// Occupied slots in permille.
     pub fn hashfull(&self) -> usize {
-        self.used * 1000 / self.entries.len()
+        (self.used.load(Relaxed) * 1000 / self.entries.len()).min(1000)
     }
 
     /// Everything the network input depends on: the position (Zobrist
@@ -153,16 +224,15 @@ impl EvalTable {
     /// The evaluation of `game`'s position: from the table, or from the
     /// network (then stored). Always the quantised values (see the module
     /// documentation), except for positions too large for an entry.
-    pub fn evaluate(&mut self, net: &mut PolicyNet, game: &Game) -> Evaluation {
+    pub fn evaluate(&self, net: &mut PolicyNet, game: &Game) -> Evaluation {
         let key = EvalTable::key(game);
         let i = self.slot(key);
-        self.probes += 1;
-        let e = &self.entries[i];
-        if e.key == key {
+        self.probes.fetch_add(1, Relaxed);
+        if let Some(e) = self.load(i, key) {
             let legal = legal_actions(game.position());
             // a different move count: a key collision, not this position
             if legal.len() == e.count as usize {
-                self.hits += 1;
+                self.hits.fetch_add(1, Relaxed);
                 return e.unpack(legal.into_iter().map(|(_, m)| m));
             }
         }
@@ -171,10 +241,7 @@ impl EvalTable {
             return eval;
         }
         let entry = Entry::pack(key, &eval);
-        if self.entries[i].key == 0 {
-            self.used += 1;
-        }
-        self.entries[i] = entry;
+        self.store(i, &entry);
         entry.unpack(eval.moves.iter().map(|m| m.0))
     }
 }
@@ -187,7 +254,7 @@ mod tests {
     fn transposition_hits_return_the_same_values_as_the_miss() {
         peazero_core::init();
         let mut net = PolicyNet::embedded();
-        let mut tt = EvalTable::new(1 << 20);
+        let tt = EvalTable::new(1 << 20);
         // two move orders reaching the same position
         let mut a = Game::default();
         for m in ["g1f3", "g8f6", "b1c3"] {
@@ -200,7 +267,7 @@ mod tests {
         assert_eq!(EvalTable::key(&a), EvalTable::key(&b));
         let miss = tt.evaluate(&mut net, &a);
         let hit = tt.evaluate(&mut net, &b);
-        assert_eq!((tt.probes, tt.hits), (2, 1));
+        assert_eq!((tt.probes(), tt.hits()), (2, 1));
         assert_eq!(hit.wdl, miss.wdl);
         assert_eq!(hit.moves, miss.moves);
         assert!(tt.hashfull() <= 1000);
@@ -210,7 +277,7 @@ mod tests {
     fn quantisation_is_close_to_the_network() {
         peazero_core::init();
         let mut net = PolicyNet::embedded();
-        let mut tt = EvalTable::new(1 << 20);
+        let tt = EvalTable::new(1 << 20);
         let g =
             Game::from_fen("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1")
                 .unwrap();
@@ -259,5 +326,63 @@ mod tests {
         let tt = EvalTable::new(4 << 20);
         assert_eq!(tt.len(), (4 << 20) / 80);
         assert_eq!(tt.hashfull(), 0);
+    }
+
+    #[test]
+    fn entries_round_trip_and_torn_entries_are_misses() {
+        let mut logits = [0u8; MAX_MOVES];
+        for (i, l) in logits.iter_mut().enumerate() {
+            *l = (i * 37 % 256) as u8;
+        }
+        let e = Entry {
+            key: 0xdead_beef_1234_5677,
+            w: 40000,
+            l: 1234,
+            count: 41,
+            logits,
+        };
+        let tt = EvalTable::new(1 << 16);
+        tt.store(5, &e);
+        let back = tt.load(5, e.key).unwrap();
+        assert_eq!((back.w, back.l, back.count), (e.w, e.l, e.count));
+        assert_eq!(back.logits, e.logits);
+        assert!(tt.load(5, e.key ^ 2).is_none());
+        // another thread overwrote one data word: the key no longer matches
+        tt.entries[5][3].store(12345, Relaxed);
+        assert!(tt.load(5, e.key).is_none());
+    }
+
+    #[test]
+    fn shared_by_threads() {
+        peazero_core::init();
+        let tt = EvalTable::new(1 << 16);
+        let games: Vec<Game> = ["e2e4", "d2d4", "g1f3", "c2c4"]
+            .iter()
+            .map(|m| {
+                let mut g = Game::default();
+                g.push_uci(m);
+                g
+            })
+            .collect();
+        let reference: Vec<_> = {
+            let mut net = PolicyNet::embedded();
+            games
+                .iter()
+                .map(|g| tt.evaluate(&mut net, g).moves)
+                .collect()
+        };
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    let mut net = PolicyNet::embedded();
+                    for _ in 0..20 {
+                        for (g, r) in games.iter().zip(&reference) {
+                            assert_eq!(&tt.evaluate(&mut net, g).moves, r);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(tt.hits() >= 150);
     }
 }

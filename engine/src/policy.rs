@@ -34,6 +34,9 @@ pub struct PolicyNet {
     net: Backend,
     obs: Vec<f32>,
     policy: Vec<f32>,
+    /// The network file (other CPUs: `fork` rebuilds tract from it).
+    #[cfg(not(target_arch = "x86_64"))]
+    source: std::sync::Arc<[u8]>,
 }
 
 impl PolicyNet {
@@ -48,7 +51,30 @@ impl PolicyNet {
             net,
             obs: vec![0.0; OBS_SIZE],
             policy: vec![0.0; NUM_ACTIONS],
+            #[cfg(not(target_arch = "x86_64"))]
+            source: bytes.into(),
         })
+    }
+
+    /// Another instance of the same network for a search thread: the
+    /// weights are shared, only the scratch buffers are new.
+    pub fn fork(&self) -> PolicyNet {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut net = peazero_nn::fast::FastNet::new(std::sync::Arc::clone(self.net.weights()));
+            net.set_int8(self.net.int8());
+            net.set_simd(self.net.simd());
+            net.set_winograd(self.net.winograd());
+            PolicyNet {
+                net,
+                obs: vec![0.0; OBS_SIZE],
+                policy: vec![0.0; NUM_ACTIONS],
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            PolicyNet::from_pzn(&self.source).expect("the network loaded before")
+        }
     }
 
     /// Which inference kernels are in use (for `info string`).

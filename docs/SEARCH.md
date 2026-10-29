@@ -65,7 +65,8 @@ meant to be its own SPRT.
 - Time manager (§3.2): target = time/movestogo (`TmMovesToGo`, 30) + `TmIncPercent` of the increment, at most half the remaining time. The search stops at target × a factor from how settled it is: more time when the best move holds a small share of the visits or when the evaluation changes along its PV, less when one move holds most visits and the PV is stable. It never passes the hard limit (`TmHardMult` × target, at most ¾ of the remaining time). A single legal move is played after a few playouts (for a real score); `go movetime` uses exactly its time.
 
 **Network and modes**
-- Int8 SIMD inference (FastNet) on x86-64, tract on other CPUs. Batch 1, single-threaded.
+- Int8 SIMD inference (FastNet) on x86-64, tract on other CPUs. Batch 1 per thread.
+- Threads (`Threads`): all threads search one shared tree, with virtual loss (§5.2). With one thread the search is unchanged.
 - Other modes: `AlphaBeta` (iterative deepening with policy move ordering, with real `mate N` scores) and `Searchless`.
 
 **Tuning**
@@ -75,7 +76,7 @@ meant to be its own SPRT.
 
 **Not present yet**
 - Shared statistics between transpositions (a full transposition graph).
-- Batching, virtual loss or multithreading.
+- Batched evaluation (measured not to pay on one thread, §5.1).
 - Propagation of proven wins, losses and draws, so no `mate N` scores.
 - Smart pruning, early stopping or extending past `soft`.
 
@@ -248,13 +249,11 @@ The tuned temperatures make the policy flat enough that dropping moves loses rea
 
 **Expected:** +5 to +20 Elo at 8+0.08, more at longer time controls and in endgames. Test at the time control: at fixed nodes it changes nothing, by design.
 
-### 3.4 Cheap per-playout speed-ups (profile first)
+### 3.4 Cheap per-playout speed-ups (profiled: not worth it)
 
-At 264 µs per evaluation, inference probably dominates, so measure before working on these:
-- `Tree::evaluate` calls `pos.legal_moves()` for the terminal check, then `legal_actions()` generates the moves again inside `PolicyNet::evaluate`. Generate them once and pass them in.
-- Every playout clones the whole `Game` (with its history) and allocates `path`. Reuse one scratch game and path buffer, or make and unmake moves.
-- `Node` is already compact (24 bytes: move, child count, flags, prior, first-child index, visits, W and L sums).
-- Run `perf` or `cargo flamegraph` on `bench` first. If inference is above 90% of the time, skip all of this.
+Callgrind on `bench`: of the instructions spent in the search, **99.6% are network evaluation** (`PolicyNet::evaluate`). Selection, backup, table lookups and move generation are 0.4%, so there's nothing to gain in the search code itself.
+
+Side finding: about a quarter of `bench`'s instructions are start-up. `find_magic` searches the bitboard magic numbers every time the engine starts (~300 ms before `readyok`). That isn't on the game clock; hard-coding the magics would make start-up and bench instant.
 
 ## 4. Phase 3: correctness in decisive positions
 
@@ -306,19 +305,41 @@ play       = the candidate with the highest  Q − BestMoveLcbC / √visits   (t
 
 ## 5. Phase 4: larger engineering (measure first)
 
-### 5.1 Batched evaluation with virtual loss
+### 5.1 Batched evaluation (measured: skipped)
 
-- **Change:** collect several leaves per step with virtual loss, evaluate them as one batch, then back them all up.
-- **When it pays:** only if the int8 CPU network gets faster per position at batch 4–16 than at batch 1. Convolutions on a 64-channel 8×8 board often do, through better GEMM shapes and amortised weight loads, by roughly 1.3–2×.
-- **First measure:** a micro-benchmark of evaluations per second at batch sizes 1, 2, 4, 8, 16 (§7). If the gain is below 1.2×, skip this.
-- **Costs:** virtual loss also slightly degrades the search, more so at small node counts like ours.
-- **Expected:** −10 to +40 Elo, depending entirely on that benchmark. Effort: high.
+One evaluation of the 64×6 network on one thread (`evalbench`, AVX-512 VNNI machine):
 
-### 5.2 Multi-threaded search
+| Kernel | µs / evaluation | of which residual convolutions |
+|---|---|---|
+| AVX-512 VNNI int8 (the default there) | 183–196 | 151–160 (~85%) |
+| AVX2 int8 | ~530 | ~400 |
+| float + Winograd | ~440 | |
 
-- **Change:** the same virtual-loss machinery with N threads, each evaluating its own leaves.
-- **Value:** only useful for `Threads > 1` tests and play. OpenBench tests normally run 1 thread, so this doesn't show in SPRTs unless you add SMP tests.
-- **Priority:** after 5.1, which builds most of the infrastructure.
+The residual convolutions need about 28 million multiply-adds per position and already run close to the CPU's peak: at VNNI throughput that is about 150 µs, the measured time. The kernels reuse each weight load across 5–8 squares, and a convolution's weights (36 KB) stay in L1 cache. Batching positions can't reduce the arithmetic; it could only trim part of the ~30 µs outside the convolutions (input layer, heads, normalisation), at most 5–10%. Not worth the complexity, and threads don't need it (§5.2).
+
+Speed has to come from elsewhere:
+- the CPU's instruction set (AVX2-only CPUs are about 2.9× slower than AVX-512 VNNI);
+- fewer multiply-adds per position, through the network's size and shape, or int8 Winograd (a research-sized project).
+
+### 5.2 Multi-threaded search (done)
+
+**Design** (`mcts.rs`):
+- **One shared tree.** Every node field is an atomic: W and L share one 64-bit word, so a backup is one compare-and-swap per node. The node is still 24 bytes. Relaxed atomics are plain loads and stores on x86, so one thread pays nothing.
+- **Threads.** The calling thread is the main thread: time management, `info` lines, stopping. `Threads − 1` helpers run on scoped threads until the main thread stops them. Each helper has its own network instance (`PolicyNet::fork`: shared weights, own scratch buffers), kept between moves and re-forked when the network changes.
+- **Virtual loss** (with more than one thread). A selected node gets its visit and `VirtualLoss` losses (default 1) on the way down, so the other threads see it as worse and spread out. The backup replaces the virtual loss with the real result.
+- **Expansion races.** A thread claims a leaf with an atomic flag before evaluating it. A thread that reaches a claimed leaf takes its virtual losses back and starts a new playout (a collision). Children are reserved with an atomic counter in the preallocated arena, written, then published with release/acquire ordering.
+- **Pruning.** Every playout holds a shared lock on the arena. When the tree is full, a thread takes the lock exclusively for the prune, so nodes never move under a running playout.
+- **Evaluation table.** Lockless: each entry is ten 64-bit atomic words, with the key word XORed with the data, so a half-written entry reads as a miss (tt.rs).
+- **Limits.** `go nodes` counts the playouts of all threads; time, depth and `stop` are checked by the main thread, which then stops the helpers.
+- **One thread:** no virtual loss and no collisions possible; bench is unchanged (2827).
+
+**Measured on a 2-core machine** (20,000 playouts each): 1.76–1.84× the speed with 2 threads, with the same best moves. Collisions: 1, 9 and 554 per 20,000 playouts (the last in Kiwipete, where many lines meet). An 8+0.08 game with 2 threads: ~11k nps, no move past the hard limit, an `info` line every move.
+
+**Output:** `info string threads: N, collisions C` after each move.
+
+**Not done yet:** a jittered cpuct for helpers (would spread the threads further); buffering root statistics per thread (only matters at high thread counts).
+
+**Testing:** only shows with `Threads` > 1, for example an SMP test with 2 or 4 threads against the same build with 1 thread. Tune `VirtualLoss` there, not in single-thread tests.
 
 ### 5.3 Gumbel root search in the engine
 
@@ -349,7 +370,7 @@ play       = the candidate with the highest  Q − BestMoveLcbC / √visits   (t
 | 5 | Certainty propagation + mate scores | SPRT 8+0.08 | +5–20 | medium |
 | 6 | Transposition table for evaluations **(done)** | SPRT 8+0.08 and 40+0.4 | +5–20 | small |
 | 7 | Final-move LCB **(done)** | SPRT | 0–15 | trivial |
-| 8 | Batch benchmark → batched search if ≥ 1.2× | benchmark, then SPRT | −10–+40 | high |
+| 8 | Batch benchmark → batched search if ≥ 1.2× **(measured: skipped)**; multi-threaded search **(done)** | SMP test | scales ~1.8× on 2 cores | high |
 | 9 | Gumbel root search (experiment) | SPRT | ±30 | medium |
 
 The Elo figures are rough guesses based on what such changes typically give
