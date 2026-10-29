@@ -66,7 +66,6 @@ impl SearchLimits {
         l
     }
 }
-
 #[derive(Clone, Copy, Debug)]
 pub struct SearchResult {
     /// `Move::NULL` when there are no legal moves (printed as `0000`).
